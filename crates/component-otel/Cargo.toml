@@ -1,0 +1,11 @@
+[package]
+name = "component-otel"
+version = "0.1.0"
+edition = "2021"
+description = "Ergonomic OpenTelemetry helpers for wasmCloud components"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+wit-bindgen = "0.41.0"

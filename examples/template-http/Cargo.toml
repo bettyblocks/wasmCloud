@@ -1,0 +1,19 @@
+[package]
+name = "template-http"
+edition = "2021"
+version = "0.1.0"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0"
+wit-bindgen = "0.41.0"
+component-otel = { path = "../../crates/component-otel" }
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = true
