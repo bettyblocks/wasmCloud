@@ -1,0 +1,31 @@
+apiVersion: runtime.wasmcloud.dev/v1alpha1
+kind: WorkloadDeployment
+metadata:
+  name: sse-relay-demo
+spec:
+  replicas: 1
+  template:
+    spec:
+      hostSelector:
+        hostgroup: default
+      service:
+        image: wasmcloud-registry:5000/mock-openai:0.1.0
+        maxRestarts: 3
+        localResources:
+          environment:
+            config:
+              MOCK_BIND_ADDR: "127.0.0.1:9091"
+      components:
+        - name: sse-relay
+          image: wasmcloud-registry:5000/sse-relay:0.1.0
+          localResources:
+            environment:
+              config:
+                UPSTREAM_ADDR: "127.0.0.1:9091"
+      hostInterfaces:
+        - namespace: wasi
+          package: http
+          interfaces:
+            - incoming-handler
+          config:
+            host: sse-relay-demo
