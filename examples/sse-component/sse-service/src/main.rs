@@ -21,6 +21,49 @@ struct SseConnection {
 
 type ConnectionRegistry = Arc<RwLock<HashMap<String, SseConnection>>>;
 
+/// A stored message for replay support.
+struct StoredMessage {
+    id: u64,
+    scope_key: String,
+    data: String,
+}
+
+/// In-memory message store with monotonically increasing IDs.
+/// Stores all messages for the lifetime of the service process.
+struct MessageStore {
+    messages: Vec<StoredMessage>,
+    next_id: u64,
+}
+
+impl MessageStore {
+    fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            next_id: 1,
+        }
+    }
+
+    fn append(&mut self, scope_key: &str, data: &str) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.messages.push(StoredMessage {
+            id,
+            scope_key: scope_key.to_string(),
+            data: data.to_string(),
+        });
+        id
+    }
+
+    fn replay(&self, scope_key: &str, after_id: u64) -> Vec<&StoredMessage> {
+        self.messages
+            .iter()
+            .filter(|m| m.scope_key == scope_key && m.id > after_id)
+            .collect()
+    }
+}
+
+type SharedMessageStore = Arc<RwLock<MessageStore>>;
+
 #[derive(Deserialize)]
 struct PushRequest {
     /// Push to a specific stream by ID.
@@ -44,6 +87,7 @@ async fn main() -> Result<()> {
     let bind_addr = std::env::var("SSE_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".into());
 
     let connections: ConnectionRegistry = Arc::new(RwLock::new(HashMap::new()));
+    let message_store: SharedMessageStore = Arc::new(RwLock::new(MessageStore::new()));
 
     let listener = TcpListener::bind(&bind_addr).await?;
     eprintln!("SSE component listening on {bind_addr}");
@@ -59,8 +103,9 @@ async fn main() -> Result<()> {
         };
 
         let conns = Arc::clone(&connections);
+        let store = Arc::clone(&message_store);
         wstd::runtime::spawn(async move {
-            if let Err(e) = handle_connection(stream, conns).await {
+            if let Err(e) = handle_connection(stream, conns, store).await {
                 eprintln!("connection error: {e}");
             }
             Ok::<(), anyhow::Error>(())
@@ -74,6 +119,7 @@ async fn main() -> Result<()> {
 async fn handle_connection(
     stream: wstd::net::TcpStream,
     connections: ConnectionRegistry,
+    message_store: SharedMessageStore,
 ) -> Result<()> {
     // Read the HTTP request headers
     let mut buf = [0u8; 4096];
@@ -110,6 +156,7 @@ async fn handle_connection(
     // Parse headers
     let mut accept = String::new();
     let mut content_length: usize = 0;
+    let mut last_event_id: Option<u64> = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -120,6 +167,8 @@ async fn handle_connection(
                 accept = value.to_string();
             } else if name_lower == "content-length" {
                 content_length = value.trim().parse().unwrap_or(0);
+            } else if name_lower == "last-event-id" {
+                last_event_id = Some(value.trim().parse().unwrap_or(0));
             }
         }
     }
@@ -136,7 +185,15 @@ async fn handle_connection(
     match (method, is_sse) {
         ("GET", true) => {
             let scope_key = path.trim_start_matches('/').to_string();
-            handle_sse_connection(&mut reader, &mut writer, scope_key, connections).await
+            handle_sse_connection(
+                &mut reader,
+                &mut writer,
+                scope_key,
+                connections,
+                message_store,
+                last_event_id,
+            )
+            .await
         }
         ("POST", _) if path == "/push" => {
             // Read remaining body if needed
@@ -148,7 +205,7 @@ async fn handle_connection(
                 }
                 body_data.extend_from_slice(&buf[..n]);
             }
-            handle_push(&mut writer, &body_data, connections).await
+            handle_push(&mut writer, &body_data, connections, message_store).await
         }
         ("GET", false) if path.starts_with("/connections") => {
             let scope_key = path
@@ -171,6 +228,8 @@ async fn handle_sse_connection<'a>(
     writer: &mut wstd::net::WriteHalf<'a>,
     scope_key: String,
     connections: ConnectionRegistry,
+    message_store: SharedMessageStore,
+    last_event_id: Option<u64>,
 ) -> Result<()> {
     let stream_id = generate_stream_id();
 
@@ -187,6 +246,24 @@ async fn handle_sse_connection<'a>(
     writer.flush().await?;
 
     eprintln!("SSE connection opened: stream_id={stream_id}, scope={scope_key}");
+
+    // Replay stored messages if client sent Last-Event-ID header.
+    // Last-Event-ID: 0 replays all messages; Last-Event-ID: N replays after N.
+    if let Some(after_id) = last_event_id {
+        let store = message_store.read().unwrap();
+        let replayed = store.replay(&scope_key, after_id);
+        eprintln!(
+            "Replaying {} messages for scope={scope_key} after id={after_id}",
+            replayed.len()
+        );
+        for msg in replayed {
+            let line = format!("id: {}\ndata: {}\n\n", msg.id, msg.data);
+            if writer.write_all(line.as_bytes()).await.is_err() {
+                return Ok(());
+            }
+        }
+        writer.flush().await?;
+    }
 
     // Create a channel for receiving events
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -210,7 +287,8 @@ async fn handle_sse_connection<'a>(
         // Check for events (non-blocking)
         match rx.try_recv() {
             Ok(event_data) => {
-                let msg = format!("data: {event_data}\n\n");
+                // event_data is pre-formatted with "id: ...\ndata: ..."
+                let msg = format!("{event_data}\n\n");
                 if writer.write_all(msg.as_bytes()).await.is_err() {
                     break;
                 }
@@ -254,11 +332,32 @@ async fn handle_push(
     writer: &mut wstd::net::WriteHalf<'_>,
     body: &[u8],
     connections: ConnectionRegistry,
+    message_store: SharedMessageStore,
 ) -> Result<()> {
     let push_req: PushRequest =
         serde_json::from_slice(body).context("invalid JSON body")?;
 
-    let event_data = &push_req.data;
+    // Determine scope_key for storage
+    let scope_key_for_store = if let Some(ref sk) = push_req.scope_key {
+        sk.clone()
+    } else if let Some(ref stream_id) = push_req.stream_id {
+        let conns = connections.read().unwrap();
+        conns
+            .get(stream_id)
+            .map(|c| c.scope_key.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // Store the message and get its ID
+    let event_id = {
+        let mut store = message_store.write().unwrap();
+        store.append(&scope_key_for_store, &push_req.data)
+    };
+
+    // Format as SSE event with id
+    let formatted_event = format!("id: {event_id}\ndata: {}", push_req.data);
     let mut sent_count = 0u32;
     let mut failed_ids: Vec<String> = Vec::new();
 
@@ -274,7 +373,7 @@ async fn handle_push(
         };
 
         for conn in targets {
-            match conn.tx.send(event_data.clone()) {
+            match conn.tx.send(formatted_event.clone()) {
                 Ok(()) => sent_count += 1,
                 Err(_) => failed_ids.push(conn.stream_id.clone()),
             }

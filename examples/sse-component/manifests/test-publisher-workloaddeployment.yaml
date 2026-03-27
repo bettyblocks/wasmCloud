@@ -1,7 +1,7 @@
 apiVersion: runtime.wasmcloud.dev/v1alpha1
 kind: WorkloadDeployment
 metadata:
-  name: sse-relay-demo
+  name: test-publisher
 spec:
   replicas: 1
   template:
@@ -9,17 +9,17 @@ spec:
       hostSelector:
         hostgroup: default
       components:
-        - name: sse-relay
-          image: wasmcloud-registry:5000/sse-relay:0.1.0
-          localResources:
-            environment:
-              config:
-                OPENAI_API_KEY: "CHANGE_ME"
+        - name: test-publisher
+          image: wasmcloud-registry:5000/test-publisher:0.1.0
       hostInterfaces:
         - namespace: wasi
           package: http
           interfaces:
             - incoming-handler
-            - outgoing-handler
           config:
-            host: sse-relay-demo
+            host: test-publisher
+        - namespace: wasmcloud
+          package: messaging
+          interfaces:
+            - consumer
+          config: {}

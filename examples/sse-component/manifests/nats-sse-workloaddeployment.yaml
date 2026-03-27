@@ -1,0 +1,35 @@
+apiVersion: runtime.wasmcloud.dev/v1alpha1
+kind: WorkloadDeployment
+metadata:
+  name: sse-nats-bridge
+spec:
+  replicas: 1
+  template:
+    spec:
+      hostSelector:
+        hostgroup: default
+      service:
+        image: wasmcloud-registry:5000/sse-service:0.1.0
+        maxRestarts: 3
+        localResources:
+          environment:
+            config:
+              SSE_BIND_ADDR: "127.0.0.1:9090"
+      components:
+        - name: sse-gateway
+          image: wasmcloud-registry:5000/sse-http-gateway:0.1.0
+        - name: nats-bridge
+          image: wasmcloud-registry:5000/nats-bridge:0.1.0
+      hostInterfaces:
+        - namespace: wasi
+          package: http
+          interfaces:
+            - incoming-handler
+          config:
+            host: sse-nats-bridge
+        - namespace: wasmcloud
+          package: messaging
+          interfaces:
+            - handler
+          config:
+            subscriptions: "events.>"

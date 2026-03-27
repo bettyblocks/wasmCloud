@@ -15,8 +15,16 @@ async fn main(req: Request<Body>) -> Result<Response<Body>> {
         .map(|v| v.contains("text/event-stream"))
         .unwrap_or(false);
 
+    let last_event_id = req
+        .headers()
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+
     match (req.method().clone(), is_sse) {
-        (wstd::http::Method::GET, true) => proxy_sse_stream(&path).await,
+        (wstd::http::Method::GET, true) => {
+            proxy_sse_stream(&path, last_event_id.as_deref()).await
+        }
         (wstd::http::Method::POST, _) if path == "/push" => proxy_request(req, &path).await,
         (wstd::http::Method::GET, _) if path.starts_with("/connections") => {
             proxy_request(req, &path).await
@@ -29,16 +37,21 @@ async fn main(req: Request<Body>) -> Result<Response<Body>> {
 }
 
 /// Proxy an SSE request to the SSE service and stream the response back.
-async fn proxy_sse_stream(path: &str) -> Result<Response<Body>> {
+async fn proxy_sse_stream(path: &str, last_event_id: Option<&str>) -> Result<Response<Body>> {
     let mut stream = TcpStream::connect(SSE_SERVICE_ADDR)
         .await
         .context("failed to connect to SSE service")?;
 
     // Forward the SSE request (write first, then read)
+    let last_event_id_header = match last_event_id {
+        Some(id) => format!("Last-Event-ID: {id}\r\n"),
+        None => String::new(),
+    };
     let raw_request = format!(
         "GET {path} HTTP/1.1\r\n\
          Accept: text/event-stream\r\n\
          Host: localhost\r\n\
+         {last_event_id_header}\
          \r\n"
     );
     stream.write_all(raw_request.as_bytes()).await?;
