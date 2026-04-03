@@ -92,6 +92,14 @@ pub struct HostCommand {
     #[clap(long = "compiled-cache-dir")]
     pub compiled_cache_dir: Option<PathBuf>,
 
+    /// How often to run OCI cache cleanup (e.g. "5m", "300s")
+    #[clap(long = "oci-cleanup-interval", value_parser = humantime::parse_duration, env = "WASH_OCI_CLEANUP_INTERVAL")]
+    pub oci_cleanup_interval: Option<Duration>,
+
+    /// Maximum age of cached OCI artifacts before they are cleaned up (e.g. "1h", "3600s")
+    #[clap(long = "oci-cleanup-age", value_parser = humantime::parse_duration, env = "WASH_OCI_CLEANUP_AGE")]
+    pub oci_cleanup_age: Option<Duration>,
+
     /// Enable WASI OpenTelemetry plugin
     #[clap(long = "wasi-otel", default_value_t = false)]
     pub wasi_otel: bool,
@@ -168,6 +176,14 @@ impl CliCommand for HostCommand {
                 plugin::wasmcloud_postgres::WasmcloudPostgres::new(postgres_url)
                     .context("failed to configure postgres plugin")?,
             ))?;
+        }
+
+        if let Some(interval) = self.oci_cleanup_interval {
+            cluster_host_builder = cluster_host_builder.with_cleanup_interval(interval);
+        }
+
+        if let Some(age) = self.oci_cleanup_age {
+            cluster_host_builder = cluster_host_builder.with_cleanup_age(age);
         }
 
         if let Some(host_name) = &self.host_name {
