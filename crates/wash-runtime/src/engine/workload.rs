@@ -834,7 +834,7 @@ impl ResolvedWorkload {
 
                                                 // Enforce a timeout on this call to prevent hanging indefinitely
                                                 const CALL_TIMEOUT: Duration =
-                                                    Duration::from_secs(30);
+                                                    Duration::from_secs(600);
                                                 timeout(
                                                     CALL_TIMEOUT,
                                                     func.call_async(
