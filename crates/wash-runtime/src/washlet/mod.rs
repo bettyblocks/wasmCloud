@@ -73,6 +73,16 @@ impl ClusterHostBuilder {
         self
     }
 
+    pub fn with_cleanup_interval(mut self, interval: Duration) -> Self {
+        self.cleanup_interval = Some(interval);
+        self
+    }
+
+    pub fn with_cleanup_age(mut self, age: Duration) -> Self {
+        self.cleanup_age = Some(age);
+        self
+    }
+
     pub fn with_engine(mut self, engine: crate::engine::Engine) -> Self {
         self.host_builder = self.host_builder.with_engine(engine);
         self
