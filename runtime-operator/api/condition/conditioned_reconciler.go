@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -263,6 +264,11 @@ func (r *ConditionedReconciler[T]) Reconcile(ctx context.Context, req reconcile.
 
 	if reconcilerCtx.ForceUpdate {
 		if err := r.client.Status().Patch(ctx, obj, client.MergeFrom(originalObject)); err != nil {
+			logger := ctrl.LoggerFrom(ctx)
+			logger.Error(err, "failed to patch status",
+				"name", obj.GetName(),
+				"resourceVersion", originalObject.GetResourceVersion(),
+			)
 			return reconcile.Result{}, err
 		}
 	}
