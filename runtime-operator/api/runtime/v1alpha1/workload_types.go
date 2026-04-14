@@ -1,7 +1,7 @@
 package v1alpha1
 
 import (
-	"go.wasmcloud.dev/runtime-operator/api/condition"
+	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -161,6 +161,27 @@ func (h *HostInterface) EnsureInterfaces(ifaces ...string) {
 	}
 }
 
+// KubernetesServiceRef references an existing Kubernetes Service that the
+// operator will manage an EndpointSlice for, pointing to the host pods that
+// are running this workload.
+type KubernetesServiceRef struct {
+	// Name is the name of the Kubernetes Service in the same namespace.
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+}
+
+// KubernetesSpec groups Kubernetes-specific configuration for a workload.
+type KubernetesSpec struct {
+	// Service references an existing Kubernetes Service that the operator will
+	// maintain an EndpointSlice for, pointing to the host pods running this
+	// workload. When set, the operator also registers DNS aliases for the
+	// service (e.g. service-name, service-name.namespace.svc.cluster.local)
+	// with the host so cluster-internal callers can reach the workload via
+	// Service DNS without going through an external gateway.
+	// +kubebuilder:validation:Optional
+	Service *KubernetesServiceRef `json:"service,omitempty"`
+}
+
 // WorkloadSpec defines the desired state of Workload.
 type WorkloadSpec struct {
 	// +kubebuilder:validation:Optional
@@ -176,6 +197,11 @@ type WorkloadSpec struct {
 	Service *WorkloadService `json:"service,omitempty"`
 	// +kubebuilder:validation:Optional
 	Volumes []Volume `json:"volumes,omitempty"`
+
+	// Kubernetes groups Kubernetes-specific configuration such as Service
+	// references and endpoint management.
+	// +kubebuilder:validation:Optional
+	Kubernetes *KubernetesSpec `json:"kubernetes,omitempty"`
 }
 
 func (s *WorkloadSpec) EnsureHostInterface(iface HostInterface) {

@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
-	runtime_controllers "go.wasmcloud.dev/runtime-operator/internal/controller/runtime"
-	"go.wasmcloud.dev/runtime-operator/pkg/wasmbus"
+	runtime_controllers "go.wasmcloud.dev/runtime-operator/v2/internal/controller/runtime"
+	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
@@ -28,6 +28,10 @@ type EmbeddedOperatorConfig struct {
 	// Disable Artifact Controller. If set, Artifacts must be marked as 'Ready' elsewhere.
 	// Useful when introducing a custom artifact management solution.
 	DisableArtifactController bool
+	// Namespace restricts the HostPodReconciler to watching Pods in this
+	// namespace only. Should match the namespace the operator is deployed in.
+	// If empty, all namespaces are watched.
+	Namespace string
 }
 
 // EmbeddedOperator is the main struct for the embedded operator.
@@ -69,6 +73,14 @@ func NewEmbeddedOperator(
 		return nil, err
 	}
 
+	if err = (&runtime_controllers.HostPodReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Namespace: cfg.Namespace,
+	}).SetupWithManager(mgr); err != nil {
+		return nil, err
+	}
+
 	if err = (&runtime_controllers.WorkloadReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -85,6 +97,13 @@ func NewEmbeddedOperator(
 	}
 
 	if err = (&runtime_controllers.WorkloadDeploymentReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		return nil, err
+	}
+
+	if err = (&runtime_controllers.WorkloadRouteReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {

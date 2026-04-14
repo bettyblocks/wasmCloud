@@ -13,9 +13,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	"go.wasmcloud.dev/runtime-operator/api/condition"
+	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
 
-	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/api/runtime/v1alpha1"
+	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
 )
 
 const (
@@ -73,6 +73,9 @@ func (r *WorkloadDeploymentReconciler) reconcileSync(ctx context.Context, deploy
 	if err := resolveArtifacts(ctx, r.Client, deployment.Namespace, templateCopy, deployment.Spec.Artifacts); err != nil {
 		return err
 	}
+	if deployment.Spec.Kubernetes != nil {
+		templateCopy.Spec.Kubernetes = deployment.Spec.Kubernetes.DeepCopy()
+	}
 
 	if want, got := currentReplica.Spec.Template.Hash(), templateCopy.Hash(); want != got {
 		return fmt.Errorf("template hash mismatch: want %s, got %s", want, got)
@@ -97,6 +100,12 @@ func (r *WorkloadDeploymentReconciler) reconcileDeploy(ctx context.Context, depl
 	replicaSetTemplate := deployment.Spec.WorkloadReplicaSetSpec.DeepCopy()
 	if err := resolveArtifacts(ctx, r.Client, deployment.Namespace, &replicaSetTemplate.Template, deployment.Spec.Artifacts); err != nil {
 		return err
+	}
+
+	// Propagate deployment-level service reference into each workload's spec
+	// so the WorkloadRouteReconciler can find it via the field index.
+	if deployment.Spec.Kubernetes != nil {
+		replicaSetTemplate.Template.Spec.Kubernetes = deployment.Spec.Kubernetes.DeepCopy()
 	}
 
 	replicaSetName := fmt.Sprintf("%s-%s", deployment.Name, randHash())
@@ -275,7 +284,7 @@ func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&runtimev1alpha1.WorkloadDeployment{}).
 		Owns(&runtimev1alpha1.WorkloadReplicaSet{}).
-		Named("workload-WorkloadDeployment").
+		Named("workload-deployment").
 		Complete(r)
 }
 

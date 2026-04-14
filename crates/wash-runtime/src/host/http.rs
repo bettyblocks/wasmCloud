@@ -43,18 +43,35 @@ use tracing::{Instrument, debug, error, info, instrument, warn};
 use wasmtime::Store;
 use wasmtime::component::InstancePre;
 use wasmtime_wasi_http::{
-    WasiHttpView,
-    bindings::{ProxyPre, http::types::Scheme},
-    body::HyperOutgoingBody,
-    hyper_request_error,
     io::TokioIo,
-    types::{HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig},
+    p2::{
+        WasiHttpView,
+        bindings::{ProxyPre, http::types::Scheme},
+        body::HyperOutgoingBody,
+        hyper_request_error,
+        types::{HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig},
+    },
 };
 
 use rustls::{ServerConfig, pki_types::CertificateDer};
 use rustls_pemfile::{certs, private_key};
 use tokio::sync::{RwLock, mpsc};
 use tokio_rustls::TlsAcceptor;
+
+/// Validates a hostname according to RFC 1123.
+fn is_valid_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
 
 /// Trait defining the routing behavior for HTTP requests
 /// Allows for custom routing logic based on workload IDs and requests
@@ -76,8 +93,8 @@ pub trait Router: Send + Sync + 'static {
     fn allow_outgoing_request(
         &self,
         workload_id: &str,
-        request: &hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        config: &wasmtime_wasi_http::types::OutgoingRequestConfig,
+        request: &hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        config: &wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         _allowed_hosts: &[String],
     ) -> anyhow::Result<()>;
 
@@ -92,7 +109,9 @@ pub trait Router: Send + Sync + 'static {
 #[derive(Default)]
 pub struct DynamicRouter {
     host_to_workload: tokio::sync::RwLock<HashMap<String, HashSet<String>>>,
-    workload_to_host: tokio::sync::RwLock<HashMap<String, String>>,
+    /// Maps workload_id -> all hostnames (primary + aliases) registered for it.
+    /// Used by on_workload_unbind to remove all entries cleanly.
+    workload_to_host: tokio::sync::RwLock<HashMap<String, Vec<String>>>,
 }
 
 /// Implementation of Router that maps Host headers to workload IDs
@@ -113,34 +132,62 @@ impl Router for DynamicRouter {
             anyhow::bail!("workload did not request wasi:http/incoming-handler interface");
         };
 
-        let host_header = http_iface
+        let primary_host = http_iface
             .config
             .get("host")
             .cloned()
             .context("No host header found")?;
 
+        anyhow::ensure!(
+            is_valid_hostname(&primary_host),
+            "primary host {primary_host:?} is not a valid RFC 1123 hostname"
+        );
+
+        // Collect primary hostname plus any DNS aliases injected by the operator.
+        // Aliases are a comma-separated list of Service DNS names (e.g.
+        // "my-svc,my-svc.default,my-svc.default.svc,my-svc.default.svc.cluster.local")
+        // that allow cluster-internal callers to reach this workload via Service DNS.
+        let mut all_hosts = vec![primary_host];
+        if let Some(aliases) = http_iface.config.get("host-aliases") {
+            all_hosts.extend(
+                aliases
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty() && is_valid_hostname(s)),
+            );
+        }
+
+        let workload_id = resolved_handle.id().to_string();
+
         {
             let mut lock = self.workload_to_host.write().await;
-            lock.insert(resolved_handle.id().to_string(), host_header.clone());
+            lock.insert(workload_id.clone(), all_hosts.clone());
         }
 
         {
             let mut lock = self.host_to_workload.write().await;
-            let entry = lock.entry(host_header.clone()).or_insert_with(HashSet::new);
-            entry.insert(resolved_handle.id().to_string());
+            for host in &all_hosts {
+                let entry = lock.entry(host.clone()).or_insert_with(HashSet::new);
+                entry.insert(workload_id.clone());
+            }
         }
 
         Ok(())
     }
 
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()> {
-        let mut lock = self.workload_to_host.write().await;
-        if let Some(host_header) = lock.remove(workload_id) {
-            let mut host_lock = self.host_to_workload.write().await;
-            if let Some(workload_set) = host_lock.get_mut(&host_header) {
-                workload_set.remove(workload_id);
-                if workload_set.is_empty() {
-                    host_lock.remove(&host_header);
+        let hostnames = {
+            let mut wth_lock = self.workload_to_host.write().await;
+            wth_lock.remove(workload_id)
+        };
+        if let Some(hostnames) = hostnames {
+            let mut htw_lock = self.host_to_workload.write().await;
+            for hostname in &hostnames {
+                if let Some(workload_set) = htw_lock.get_mut(hostname) {
+                    workload_set.remove(workload_id);
+                    if workload_set.is_empty() {
+                        htw_lock.remove(hostname);
+                    }
                 }
             }
         }
@@ -150,8 +197,8 @@ impl Router for DynamicRouter {
     fn allow_outgoing_request(
         &self,
         _workload_id: &str,
-        request: &hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        _config: &wasmtime_wasi_http::types::OutgoingRequestConfig,
+        request: &hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        _config: &wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         allowed_hosts: &[String],
     ) -> anyhow::Result<()> {
         check_allowed_hosts(request, allowed_hosts)
@@ -215,8 +262,8 @@ impl Router for DevRouter {
     fn allow_outgoing_request(
         &self,
         _workload_id: &str,
-        _request: &hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        _config: &wasmtime_wasi_http::types::OutgoingRequestConfig,
+        _request: &hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        _config: &wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         _allowed_hosts: &[String],
     ) -> anyhow::Result<()> {
         Ok(())
@@ -262,10 +309,10 @@ pub trait HostHandler: Send + Sync + 'static {
     fn outgoing_request(
         &self,
         workload_id: &str,
-        request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         allowed_hosts: &[String],
-    ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse>;
+    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>;
 }
 
 impl std::fmt::Debug for dyn HostHandler {
@@ -306,13 +353,14 @@ impl HostHandler for NullServer {
     fn outgoing_request(
         &self,
         _workload_id: &str,
-        _request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        _config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+        _request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        _config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         _allowed_hosts: &[String],
-    ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
-        Err(wasmtime_wasi_http::HttpError::trap(wasmtime::format_err!(
-            "http client not available"
-        )))
+    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
+    {
+        Err(wasmtime_wasi_http::p2::HttpError::trap(
+            wasmtime::format_err!("http client not available"),
+        ))
     }
 }
 
@@ -507,24 +555,25 @@ impl<T: Router> HostHandler for HttpServer<T> {
     fn outgoing_request(
         &self,
         workload_id: &str,
-        request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
-        config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         allowed_hosts: &[String],
-    ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
+    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
+    {
         if let Err(e) =
             self.router
                 .allow_outgoing_request(workload_id, &request, &config, allowed_hosts)
         {
             warn!(workload_id = %workload_id, err = %e, "outgoing request denied by allowed_hosts policy");
-            return Err(wasmtime_wasi_http::HttpError::trap(
-                wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied,
+            return Err(wasmtime_wasi_http::p2::HttpError::trap(
+                wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied,
             ));
         }
 
         if is_grpc_request(&request) {
             Ok(send_grpc_request(request, config))
         } else {
-            Ok(wasmtime_wasi_http::types::default_send_request(
+            Ok(wasmtime_wasi_http::p2::default_send_request(
                 request, config,
             ))
         }
@@ -701,6 +750,25 @@ async fn invoke_component_handler(
     // Create a new store for this request with plugin contexts
     let store = workload_handle.new_store(component_id).await?;
 
+    // Check if this component targets WASIP3 and dispatch accordingly
+    #[cfg(feature = "wasip3")]
+    if crate::engine::targets_wasip3_http(instance_pre.component()) {
+        let resp =
+            crate::host::http_p3::handle_component_request_p3(store, instance_pre, req, fuel_meter)
+                .await?;
+        // Convert P3 response to a compatible HyperOutgoingBody response
+        let (parts, body) = resp.into_parts();
+        let body = HyperOutgoingBody::new(
+            body.map_err(|e| {
+                wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::InternalError(Some(
+                    format!("failed to convert P3 http body: {e:?}"),
+                ))
+            })
+            .boxed_unsync(),
+        );
+        return Ok(hyper::Response::from_parts(parts, body));
+    }
+
     handle_component_request(store, instance_pre, req, fuel_meter).await
 }
 
@@ -729,8 +797,8 @@ pub async fn handle_component_request(
         .unwrap_or_default();
     let uri = req.uri().to_string();
 
-    let req = store.data_mut().new_incoming_request(scheme, req)?;
-    let out = store.data_mut().new_response_outparam(sender)?;
+    let req = store.data_mut().http().new_incoming_request(scheme, req)?;
+    let out = store.data_mut().http().new_response_outparam(sender)?;
     let pre = ProxyPre::new(pre)
         .map_err(anyhow::Error::from)
         .context("failed to instantiate proxy pre")?;
@@ -868,8 +936,8 @@ async fn load_tls_config(
 ///
 /// If `allowed_hosts` is empty, all requests are allowed.
 /// Supports wildcard patterns like `*.example.com` which match any subdomain.
-pub fn check_allowed_hosts(
-    request: &hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
+pub fn check_allowed_hosts<B>(
+    request: &hyper::Request<B>,
     allowed_hosts: &[String],
 ) -> anyhow::Result<()> {
     if allowed_hosts.is_empty() {
@@ -930,10 +998,10 @@ async fn send_grpc_request_handler(
         first_byte_timeout,
         between_bytes_timeout,
     }: OutgoingRequestConfig,
-) -> Result<IncomingResponse, wasmtime_wasi_http::bindings::http::types::ErrorCode> {
+) -> Result<IncomingResponse, wasmtime_wasi_http::p2::bindings::http::types::ErrorCode> {
     use tokio::net::TcpStream;
     use tokio::time::timeout;
-    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 
     let authority = if let Some(authority) = request.uri().authority() {
         if authority.port().is_some() {
@@ -1046,7 +1114,7 @@ async fn send_grpc_request_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wasmtime_wasi_http::body::HyperOutgoingBody;
+    use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 
     fn build_request(uri: &str) -> hyper::Request<HyperOutgoingBody> {
         hyper::Request::builder()
