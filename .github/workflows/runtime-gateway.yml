@@ -8,6 +8,8 @@ on:
   pull_request:
     paths:
       - "runtime-gateway/**"
+      - "runtime-operator/**"
+      - "go.work"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

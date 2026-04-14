@@ -27,23 +27,25 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	"go.wasmcloud.dev/runtime-operator/pkg/wasmbus"
+	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus"
 
 	"github.com/nats-io/nats.go"
-	runtime_operator "go.wasmcloud.dev/runtime-operator"
+	runtime_operator "go.wasmcloud.dev/runtime-operator/v2"
 
-	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/api/runtime/v1alpha1"
+	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -136,6 +138,7 @@ func main() {
 		HeartbeatTTL:              60 * time.Second,
 		HostCPUThreshold:          cpuBackpressureThreshold,
 		HostMemoryThreshold:       memoryBackpressureThreshold,
+		Namespace:                 os.Getenv("OPERATOR_NAMESPACE"),
 	}
 
 	if natsCreds != "" {
@@ -208,6 +211,20 @@ func main() {
 			}
 		}
 		cacheOpts.DefaultNamespaces = toWatchNamespaces
+	}
+
+	// Restrict the Pod cache to the operator's own namespace so the cache
+	// only requires a namespaced Role (not a ClusterRole) for Pod list/watch.
+	// ByObject overrides DefaultNamespaces for the specified type, so Pods are
+	// always scoped to the operator namespace regardless of -watch-namespaces.
+	if operatorCfg.Namespace != "" {
+		cacheOpts.ByObject = map[client.Object]cache.ByObject{
+			&corev1.Pod{}: {
+				Namespaces: map[string]cache.Config{
+					operatorCfg.Namespace: {},
+				},
+			},
+		}
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{

@@ -13,16 +13,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	"go.wasmcloud.dev/runtime-operator/api/condition"
-	"go.wasmcloud.dev/runtime-operator/pkg/wasmbus"
+	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
+	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus"
 
-	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/api/runtime/v1alpha1"
-	runtimev2 "go.wasmcloud.dev/runtime-operator/pkg/rpc/wasmcloud/runtime/v2"
+	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
+	runtimev2 "go.wasmcloud.dev/runtime-operator/v2/pkg/rpc/wasmcloud/runtime/v2"
 )
 
 const (
 	hostHeartbeatTimeout  = 5 * time.Second
 	hostReconcileInterval = 1 * time.Minute
+	hostFinalizerName     = "runtime.wasmcloud.dev/host-finalizer"
 )
 
 // HostReconciler reconciles a Host object
@@ -111,6 +112,32 @@ func (r *HostReconciler) reconcileReady(ctx context.Context, host *runtimev1alph
 	return fmt.Errorf("host has not reported recently")
 }
 
+// finalize deletes all Workload objects assigned to this host so that the
+// ReplicaSet controller can immediately schedule replacements rather than
+// waiting for the unhealthy-workload grace period to expire.
+// +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=workloads,verbs=get;list;delete
+func (r *HostReconciler) finalize(ctx context.Context, host *runtimev1alpha1.Host) error {
+	workloadList := &runtimev1alpha1.WorkloadList{}
+	if err := r.List(ctx, workloadList); err != nil {
+		return err
+	}
+
+	for i := range workloadList.Items {
+		workload := &workloadList.Items[i]
+		if workload.Status.HostID != host.HostID {
+			continue
+		}
+		if workload.DeletionTimestamp != nil {
+			continue
+		}
+		if err := r.Delete(ctx, workload); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=hosts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=hosts/status,verbs=get;update;patch
@@ -123,6 +150,7 @@ func (r *HostReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		&runtimev1alpha1.Host{},
 		hostReconcileInterval)
 
+	reconciler.SetFinalizer(hostFinalizerName, r.finalize)
 	reconciler.SetCondition(runtimev1alpha1.HostConditionReporting, r.reconcileReporting)
 	reconciler.SetCondition(condition.TypeReady, r.reconcileReady)
 
@@ -140,6 +168,7 @@ func (r *HostReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			"lastSeen", host.Status.LastSeen.Time,
 			"unreachableDuration", time.Since(host.Status.LastSeen.Time).Round(time.Second),
 		)
+		// Delete unresponsive host; the finalizer will clean up assigned workloads.
 		return r.Delete(ctx, host)
 	})
 
@@ -155,7 +184,7 @@ func (r *HostReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&runtimev1alpha1.Host{}).
-		Named("workload-Host").
+		Named("workload-host").
 		Complete(r)
 }
 
@@ -172,7 +201,7 @@ func (h *hostStatusUpdater) Start(ctx context.Context) error {
 		return err
 	}
 
-	go subscription.Handle(func(msg *wasmbus.Message) {
+	subscription.Handle(func(msg *wasmbus.Message) {
 		var req runtimev2.HostHeartbeat
 		if err := protojson.Unmarshal(msg.Data, &req); err != nil {
 			logger.Error(err, "failed to decode heartbeat message",
@@ -184,15 +213,19 @@ func (h *hostStatusUpdater) Start(ctx context.Context) error {
 
 		host := &runtimev1alpha1.Host{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:   req.FriendlyName,
-				Labels: req.GetLabels(),
+				Name: req.FriendlyName,
 			},
-			HostID:   req.Id,
-			Hostname: req.Hostname,
-			HTTPPort: req.HttpPort,
 		}
+
+		// CreateOrUpdate handles spec and metadata (labels, HostID, Hostname,
+		// HTTPPort). The mutate func sets these fields so they are applied on
+		// both create and update paths (c.Get overwrites the pre-populated
+		// struct for existing objects).
 		result, err := controllerutil.CreateOrUpdate(ctx, h.client, host, func() error {
-			host.Status.LastSeen = metav1.Now()
+			host.Labels = req.GetLabels()
+			host.HostID = req.Id
+			host.Hostname = req.Hostname
+			host.HTTPPort = req.HttpPort
 			return nil
 		})
 		if err != nil {
@@ -212,6 +245,17 @@ func (h *hostStatusUpdater) Start(ctx context.Context) error {
 				"version", req.Version,
 				"startedAt", req.StartedAt.AsTime(),
 			)
+		}
+
+		// Status is a separate subresource; c.Update() (used by CreateOrUpdate)
+		// silently ignores status fields. Use Status().Patch() to persist
+		// LastSeen without conflicting with concurrent metadata changes (e.g.
+		// the ConditionedReconciler adding a finalizer between CreateOrUpdate
+		// and this call).
+		base := host.DeepCopy()
+		host.Status.LastSeen = metav1.Now()
+		if err := h.client.Status().Patch(ctx, host, client.MergeFrom(base)); err != nil {
+			fmt.Println("Failed to update Host status:", err)
 		}
 	})
 

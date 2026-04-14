@@ -16,7 +16,7 @@ on:
     branches:
       - main
     tags:
-      - "wash-v*"
+      - "v*"
 
 defaults:
   run:
@@ -86,8 +86,13 @@ jobs:
       - name: Test
         env:
           RUST_BACKTRACE: "1"
+          OCI_INTEGRATION_TESTS: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
+          NATS_INTEGRATION_TESTS: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
         run: |
           cargo test --workspace
+      - name: Test with wasip3
+        run: |
+          cargo test -p wash-runtime --features wasip3
 
   lint:
     runs-on: ubuntu-latest
@@ -116,7 +121,7 @@ jobs:
           cargo +nightly fmt -- --check
       - name: Lint
         run: |
-          cargo clippy --workspace
+          cargo clippy --workspace --features wasip3
       - name: Check for unused dependencies
         run: |
           cargo machete
@@ -135,7 +140,7 @@ jobs:
         type=raw,value=canary-v2
 
   docker-release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/wash-v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
       packages: write
@@ -145,10 +150,10 @@ jobs:
       push: true
       image: ghcr.io/wasmcloud/wash
       tags: |
-        type=match,pattern=wash-v(.*),group=1
+        type=semver,pattern={{version}},value=${{ github.ref_name }}
 
   release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/wash-v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -206,11 +211,25 @@ jobs:
           ${{ matrix.buildCommand }} --release --target ${{ matrix.target }}
           cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.artifact }}
 
+      - name: Create Windows zip archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin }}" -DestinationPath "${{ matrix.artifact }}.zip"
+
       - name: Upload artifact
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+      - name: Upload Windows zip artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ${{ matrix.artifact }}.zip
+          path: ${{ matrix.artifact }}.zip
           if-no-files-found: error
 
   upload-release-assets:
@@ -249,7 +268,7 @@ jobs:
 
   update-homebrew:
     needs: upload-release-assets
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/wash-v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -257,7 +276,7 @@ jobs:
       - name: Extract version from tag
         id: version
         run: |
-          VERSION="${GITHUB_REF_NAME#wash-v}"
+          VERSION="${GITHUB_REF_NAME#v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch Homebrew tap update
@@ -268,3 +287,25 @@ jobs:
             -f event_type=brew-formula-update \
             -f 'client_payload[tag_prefix]=wash' \
             -f 'client_payload[tag_version]=${{ steps.version.outputs.version }}'
+
+  update-winget:
+    needs: upload-release-assets
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Update winget package
+        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        with:
+          identifier: wasmCloud.wash
+          version: ${{ steps.version.outputs.version }}
+          installers-regex: '\.zip$'
+          release-tag: ${{ github.ref_name }}
+          token: ${{ secrets.WASMCLOUD_BOT_PAT }}
