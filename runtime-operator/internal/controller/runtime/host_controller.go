@@ -49,10 +49,18 @@ func (r *HostReconciler) reconcileReporting(ctx context.Context, host *runtimev1
 
 	heartbeat, err := client.Heartbeat(ctx)
 	if err != nil {
+		logger := ctrl.LoggerFrom(ctx)
+		logger.Error(err, "host heartbeat failed",
+			"hostName", host.Name,
+			"hostID", host.HostID,
+			"lastSeen", host.Status.LastSeen.Time,
+		)
 		return err
 	}
 
 	condition.ForceStatusUpdate(ctx)
+
+	wasReporting := host.Status.AllTrue(runtimev1alpha1.HostConditionReporting)
 
 	host.Status.SystemCPUUsage = strconv.FormatFloat(float64(heartbeat.GetSystemCpuUsage()), 'f', -1, 32)
 	host.Status.SystemMemoryTotal = int64(heartbeat.GetSystemMemoryTotal())
@@ -65,12 +73,35 @@ func (r *HostReconciler) reconcileReporting(ctx context.Context, host *runtimev1
 	host.Status.Version = heartbeat.GetVersion()
 
 	host.Status.LastSeen = metav1.Now()
+
+	if !wasReporting {
+		logger := ctrl.LoggerFrom(ctx)
+		logger.Info("host heartbeat received",
+			"hostName", host.Name,
+			"hostID", host.HostID,
+			"version", heartbeat.GetVersion(),
+			"cpuUsage", heartbeat.GetSystemCpuUsage(),
+			"memoryFree", heartbeat.GetSystemMemoryFree(),
+			"memoryTotal", heartbeat.GetSystemMemoryTotal(),
+			"componentCount", heartbeat.GetComponentCount(),
+			"workloadCount", heartbeat.GetWorkloadCount(),
+		)
+	}
+
 	return nil
 }
 
-func (r *HostReconciler) reconcileReady(_ context.Context, host *runtimev1alpha1.Host) error {
+func (r *HostReconciler) reconcileReady(ctx context.Context, host *runtimev1alpha1.Host) error {
 	if host.Status.AllTrue(runtimev1alpha1.HostConditionReporting) {
 		return nil
+	}
+
+	if host.Status.LastSeen.IsZero() {
+		logger := ctrl.LoggerFrom(ctx)
+		logger.Info("host has never reported (lastSeen is zero, status may not have been persisted)",
+			"hostName", host.Name,
+			"hostID", host.HostID,
+		)
 	}
 
 	if host.Status.LastSeen.Add(r.UnreachableTimeout).After(metav1.Now().Time) {
@@ -102,7 +133,13 @@ func (r *HostReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		if host.Status.AnyUnknown(condition.TypeReady) {
 			return nil
 		}
-		// Delete unresponsive host
+		logger := ctrl.LoggerFrom(ctx)
+		logger.Info("deleting unresponsive host",
+			"hostName", host.Name,
+			"hostID", host.HostID,
+			"lastSeen", host.Status.LastSeen.Time,
+			"unreachableDuration", time.Since(host.Status.LastSeen.Time).Round(time.Second),
+		)
 		return r.Delete(ctx, host)
 	})
 
@@ -128,6 +165,8 @@ type hostStatusUpdater struct {
 }
 
 func (h *hostStatusUpdater) Start(ctx context.Context) error {
+	logger := ctrl.Log.WithName("host-status-updater")
+
 	subscription, err := h.bus.Subscribe("runtime.operator.heartbeat.>", 100)
 	if err != nil {
 		return err
@@ -136,7 +175,10 @@ func (h *hostStatusUpdater) Start(ctx context.Context) error {
 	go subscription.Handle(func(msg *wasmbus.Message) {
 		var req runtimev2.HostHeartbeat
 		if err := protojson.Unmarshal(msg.Data, &req); err != nil {
-			fmt.Println("Failed to decode heartbeat message:", err)
+			logger.Error(err, "failed to decode heartbeat message",
+				"natsSubject", msg.Subject,
+				"rawDataLen", len(msg.Data),
+			)
 			return
 		}
 
@@ -149,15 +191,31 @@ func (h *hostStatusUpdater) Start(ctx context.Context) error {
 			Hostname: req.Hostname,
 			HTTPPort: req.HttpPort,
 		}
-		_, err := controllerutil.CreateOrUpdate(ctx, h.client, host, func() error {
+		result, err := controllerutil.CreateOrUpdate(ctx, h.client, host, func() error {
 			host.Status.LastSeen = metav1.Now()
 			return nil
 		})
 		if err != nil {
-			fmt.Println("Failed to create or update Host resource:", err)
+			logger.Error(err, "failed to create or update host resource",
+				"hostName", req.FriendlyName,
+				"hostID", req.Id,
+				"hostname", req.Hostname,
+			)
+			return
+		}
+
+		if result == controllerutil.OperationResultCreated {
+			logger.Info("host discovered via heartbeat",
+				"hostName", req.FriendlyName,
+				"hostID", req.Id,
+				"hostname", req.Hostname,
+				"version", req.Version,
+				"startedAt", req.StartedAt.AsTime(),
+			)
 		}
 	})
 
 	<-ctx.Done()
+	logger.Info("stopping host status updater")
 	return subscription.Drain()
 }
