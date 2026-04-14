@@ -18,11 +18,11 @@ use crate::{
     wit::{WitInterface, WitWorld},
 };
 
-use bindings::bettyblocks::smtp::client::{
+use bindings::betty_blocks::smtp::client::{
     Credentials, Host, Message, SendResult, TlsMode, add_to_linker,
 };
 
-const BETTYBLOCKS_SMTP_PLUGIN_ID: &str = "bettyblocks-smtp";
+const BETTYBLOCKS_SMTP_PLUGIN_ID: &str = "betty-blocks-smtp";
 const PLAIN_TEXT_WIDTH: usize = 80;
 const MAX_POOLED_CONNECTIONS: u32 = 5;
 const MIN_IDLE_CONNECTIONS: u32 = 0;
@@ -177,7 +177,7 @@ impl HostPlugin for BettySmtp {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from("bettyblocks:smtp/client@0.2.0")]),
+            imports: HashSet::from([WitInterface::from("betty-blocks:smtp/client@0.2.0")]),
             ..Default::default()
         }
     }
@@ -189,7 +189,7 @@ impl HostPlugin for BettySmtp {
     ) -> anyhow::Result<()> {
         let has_smtp = interfaces
             .iter()
-            .any(|i| i.namespace == "bettyblocks" && i.package == "smtp");
+            .any(|i| i.namespace == "betty-blocks" && i.package == "smtp");
 
         if !has_smtp {
             tracing::warn!(

@@ -70,7 +70,7 @@ fn create_workload_request(name: &str, host_header: &str) -> WorkloadStartReques
                     name: None,
                 },
                 WitInterface {
-                    namespace: "bettyblocks".to_string(),
+                    namespace: "betty-blocks".to_string(),
                     package: "smtp".to_string(),
                     interfaces: ["client".to_string()].into_iter().collect(),
                     version: Some(semver::Version::parse("0.2.0").unwrap()),
