@@ -311,6 +311,7 @@ async fn create_workload(host: &Host, config: &Config, bytes: Bytes) -> anyhow::
                 volume_mounts: volume_mounts.clone(),
                 ..Default::default()
             },
+            precompiled: Vec::new(),
         })
     } else {
         let component_interfaces = host
@@ -338,6 +339,7 @@ async fn create_workload(host: &Host, config: &Config, bytes: Bytes) -> anyhow::
             },
             pool_size: -1,
             max_invocations: -1,
+            precompiled: Vec::new(),
         });
 
         if let Some(service_path) = &dev_config.service_file {
@@ -353,6 +355,7 @@ async fn create_workload(host: &Host, config: &Config, bytes: Bytes) -> anyhow::
                     volume_mounts: volume_mounts.clone(),
                     ..Default::default()
                 },
+                precompiled: Vec::new(),
             });
         }
     }
@@ -392,6 +395,7 @@ async fn create_workload(host: &Host, config: &Config, bytes: Bytes) -> anyhow::
             },
             pool_size: -1,
             max_invocations: -1,
+            precompiled: Vec::new(),
         });
     }
 

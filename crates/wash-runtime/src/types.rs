@@ -17,6 +17,7 @@
 use bytes::Bytes;
 use std::{collections::HashMap, sync::Arc};
 
+use crate::component_loader::PrecompiledVariant;
 use crate::wit::WitInterface;
 
 /// Represents a deployable workload containing one or more WebAssembly components.
@@ -54,6 +55,8 @@ pub struct Service {
     pub digest: Option<String>,
     pub local_resources: LocalResources,
     pub max_restarts: u64,
+    /// Precompiled variants published for this component, consulted before Cranelift.
+    pub precompiled: Vec<PrecompiledVariant>,
 }
 
 /// A WebAssembly component that can be executed as part of a workload.
@@ -66,6 +69,8 @@ pub struct Component {
     pub local_resources: LocalResources,
     pub pool_size: i32,
     pub max_invocations: i32,
+    /// Precompiled variants published for this component, consulted before Cranelift.
+    pub precompiled: Vec<PrecompiledVariant>,
 }
 
 /// Resource limits and configuration for a component or service.

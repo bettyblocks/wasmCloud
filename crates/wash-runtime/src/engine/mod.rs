@@ -49,6 +49,8 @@ use tracing::{instrument, warn};
 use wasmtime::PoolingAllocationConfig;
 use wasmtime::component::{Component, Linker};
 
+use crate::artifact_store::ArtifactStoreRegistry;
+use crate::component_loader::{ComponentLoader, ComponentSource, DefaultComponentLoader};
 use crate::engine::ctx::SharedCtx;
 use crate::engine::workload::{UnresolvedWorkload, WorkloadComponent, WorkloadService};
 use crate::types::{EmptyDirVolume, HostPathVolume, VolumeType, Workload};
@@ -230,14 +232,27 @@ pub mod workload;
 /// The `Engine` is responsible for compiling WebAssembly components, managing
 /// their lifecycle, and providing the runtime environment for execution.
 /// It wraps a wasmtime engine with additional functionality for workload management.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Engine {
     // wasmtime engine
     pub(crate) inner: wasmtime::Engine,
     pub(crate) cache: Cache<CacheKey, CacheValue>,
+    /// Resolves a [`crate::types::Component`] into a wasmtime component, either
+    /// by fetching a precompiled variant or compiling its `bytes` inline.
+    pub(crate) component_loader: Arc<dyn ComponentLoader>,
     /// Whether WASIP3 support is enabled for this engine.
     #[cfg(feature = "wasip3")]
     wasip3: bool,
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("Engine");
+        s.field("inner", &self.inner).field("cache", &self.cache);
+        #[cfg(feature = "wasip3")]
+        s.field("wasip3", &self.wasip3);
+        s.finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -292,7 +307,7 @@ impl Engine {
     /// - Service component validation fails
     /// - Volume paths don't exist or aren't accessible
     /// - Component initialization fails
-    pub fn initialize_workload(
+    pub async fn initialize_workload(
         &self,
         id: impl AsRef<str>,
         workload: Workload,
@@ -338,14 +353,17 @@ impl Engine {
 
         // Iniitalize service
         let service = if let Some(svc) = service {
-            match self.initialize_service(
-                id.as_ref(),
-                &name,
-                &namespace,
-                svc,
-                &validated_volumes,
-                Arc::clone(&loopback),
-            ) {
+            match self
+                .initialize_service(
+                    id.as_ref(),
+                    &name,
+                    &namespace,
+                    svc,
+                    &validated_volumes,
+                    Arc::clone(&loopback),
+                )
+                .await
+            {
                 Ok(handle) => {
                     tracing::debug!("successfully initialized service component");
                     Some(handle)
@@ -362,14 +380,17 @@ impl Engine {
         // Initialize all components
         let mut workload_components = Vec::new();
         for component in components.into_iter() {
-            match self.initialize_workload_component(
-                id.as_ref(),
-                &name,
-                &namespace,
-                component,
-                &validated_volumes,
-                Arc::clone(&loopback),
-            ) {
+            match self
+                .initialize_workload_component(
+                    id.as_ref(),
+                    &name,
+                    &namespace,
+                    component,
+                    &validated_volumes,
+                    Arc::clone(&loopback),
+                )
+                .await
+            {
                 Ok(handle) => {
                     tracing::debug!("successfully initialized workload component");
                     workload_components.push(handle);
@@ -392,7 +413,7 @@ impl Engine {
     }
 
     #[instrument(name = "initialize_service", skip_all)]
-    fn initialize_service(
+    async fn initialize_service(
         &self,
         workload_id: impl AsRef<str>,
         workload_name: impl AsRef<str>,
@@ -401,9 +422,10 @@ impl Engine {
         validated_volumes: &std::collections::HashMap<String, PathBuf>,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
     ) -> anyhow::Result<WorkloadService> {
-        // Create a wasmtime component from the bytes
+        // Create a wasmtime component (precompiled variant if available, else compile)
         let wasmtime_component = self
-            .load_component_bytes(service.bytes, service.digest)
+            .load_service_component(&service)
+            .await
             .context("failed to create component from bytes")?;
 
         // Create a linker for this component
@@ -470,45 +492,86 @@ impl Engine {
         Ok(service)
     }
 
-    /// Load a WebAssembly component from raw bytes or yields a previously compiled one.
-    #[instrument(name = "load_component_bytes", skip_all, fields(digest = %digest.as_ref().map(|d| d.as_ref()).unwrap_or("none")))]
-    fn load_component_bytes(
+    /// Load a WebAssembly component, consulting precompiled variants via the
+    /// configured [`ComponentLoader`] before falling back to Cranelift.
+    ///
+    /// The in-process moka cache sits in front of the loader: repeated calls
+    /// for the same digest short-circuit before any loader work.
+    #[instrument(name = "load_component", skip_all, fields(component.name = %component.name, digest = %component.digest.as_deref().unwrap_or("none")))]
+    async fn load_component(
         &self,
-        bytes: impl AsRef<[u8]>,
-        digest: Option<impl AsRef<str>>,
+        component: &crate::types::Component,
     ) -> anyhow::Result<Component> {
-        match digest {
-            None => {
-                tracing::debug!("no digest provided, compiling component without caching");
-                let compiled = Component::new(&self.inner, bytes.as_ref())
-                    .map_err(anyhow::Error::from)
-                    .context("failed to compile component from bytes")?;
-                Ok(compiled)
-            }
-            Some(digest) => {
-                let key = CacheKey(digest.as_ref().to_string());
-                let inner = &self.inner;
-                let bytes_ref = bytes.as_ref();
-
-                self.cache
-                    .try_get_with(key, || {
-                        Component::new(inner, bytes_ref)
-                            .map_err(anyhow::Error::from)
-                            .context("failed to compile component from bytes")
-                            .map(CacheValue)
-                    })
-                    .map_err(|e: Arc<anyhow::Error>| {
-                        anyhow::anyhow!(e).context("compilation cache error")
-                    })
-                    .map(|v| v.0)
+        if let Some(digest) = &component.digest {
+            let key = CacheKey(digest.clone());
+            if let Some(cached) = self.cache.get(&key) {
+                tracing::debug!("component cache hit");
+                return Ok(cached.0);
             }
         }
+
+        let source = ComponentSource {
+            name: component.name.clone(),
+            oci_image: String::new(),
+            digest: component.digest.clone(),
+            precompiled: component.precompiled.clone(),
+            fallback_bytes: Some(component.bytes.clone()),
+        };
+
+        let compiled = self
+            .component_loader
+            .load(&source, &self.inner)
+            .await
+            .context("failed to load component via ComponentLoader")?;
+
+        if let Some(digest) = &component.digest {
+            self.cache
+                .insert(CacheKey(digest.clone()), CacheValue(compiled.clone()));
+        }
+
+        Ok(compiled)
+    }
+
+    /// Same as [`Self::load_component`] but for a [`crate::types::Service`].
+    #[instrument(name = "load_service_component", skip_all, fields(digest = %service.digest.as_deref().unwrap_or("none")))]
+    async fn load_service_component(
+        &self,
+        service: &crate::types::Service,
+    ) -> anyhow::Result<Component> {
+        if let Some(digest) = &service.digest {
+            let key = CacheKey(digest.clone());
+            if let Some(cached) = self.cache.get(&key) {
+                tracing::debug!("service component cache hit");
+                return Ok(cached.0);
+            }
+        }
+
+        let source = ComponentSource {
+            name: "service".to_string(),
+            oci_image: String::new(),
+            digest: service.digest.clone(),
+            precompiled: service.precompiled.clone(),
+            fallback_bytes: Some(service.bytes.clone()),
+        };
+
+        let compiled = self
+            .component_loader
+            .load(&source, &self.inner)
+            .await
+            .context("failed to load service component via ComponentLoader")?;
+
+        if let Some(digest) = &service.digest {
+            self.cache
+                .insert(CacheKey(digest.clone()), CacheValue(compiled.clone()));
+        }
+
+        Ok(compiled)
     }
 
     /// Initialize a component that is a part of a workload, add wasi@0.2 interfaces (and
     /// wasi:http if the `http` feature is enabled) to the linker.
     #[instrument(name = "initialize_workload_component", skip_all, fields(component.name = %component.name))]
-    fn initialize_workload_component(
+    async fn initialize_workload_component(
         &self,
         workload_id: impl AsRef<str>,
         workload_name: impl AsRef<str>,
@@ -517,9 +580,10 @@ impl Engine {
         validated_volumes: &std::collections::HashMap<String, PathBuf>,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
     ) -> anyhow::Result<WorkloadComponent> {
-        // Create a wasmtime component from the bytes
+        // Create a wasmtime component (precompiled variant if available, else compile)
         let wasmtime_component = self
-            .load_component_bytes(component.bytes, component.digest)
+            .load_component(&component)
+            .await
             .context("failed to create component from bytes")?;
 
         // Create a linker for this component
@@ -592,6 +656,8 @@ pub struct EngineBuilder {
     compilation_cache_size: Option<u64>,
     compilation_cache_ttl: Option<Duration>,
     fuel_consumption: bool,
+    component_loader: Option<Arc<dyn ComponentLoader>>,
+    artifact_stores: Option<ArtifactStoreRegistry>,
     #[cfg(feature = "wasip3")]
     wasip3: bool,
 }
@@ -654,6 +720,21 @@ impl EngineBuilder {
         self.wasip3 = enable;
         self
     }
+
+    /// Override the [`ComponentLoader`]. Without this call, a
+    /// [`DefaultComponentLoader`] is constructed using the [`ArtifactStoreRegistry`]
+    /// provided via [`Self::with_artifact_stores`] (or an empty one if none).
+    pub fn with_component_loader(mut self, loader: Arc<dyn ComponentLoader>) -> Self {
+        self.component_loader = Some(loader);
+        self
+    }
+
+    /// Provide the [`ArtifactStoreRegistry`] used by the default
+    /// [`ComponentLoader`]. Ignored if [`Self::with_component_loader`] is also set.
+    pub fn with_artifact_stores(mut self, stores: ArtifactStoreRegistry) -> Self {
+        self.artifact_stores = Some(stores);
+        self
+    }
 }
 
 impl EngineBuilder {
@@ -705,9 +786,23 @@ impl EngineBuilder {
                     .unwrap_or(Duration::from_secs(600)),
             )
             .build();
+
+        let component_loader: Arc<dyn ComponentLoader> = match self.component_loader {
+            Some(loader) => loader,
+            None => {
+                let stores = self.artifact_stores.unwrap_or_default();
+                Arc::new(DefaultComponentLoader::new(
+                    stores,
+                    env!("WASH_TARGET_TRIPLE"),
+                    env!("WASH_WASMTIME_VERSION"),
+                ))
+            }
+        };
+
         Ok(Engine {
             inner,
             cache,
+            component_loader,
             #[cfg(feature = "wasip3")]
             wasip3: self.wasip3,
         })

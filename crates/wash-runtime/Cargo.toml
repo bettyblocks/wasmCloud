@@ -15,8 +15,11 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
-default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel"]
-oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:sha2", "dep:wit-component"]
+default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel", "artifact-store-nats"]
+# Enables the NATS JetStream Object Store backend for `artifact_store`. Safe to
+# disable if a different backend is provided via `ArtifactStoreRegistry::register`.
+artifact-store-nats = []
+oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:wit-component"]
 wasi-otel = []
 washlet = ["oci"]
 wasi-config = []
@@ -96,7 +99,7 @@ wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git
 docker_credential = { workspace = true, optional = true }
 oci-client = { workspace = true, optional = true, features = ["rustls-tls", "rustls-tls-native-roots"] }
 oci-wasm = { workspace = true, optional = true, features = ["rustls-tls"] }
-sha2 = { workspace = true, optional = true }
+sha2 = { workspace = true }
 wit-component = { workspace = true, optional = true }
 
 # PostgreSQL dependencies (optional, behind 'wasmcloud-postgres' feature)

@@ -406,6 +406,7 @@ async fn workload_start(
                     .unwrap_or_default(),
                 pool_size: component.pool_size,
                 max_invocations: component.max_invocations,
+                precompiled: Vec::new(),
             })
         }
         (
@@ -449,6 +450,7 @@ async fn workload_start(
                 .map(Into::into)
                 .unwrap_or_default(),
             max_restarts: service.max_restarts,
+            precompiled: Vec::new(),
         })
     } else {
         None

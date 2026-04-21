@@ -269,6 +269,37 @@ fn compile_protos(workspace_dir: &Path, out_dir: &Path) {
         .expect("failed to build final protos");
 }
 
+/// Extract the exact wasmtime version from the workspace Cargo.lock.
+///
+/// The runtime reads this via `env!("WASH_WASMTIME_VERSION")` to stamp
+/// precompiled artifacts and to refuse to load variants compiled with a
+/// different version. Falls back to `"unknown"` if the lock file is absent
+/// (the compat hash still catches real drift, but logs will be less useful).
+fn wasmtime_version(workspace_dir: &Path) -> String {
+    let lock = workspace_dir.join("Cargo.lock");
+    let Ok(contents) = fs::read_to_string(&lock) else {
+        return "unknown".into();
+    };
+
+    let mut lines = contents.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == r#"name = "wasmtime""# {
+            for next in lines.by_ref() {
+                let t = next.trim();
+                if let Some(rest) = t.strip_prefix("version = \"") {
+                    if let Some(end) = rest.find('"') {
+                        return rest[..end].to_string();
+                    }
+                }
+                if t.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    "unknown".into()
+}
+
 fn main() {
     let out_dir = PathBuf::from(
         env::var("OUT_DIR").expect("failed to look up `OUT_DIR` from environment variables"),
@@ -278,6 +309,17 @@ fn main() {
     // Export WORKSPACE_ROOT so runtime code (`env!("WORKSPACE_ROOT")`)
     // can locate fixture artifacts regardless of how it was invoked.
     println!("cargo:rustc-env=WORKSPACE_ROOT={}", workspace_dir.display());
+
+    let wasmtime_ver = wasmtime_version(&workspace_dir);
+    println!("cargo:rustc-env=WASH_WASMTIME_VERSION={wasmtime_ver}");
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace_dir.join("Cargo.lock").display()
+    );
+
+    // Target triple this host was built for — used to match precompiled variants.
+    let target = env::var("TARGET").unwrap_or_else(|_| "unknown".into());
+    println!("cargo:rustc-env=WASH_TARGET_TRIPLE={target}");
 
     build_all_fixtures(&workspace_dir);
     compile_protos(&workspace_dir, &out_dir);

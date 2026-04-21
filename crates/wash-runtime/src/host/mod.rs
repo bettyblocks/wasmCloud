@@ -536,7 +536,8 @@ impl Host {
         // Initialize the workload using the engine, receiving the unresolved workload
         let unresolved_workload = self
             .engine
-            .initialize_workload(&request.workload_id, request.workload)?;
+            .initialize_workload(&request.workload_id, request.workload)
+            .await?;
 
         let mut resolved_workload = unresolved_workload
             .resolve(Some(&self.plugins), self.http_handler.clone())
@@ -994,6 +995,7 @@ mod tests {
                         local_resources: Default::default(),
                         pool_size: 1,
                         max_invocations: 100,
+                        precompiled: Vec::new(),
                     }],
                     host_interfaces: vec![],
                     volumes: vec![],
@@ -1028,6 +1030,7 @@ mod tests {
                         digest: None,
                         local_resources: Default::default(),
                         max_restarts: 0,
+                        precompiled: Vec::new(),
                     }),
                     components: vec![],
                     host_interfaces: vec![],
