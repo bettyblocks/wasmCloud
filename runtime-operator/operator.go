@@ -58,6 +58,15 @@ type EmbeddedOperatorConfig struct {
 	// as the fallback HostPoolTargets when a WD does not set its own. Should
 	// be a subset of PrecompileTargetMatrix.
 	DefaultHostPoolTargets []string
+
+	// AutoArtifactCleanupInterval is how often the cleanup loop scans for
+	// orphaned auto-created Artifacts. Zero disables cleanup.
+	AutoArtifactCleanupInterval time.Duration
+
+	// AutoArtifactCleanupTTL is the minimum age an unreferenced auto-Artifact
+	// must reach before the cleaner deletes it. Defaults to 24h when
+	// AutoArtifactCleanupInterval is set and this is zero.
+	AutoArtifactCleanupTTL time.Duration
 }
 
 // EmbeddedOperator is the main struct for the embedded operator.
@@ -158,6 +167,20 @@ func NewEmbeddedOperator(
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
+	}
+
+	if cfg.AutoArtifactCleanupInterval > 0 {
+		ttl := cfg.AutoArtifactCleanupTTL
+		if ttl <= 0 {
+			ttl = 24 * time.Hour
+		}
+		if err := mgr.Add(&runtime_controllers.AutoArtifactCleaner{
+			Client:   mgr.GetClient(),
+			Interval: cfg.AutoArtifactCleanupInterval,
+			TTL:      ttl,
+		}); err != nil {
+			return nil, fmt.Errorf("add AutoArtifactCleaner: %w", err)
+		}
 	}
 
 	return &EmbeddedOperator{

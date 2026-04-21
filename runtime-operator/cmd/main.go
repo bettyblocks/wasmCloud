@@ -81,6 +81,8 @@ func main() {
 		precompileEnabled           bool
 		precompileTargets           string
 		precompileStream            string
+		autoArtifactCleanupInterval time.Duration
+		autoArtifactCleanupTTL      time.Duration
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
@@ -136,6 +138,18 @@ func main() {
 		"wasmcloud-precompile",
 		"JetStream stream name carrying precompile jobs.",
 	)
+	flag.DurationVar(
+		&autoArtifactCleanupInterval,
+		"auto-artifact-cleanup-interval",
+		0,
+		"How often to scan for orphaned auto-created Artifacts. Zero disables cleanup.",
+	)
+	flag.DurationVar(
+		&autoArtifactCleanupTTL,
+		"auto-artifact-cleanup-ttl",
+		24*time.Hour,
+		"Minimum age an unreferenced auto-created Artifact must reach before deletion.",
+	)
 
 	opts := zap.Options{
 		Development: true,
@@ -162,16 +176,18 @@ func main() {
 	}
 
 	operatorCfg := runtime_operator.EmbeddedOperatorConfig{
-		DisableArtifactController: disableArtifactController,
-		NatsURL:                   natsUrl,
-		HeartbeatTTL:              60 * time.Second,
-		HostCPUThreshold:          cpuBackpressureThreshold,
-		HostMemoryThreshold:       memoryBackpressureThreshold,
-		Namespace:                 os.Getenv("OPERATOR_NAMESPACE"),
-		PrecompileEnabled:         precompileEnabled,
-		PrecompileTargetMatrix:    precompileTargetMatrix,
-		PrecompileStream:          precompileStream,
-		DefaultHostPoolTargets:    precompileTargetMatrix,
+		DisableArtifactController:   disableArtifactController,
+		NatsURL:                     natsUrl,
+		HeartbeatTTL:                60 * time.Second,
+		HostCPUThreshold:            cpuBackpressureThreshold,
+		HostMemoryThreshold:         memoryBackpressureThreshold,
+		Namespace:                   os.Getenv("OPERATOR_NAMESPACE"),
+		PrecompileEnabled:           precompileEnabled,
+		PrecompileTargetMatrix:      precompileTargetMatrix,
+		PrecompileStream:            precompileStream,
+		DefaultHostPoolTargets:      precompileTargetMatrix,
+		AutoArtifactCleanupInterval: autoArtifactCleanupInterval,
+		AutoArtifactCleanupTTL:      autoArtifactCleanupTTL,
 	}
 
 	if natsCreds != "" {

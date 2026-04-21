@@ -12,9 +12,14 @@
 //! `unsafe` call to [`Component::deserialize`] is only reachable after all three
 //! match.
 
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Counter, Histogram};
 use wasmtime::Engine;
 use wasmtime::component::Component;
 
@@ -63,6 +68,39 @@ pub trait ComponentLoader: Send + Sync {
         source: &ComponentSource,
         engine: &Engine,
     ) -> anyhow::Result<Component>;
+}
+
+/// Metric handles for [`DefaultComponentLoader`], initialized lazily on first
+/// use. Metrics are emitted via the global OpenTelemetry meter, the same
+/// mechanism used by [`crate::observability::Meters`]. When no OTel exporter
+/// is configured these are cheap no-ops.
+struct LoaderMetrics {
+    loads: Counter<u64>,
+    fetch_duration: Histogram<f64>,
+    compile_duration: Histogram<f64>,
+}
+
+fn loader_metrics() -> &'static LoaderMetrics {
+    static METRICS: OnceLock<LoaderMetrics> = OnceLock::new();
+    METRICS.get_or_init(|| {
+        let meter = opentelemetry::global::meter("wash-runtime");
+        LoaderMetrics {
+            loads: meter
+                .u64_counter("component_loader.loads")
+                .with_description(
+                    "Component loads, labelled by source (precompiled | fallback_compile | error)",
+                )
+                .build(),
+            fetch_duration: meter
+                .f64_histogram("component_loader.fetch_duration_seconds")
+                .with_description("Wall-clock duration fetching precompiled bytes from the store")
+                .build(),
+            compile_duration: meter
+                .f64_histogram("component_loader.compile_duration_seconds")
+                .with_description("Wall-clock duration of inline Cranelift compilation")
+                .build(),
+        }
+    })
 }
 
 /// Default [`ComponentLoader`]: tries precompiled variants first, then compiles inline.
@@ -157,6 +195,7 @@ impl ComponentLoader for DefaultComponentLoader {
         source: &ComponentSource,
         engine: &Engine,
     ) -> anyhow::Result<Component> {
+        let metrics = loader_metrics();
         let host_compat_hash = Self::compat_hash(engine);
 
         for variant in &source.precompiled {
@@ -174,36 +213,64 @@ impl ComponentLoader for DefaultComponentLoader {
                 "fetching precompiled variant"
             );
 
+            let started = Instant::now();
             let bytes = self
                 .stores
                 .fetch(&variant.url)
                 .await
                 .with_context(|| format!("fetching precompiled variant {}", variant.url))?;
+            metrics
+                .fetch_duration
+                .record(started.elapsed().as_secs_f64(), &[]);
 
             let component = deserialize_precompiled(engine, &bytes, &variant.url)?;
 
+            metrics.loads.add(
+                1,
+                &[KeyValue::new("source", "precompiled")],
+            );
             tracing::info!(
                 component = %source.name,
                 url = %variant.url,
+                fetch_ms = started.elapsed().as_millis() as u64,
                 "loaded precompiled component"
             );
             return Ok(component);
         }
 
-        let bytes = source.fallback_bytes.as_ref().with_context(|| {
-            format!(
-                "no precompiled variant matched for component '{}' and no fallback bytes provided",
-                source.name
-            )
-        })?;
+        let bytes = match source.fallback_bytes.as_ref() {
+            Some(b) => b,
+            None => {
+                metrics
+                    .loads
+                    .add(1, &[KeyValue::new("source", "error")]);
+                anyhow::bail!(
+                    "no precompiled variant matched for component '{}' and no fallback bytes provided",
+                    source.name
+                );
+            }
+        };
 
         tracing::info!(
             component = %source.name,
             "no precompiled variant matched; compiling inline"
         );
-        Component::new(engine, bytes.as_ref())
+        let started = Instant::now();
+        let result = Component::new(engine, bytes.as_ref())
             .map_err(anyhow::Error::from)
-            .with_context(|| format!("compiling component '{}'", source.name))
+            .with_context(|| format!("compiling component '{}'", source.name));
+        metrics
+            .compile_duration
+            .record(started.elapsed().as_secs_f64(), &[]);
+        match &result {
+            Ok(_) => metrics
+                .loads
+                .add(1, &[KeyValue::new("source", "fallback_compile")]),
+            Err(_) => metrics
+                .loads
+                .add(1, &[KeyValue::new("source", "error")]),
+        }
+        result
     }
 }
 

@@ -1,0 +1,32 @@
+apiVersion: runtime.wasmcloud.dev/v1alpha1
+kind: WorkloadDeployment
+metadata:
+  name: precompile-demo
+spec:
+  replicas: 1
+  # Strict: refuses to dispatch until every target in hostPoolTargets has a
+  # matching entry in the referenced Artifact's status.precompiled[].
+  # Switch to Fallback to let the host compile inline on miss.
+  precompileMode: Strict
+  hostPoolTargets:
+    - x86_64-unknown-linux-gnu
+  artifacts:
+    # Inline image: the controller upserts an Artifact named
+    # auto-<sha256(image)[:12]>. Multiple WDs using this image share the
+    # Artifact and its precompile cache.
+    - name: hello
+      image: ghcr.io/wasmcloud/components/hello-world:0.1.0
+  template:
+    spec:
+      hostSelector:
+        hostgroup: default
+      components:
+        - name: hello
+          image: artifact://hello
+      hostInterfaces:
+        - namespace: wasi
+          package: http
+          interfaces:
+            - incoming-handler
+          config:
+            host: localhost
