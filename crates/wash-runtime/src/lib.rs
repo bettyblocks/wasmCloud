@@ -2,6 +2,14 @@
 
 pub mod artifact_store;
 pub mod component_loader;
+
+/// Exact wasmtime crate version this build of wash-runtime links against.
+/// Stamped at build time from the workspace Cargo.lock.
+pub const WASMTIME_VERSION: &str = env!("WASH_WASMTIME_VERSION");
+
+/// Target triple this build of wash-runtime was compiled for. Used to match
+/// precompiled component variants.
+pub const TARGET_TRIPLE: &str = env!("WASH_TARGET_TRIPLE");
 pub mod engine;
 pub mod host;
 pub mod observability;

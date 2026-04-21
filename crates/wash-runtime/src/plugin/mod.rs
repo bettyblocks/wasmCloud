@@ -22,9 +22,10 @@
 //! - [`wasi_logging`] - Structured logging (`wasi:logging`)
 //! - [`wasi_otel`] - OpenTelemetry tracing, metrics, and logs (`wasi:otel/*`)
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
-use std::{collections::HashMap, path::Path};
+#[cfg(feature = "wasi-blobstore")]
+use std::path::{Path, PathBuf};
 
 use crate::engine::workload::WorkloadItem;
 use crate::{
@@ -328,6 +329,7 @@ impl<T, Y> WorkloadTracker<T, Y> {
 }
 
 /// Locks an untrusted path to be within the given root directory.
+#[cfg(feature = "wasi-blobstore")]
 pub(crate) fn lock_root(root: impl AsRef<Path>, untrusted: &str) -> Result<PathBuf, &'static str> {
     let path = Path::new(untrusted);
 

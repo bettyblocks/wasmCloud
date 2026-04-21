@@ -78,6 +78,9 @@ func main() {
 		memoryBackpressureThreshold float64
 		disableArtifactController   bool
 		watchNamespaces             string
+		precompileEnabled           bool
+		precompileTargets           string
+		precompileStream            string
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
@@ -115,6 +118,24 @@ func main() {
 		"",
 		"Comma-separated list of namespaces to watch. If empty, watches all namespaces.",
 	)
+	flag.BoolVar(
+		&precompileEnabled,
+		"precompile-enabled",
+		false,
+		"Enable the out-of-process precompile pipeline. Requires the worker pool and a NATS JetStream stream/object-store.",
+	)
+	flag.StringVar(
+		&precompileTargets,
+		"precompile-targets",
+		"x86_64-unknown-linux-gnu",
+		"Comma-separated target triples to produce precompiled variants for.",
+	)
+	flag.StringVar(
+		&precompileStream,
+		"precompile-stream",
+		"wasmcloud-precompile",
+		"JetStream stream name carrying precompile jobs.",
+	)
 
 	opts := zap.Options{
 		Development: true,
@@ -132,6 +153,14 @@ func main() {
 		zapOpts...,
 	))
 
+	var precompileTargetMatrix []string
+	for _, t := range strings.Split(precompileTargets, ",") {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			precompileTargetMatrix = append(precompileTargetMatrix, t)
+		}
+	}
+
 	operatorCfg := runtime_operator.EmbeddedOperatorConfig{
 		DisableArtifactController: disableArtifactController,
 		NatsURL:                   natsUrl,
@@ -139,6 +168,10 @@ func main() {
 		HostCPUThreshold:          cpuBackpressureThreshold,
 		HostMemoryThreshold:       memoryBackpressureThreshold,
 		Namespace:                 os.Getenv("OPERATOR_NAMESPACE"),
+		PrecompileEnabled:         precompileEnabled,
+		PrecompileTargetMatrix:    precompileTargetMatrix,
+		PrecompileStream:          precompileStream,
+		DefaultHostPoolTargets:    precompileTargetMatrix,
 	}
 
 	if natsCreds != "" {

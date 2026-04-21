@@ -1,0 +1,35 @@
+[package]
+name = "precompile-worker"
+version = "0.1.0"
+description = "Out-of-process component precompiler for wasmCloud hosts"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/wasmCloud/wasmCloud"
+authors = ["The wasmCloud Team"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "precompile-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-nats = { workspace = true, features = ["aws-lc-rs"] }
+bytes = { workspace = true }
+clap = { workspace = true, features = ["std"] }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["io"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "ansi", "time", "json"] }
+# wash-runtime provides the Engine and OCI client. Same workspace ⇒ same
+# wasmtime version ⇒ compat hashes line up by construction.
+wash-runtime = { path = "../wash-runtime", default-features = false, features = ["oci", "artifact-store-nats"] }
+
+[dev-dependencies]
+testcontainers = { workspace = true }
