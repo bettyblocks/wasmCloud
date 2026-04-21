@@ -8,6 +8,7 @@ import (
 
 const ArtifactConditionSync condition.ConditionType = "Sync"
 const ArtifactConditionPublished condition.ConditionType = "Published"
+const ArtifactConditionCompiled condition.ConditionType = "Compiled"
 
 // ArtifactSpec defines the desired state of Artifact.
 type ArtifactSpec struct {
@@ -15,6 +16,25 @@ type ArtifactSpec struct {
 	Image string `json:"image"`
 	// +kubebuilder:validation:Optional
 	ImagePullSecret *corev1.LocalObjectReference `json:"imagePullSecret,omitempty"`
+
+	// CompileImage is the container image used to run the Wasmtime AOT compilation job.
+	// Must have wasmtime and oras available. If empty, compilation is skipped.
+	// +kubebuilder:validation:Optional
+	CompileImage string `json:"compileImage,omitempty"`
+
+	// TargetArchitectures to AOT-compile for. Supported: "amd64", "arm64". Defaults to both.
+	// +kubebuilder:validation:Optional
+	TargetArchitectures []string `json:"targetArchitectures,omitempty"`
+
+	// CompiledImageRepository is the OCI repository to push compiled artifacts to.
+	// Tags are generated as "{arch}-{generation}" (e.g. "amd64-3").
+	// Required when CompileImage is set.
+	// +kubebuilder:validation:Optional
+	CompiledImageRepository string `json:"compiledImageRepository,omitempty"`
+
+	// CompiledImagePushSecret contains push credentials for CompiledImageRepository.
+	// +kubebuilder:validation:Optional
+	CompiledImagePushSecret *corev1.LocalObjectReference `json:"compiledImagePushSecret,omitempty"`
 }
 
 // ArtifactStatus defines the observed state of Artifact.
@@ -24,6 +44,9 @@ type ArtifactStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 	// +kubebuilder:validation:Optional
 	ArtifactURL string `json:"artifactUrl,omitempty"`
+	// CompiledArtifacts maps architecture (e.g. "amd64") to the compiled OCI artifact URL.
+	// +kubebuilder:validation:Optional
+	CompiledArtifacts map[string]string `json:"compiledArtifacts,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -396,9 +396,10 @@ async fn workload_start(
     let (components, host_interfaces) = if let Some(wit_world) = wit_world {
         let mut pulled_components = Vec::with_capacity(wit_world.components.len());
         for component in &wit_world.components {
-            let mut oci_config = image_pull_secret_to_oci_config(config, &component.image_pull_secret);
+            let mut oci_config =
+                image_pull_secret_to_oci_config(config, &component.image_pull_secret);
             oci_config.insecure_registries = insecure_registries.clone();
-            let (bytes, digest) = match oci::pull_component(
+            let (bytes, digest, is_precompiled) = match oci::pull_component(
                 &component.image,
                 oci_config,
                 component.image_pull_policy().into(),
@@ -423,6 +424,7 @@ async fn workload_start(
                 name: component.name.clone(),
                 bytes: bytes.into(),
                 digest: Some(digest),
+                is_precompiled,
                 local_resources: component
                     .local_resources
                     .clone()
@@ -447,7 +449,7 @@ async fn workload_start(
     let service = if let Some(service) = service {
         let mut oci_config = image_pull_secret_to_oci_config(config, &service.image_pull_secret);
         oci_config.insecure_registries = insecure_registries.clone();
-        let (bytes, digest) = match oci::pull_component(
+        let (bytes, digest, is_precompiled) = match oci::pull_component(
             &service.image,
             oci_config,
             service.image_pull_policy().into(),
@@ -468,6 +470,7 @@ async fn workload_start(
         Some(crate::types::Service {
             bytes: bytes.into(),
             digest: Some(digest),
+            is_precompiled,
             local_resources: service
                 .local_resources
                 .clone()

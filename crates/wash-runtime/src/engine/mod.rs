@@ -358,7 +358,7 @@ impl Engine {
     ) -> anyhow::Result<WorkloadService> {
         // Create a wasmtime component from the bytes
         let wasmtime_component = self
-            .load_component_bytes(service.bytes, service.digest)
+            .load_component_bytes(service.bytes, service.digest, service.is_precompiled)
             .context("failed to create component from bytes")?;
 
         // Create a linker for this component
@@ -418,12 +418,17 @@ impl Engine {
     /// stored as `.cwasm` files on disk and loaded via file-backed mmap. This means the
     /// compiled native code is backed by a file rather than anonymous memory, allowing the
     /// OS kernel to page it in/out on demand and reducing resident memory usage.
-    #[instrument(name = "load_component_bytes", skip_all, fields(digest = %digest.as_ref().map(|d| d.as_ref()).unwrap_or("none")))]
+    #[instrument(name = "load_component_bytes", skip_all, fields(digest = %digest.as_ref().map(|d| d.as_ref()).unwrap_or("none"), is_precompiled))]
     fn load_component_bytes(
         &self,
         bytes: impl AsRef<[u8]>,
         digest: Option<impl AsRef<str>>,
+        is_precompiled: bool,
     ) -> anyhow::Result<Component> {
+        if is_precompiled {
+            return self.load_precompiled_bytes(bytes, digest);
+        }
+
         match digest {
             None => {
                 tracing::debug!("no digest provided, compiling component without caching");
@@ -454,6 +459,43 @@ impl Engine {
                     .map(|v| v.0)
             }
         }
+    }
+
+    /// Load a pre-compiled Wasmtime AOT component (`.cwasm` bytes) without recompiling.
+    /// Writes to the compiled cache dir for file-backed mmap if available, falling back to
+    /// in-memory deserialization.
+    #[allow(unsafe_code)]
+    fn load_precompiled_bytes(
+        &self,
+        bytes: impl AsRef<[u8]>,
+        digest: Option<impl AsRef<str>>,
+    ) -> anyhow::Result<Component> {
+        let engine = &self.inner;
+        let bytes = bytes.as_ref();
+
+        if let (Some(cache_dir), Some(digest)) = (&self.compiled_cache_dir, &digest) {
+            let cwasm_path =
+                cache_dir.join(format!("{}.cwasm", Self::sanitize_digest(digest.as_ref())));
+
+            if let Some(cached) = Self::load_cached(engine, &cwasm_path) {
+                return Ok(cached);
+            }
+
+            if let Err(e) = std::fs::write(&cwasm_path, bytes) {
+                tracing::warn!(
+                    path = %cwasm_path.display(),
+                    err = %e,
+                    "failed to write precompiled component to disk cache, falling back to in-memory"
+                );
+            } else if let Some(file_backed) = Self::load_cached(engine, &cwasm_path) {
+                return Ok(file_backed);
+            }
+        }
+
+        tracing::debug!("deserializing precompiled component in-memory");
+        unsafe { Component::deserialize(engine, bytes) }
+            .map_err(anyhow::Error::from)
+            .context("failed to deserialize precompiled component")
     }
 
     fn load_or_compile(
@@ -572,7 +614,7 @@ impl Engine {
     ) -> anyhow::Result<WorkloadComponent> {
         // Create a wasmtime component from the bytes
         let wasmtime_component = self
-            .load_component_bytes(component.bytes, component.digest)
+            .load_component_bytes(component.bytes, component.digest, component.is_precompiled)
             .context("failed to create component from bytes")?;
 
         // Create a linker for this component

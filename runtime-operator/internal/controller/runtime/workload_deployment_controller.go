@@ -43,8 +43,8 @@ func (r *WorkloadDeploymentReconciler) reconcileArtifacts(ctx context.Context, d
 			}
 			return err
 		}
-		if !artifact.Status.AllTrue(runtimev1alpha1.ArtifactConditionPublished) {
-			return condition.ErrStatusUnknown(fmt.Errorf("artifact %s not published", configArtifact.ArtifactFrom.Name))
+		if !artifact.Status.AllTrue(condition.TypeReady) {
+			return condition.ErrStatusUnknown(fmt.Errorf("artifact %s not ready", configArtifact.ArtifactFrom.Name))
 		}
 	}
 
@@ -302,6 +302,7 @@ func resolveArtifacts(ctx context.Context, kubeClient client.Client, namespace s
 			return fmt.Errorf("artifact %s not found in deployment spec", artifactName)
 		}
 		comp.Image = artifact.Status.ArtifactURL
+		comp.CompiledImages = artifact.Status.CompiledArtifacts
 		tpl.Spec.Components[i] = comp
 	}
 
@@ -313,6 +314,7 @@ func resolveArtifacts(ctx context.Context, kubeClient client.Client, namespace s
 				return fmt.Errorf("artifact %s not found in deployment spec", artifactName)
 			}
 			tpl.Spec.Service.Image = artifact.Status.ArtifactURL
+			tpl.Spec.Service.CompiledImages = artifact.Status.CompiledArtifacts
 		}
 	}
 

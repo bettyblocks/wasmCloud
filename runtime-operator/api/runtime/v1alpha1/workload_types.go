@@ -90,6 +90,10 @@ type WorkloadComponent struct {
 	Name string `json:"name"`
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
+	// CompiledImages maps architecture (e.g. "amd64") to an AOT-compiled OCI artifact URL.
+	// When set, the host-matched compiled image is preferred over Image at placement time.
+	// +kubebuilder:validation:Optional
+	CompiledImages map[string]string `json:"compiledImages,omitempty"`
 	// +kubebuilder:validation:Optional
 	ImagePullSecret *corev1.LocalObjectReference `json:"imagePullSecret,omitempty"`
 	// +kubebuilder:validation:Optional
@@ -111,6 +115,10 @@ type WorkloadComponent struct {
 type WorkloadService struct {
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
+	// CompiledImages maps architecture (e.g. "amd64") to an AOT-compiled OCI artifact URL.
+	// When set, the host-matched compiled image is preferred over Image at placement time.
+	// +kubebuilder:validation:Optional
+	CompiledImages map[string]string `json:"compiledImages,omitempty"`
 	// +kubebuilder:validation:Optional
 	ImagePullSecret *corev1.LocalObjectReference `json:"imagePullSecret,omitempty"`
 	// +kubebuilder:validation:Optional
