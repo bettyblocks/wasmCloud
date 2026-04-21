@@ -52,6 +52,9 @@ pub enum WorkloadState {
 pub struct Service {
     pub bytes: Bytes,
     pub digest: Option<String>,
+    /// When true, `bytes` are Wasmtime AOT-compiled native code and must be loaded via
+    /// `Component::deserialize` rather than compiled from Wasm.
+    pub is_precompiled: bool,
     pub local_resources: LocalResources,
     pub max_restarts: u64,
 }
@@ -63,6 +66,9 @@ pub struct Component {
     pub name: String,
     pub bytes: Bytes,
     pub digest: Option<String>,
+    /// When true, `bytes` are Wasmtime AOT-compiled native code and must be loaded via
+    /// `Component::deserialize` rather than compiled from Wasm.
+    pub is_precompiled: bool,
     pub local_resources: LocalResources,
     pub pool_size: i32,
     pub max_invocations: i32,

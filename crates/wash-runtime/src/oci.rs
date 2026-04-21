@@ -48,6 +48,9 @@ use tracing::{debug, instrument, warn};
 #[deprecated = "old media type used before Wasm WG standardization"]
 const WASMCLOUD_MEDIA_TYPE: &str = "application/vnd.module.wasm.content.layer.v1+wasm";
 
+/// OCI media type for Wasmtime AOT-compiled components pushed by the artifact compilation pipeline.
+pub const COMPILED_WASM_MEDIA_TYPE: &str = "application/vnd.wasmcloud.compiled.wasm";
+
 /// Configuration for OCI operations
 /// ️ **Credential Precedence**:
 /// 1. Explicit credentials (if provided in this config)
@@ -366,11 +369,15 @@ pub enum OciPullPolicy {
 /// }
 /// ```
 #[instrument(skip(config), fields(reference = %reference, pull_policy = ?pull_policy))]
+/// Returns `(bytes, digest, is_precompiled)`.
+/// `is_precompiled` is true when the layer media type is [`COMPILED_WASM_MEDIA_TYPE`], indicating
+/// the bytes are Wasmtime AOT-compiled native code and must be loaded via deserialization
+/// rather than compilation.
 pub async fn pull_component(
     reference: &str,
     config: OciConfig,
     pull_policy: OciPullPolicy,
-) -> Result<(Vec<u8>, String)> {
+) -> Result<(Vec<u8>, String, bool)> {
     // Parse OCI reference
     let reference_parsed = Reference::try_from(reference)
         .with_context(|| format!("invalid OCI reference: {reference}"))?;
@@ -413,7 +420,8 @@ pub async fn pull_component(
                 .await?;
 
             if digest == fetched_digest {
-                return Ok((component_data, digest));
+                // OCI cache only stores raw .wasm artifacts, never precompiled
+                return Ok((component_data, digest, false));
             }
 
             debug!("Cached artifact expired; pulling new component version");
@@ -430,6 +438,7 @@ pub async fn pull_component(
         &auth,
         vec![
             WASM_LAYER_MEDIA_TYPE,
+            COMPILED_WASM_MEDIA_TYPE,
             #[allow(deprecated)]
             WASMCLOUD_MEDIA_TYPE,
         ],
@@ -453,15 +462,21 @@ pub async fn pull_component(
     };
 
     // Extract the component bytes from the first layer
-    let component_data = image_data
+    let layer = image_data
         .layers
         .first()
-        .ok_or_else(|| anyhow!("no layers found in pulled artifact"))?
-        .data
-        .clone();
+        .ok_or_else(|| anyhow!("no layers found in pulled artifact"))?;
+    let component_data = layer.data.clone();
+    let is_precompiled = layer.media_type == COMPILED_WASM_MEDIA_TYPE;
     let digest = image_data
         .digest
         .ok_or_else(|| anyhow!("no digest found in pulled artifact"))?;
+
+    if is_precompiled {
+        // Precompiled artifacts are native code — skip Wasm validation and OCI cache.
+        // The engine's compiled_cache_dir handles deduplication by digest.
+        return Ok((component_data, digest, true));
+    }
 
     // Validate that it's a valid WebAssembly component
     validate_component(&component_data)
@@ -476,7 +491,7 @@ pub async fn pull_component(
             .with_context(|| "failed to cache component")?;
     }
 
-    Ok((component_data, digest))
+    Ok((component_data, digest, false))
 }
 
 /// Push a WebAssembly component to an OCI registry
