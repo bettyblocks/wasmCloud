@@ -1,0 +1,57 @@
+{{- if .Values.precompile.enabled }}
+# One-shot Job that creates the JetStream stream (work queue) and object-store
+# bucket (cwasm cache). Runs once per install; `helm upgrade` re-runs it
+# as a pre-install/pre-upgrade hook. Using `nats` CLI against the in-cluster
+# NATS service keeps us from adding a k8s-native NATS CRD dependency.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "runtime-operator.fullname" . }}-precompile-bootstrap
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+  labels:
+    wasmcloud.com/name: precompile-bootstrap
+    {{- include "runtime-operator.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap
+          image: natsio/nats-box:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              nats --server nats://nats:4222 stream add {{ .Values.precompile.queue.stream }} \
+                --subjects 'wasmcloud.precompile.jobs.>' \
+                --storage file \
+                --retention work \
+                --replicas {{ .Values.precompile.queue.replicas }} \
+                --max-bytes=-1 \
+                --max-msgs=-1 \
+                --max-msgs-per-subject=-1 \
+                --max-age=0s \
+                --max-msg-size=-1 \
+                --discard=old \
+                --dupe-window=1h \
+                --defaults || true
+
+              nats --server nats://nats:4222 consumer add {{ .Values.precompile.queue.stream }} {{ .Values.precompile.queue.consumer }} \
+                --pull \
+                --deliver=all \
+                --ack explicit \
+                --max-deliver=5 \
+                --filter '' \
+                --replay=instant \
+                --defaults || true
+
+              nats --server nats://nats:4222 object add {{ .Values.precompile.store.bucket }} \
+                --replicas {{ .Values.precompile.store.replicas }} \
+                --defaults || true
+{{- end }}

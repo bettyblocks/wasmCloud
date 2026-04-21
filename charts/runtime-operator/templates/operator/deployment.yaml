@@ -44,6 +44,11 @@ spec:
             {{- if .Values.operator.watchNamespaces }}
             - "-watch-namespaces={{ .Values.operator.watchNamespaces | join "," }}"
             {{- end }}
+            {{- if .Values.precompile.enabled }}
+            - "-precompile-enabled"
+            - "-precompile-targets={{ .Values.precompile.targets | join "," }}"
+            - "-precompile-stream={{ .Values.precompile.queue.stream }}"
+            {{- end }}
           env:
             - name: OPERATOR_NAMESPACE
               valueFrom:

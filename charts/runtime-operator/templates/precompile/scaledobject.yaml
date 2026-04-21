@@ -1,0 +1,31 @@
+{{- if .Values.precompile.enabled }}
+# KEDA ScaledObject for the precompile worker pool.
+#
+# Requires KEDA to be installed in the cluster. When queue lag exceeds
+# `lagThreshold` messages per replica, KEDA scales the Deployment up toward
+# `maxReplicaCount`. An idle queue scales back to `minReplicaCount` (>=1 so
+# a warm worker is always ready for cold starts).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "runtime-operator.fullname" . }}-precompile-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    wasmcloud.com/name: precompile-worker
+    {{- include "runtime-operator.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "runtime-operator.fullname" . }}-precompile-worker
+  minReplicaCount: {{ .Values.precompile.workers.minReplicas }}
+  maxReplicaCount: {{ .Values.precompile.workers.maxReplicas }}
+  pollingInterval: 15
+  cooldownPeriod: 60
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: "http://nats:8222"
+        account: "$G"
+        stream: {{ .Values.precompile.queue.stream | quote }}
+        consumer: {{ .Values.precompile.queue.consumer | quote }}
+        lagThreshold: {{ .Values.precompile.workers.lagThreshold | quote }}
+{{- end }}

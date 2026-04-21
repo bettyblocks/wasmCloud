@@ -1,0 +1,79 @@
+name: precompile-worker
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/precompile-worker.yml"
+      - "crates/precompile-worker/**"
+      - "crates/wash-runtime/**"
+      - "Cargo.*"
+  push:
+    branches:
+      - main
+    tags:
+      - "precompile-worker-v*"
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Remove unused files
+        run: |
+          sudo rm -rf /usr/lib/jvm /usr/share/dotnet /usr/share/swift \
+            /usr/local/.ghcup /usr/local/julia* /usr/local/lib/android \
+            /usr/local/share/chromium /opt/microsoft /opt/google /opt/az \
+            /usr/local/share/powershell /opt/hostedtoolcache
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Setup protoc
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3.0.0
+        with:
+          version: "29.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+      - name: Build
+        run: cargo build -p precompile-worker
+      - name: Test
+        run: cargo test -p precompile-worker
+
+  canary:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/docker-build-push.yml
+    secrets: inherit
+    with:
+      push: true
+      file: ./crates/precompile-worker/Dockerfile
+      image: ghcr.io/wasmcloud/precompile-worker
+      tags: |
+        type=raw,value=canary
+
+  docker-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/precompile-worker-v')
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/docker-build-push.yml
+    secrets: inherit
+    with:
+      push: true
+      file: ./crates/precompile-worker/Dockerfile
+      image: ghcr.io/wasmcloud/precompile-worker
+      tags: |
+        type=semver,pattern={{version}},value=${{ github.ref_name }}

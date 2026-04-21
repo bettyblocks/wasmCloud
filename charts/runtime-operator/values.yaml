@@ -151,3 +151,50 @@ runtime:
         limits:
           memory: "512Mi"
           cpu: "500m" # 0.5 CPU cores
+
+# -- Out-of-process component pre-compiler. When enabled, a worker pool runs
+# wasmtime/Cranelift separately from workload hosts and publishes .cwasm
+# artifacts to a NATS JetStream object store. Hosts prefer these to inline
+# compilation. See PRECOMPILER_PLAN.md.
+precompile:
+  enabled: false
+  # -- Target triples to produce precompiled variants for. Every triple
+  # your host pool uses must be present; mismatched variants are skipped
+  # at load time and the host falls back to inline compile.
+  targets:
+    - x86_64-unknown-linux-gnu
+  workers:
+    image:
+      registry: ghcr.io
+      repository: wasmcloud/precompile-worker
+      pull_policy: Always
+      # Overrides the image tag whose default is the chart appVersion.
+      tag: ""
+    minReplicas: 1
+    maxReplicas: 10
+    resources:
+      requests:
+        cpu: 500m
+        memory: 256Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+    # -- KEDA scaler trigger: spin up additional workers when queue lag
+    # exceeds this many messages per replica.
+    lagThreshold: 1
+  queue:
+    # -- JetStream stream carrying compile jobs.
+    stream: wasmcloud-precompile
+    # -- Durable consumer name the worker pool reads from.
+    consumer: workers
+    # -- Number of replicas for the stream (JetStream cluster size).
+    replicas: 1
+  store:
+    # -- JetStream object-store bucket where .cwasm bytes land.
+    bucket: wasmcloud-cwasm
+    # -- Number of replicas for the bucket.
+    replicas: 1
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}

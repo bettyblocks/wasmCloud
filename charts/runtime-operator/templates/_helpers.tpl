@@ -125,6 +125,17 @@ Create the name of the service account to use for NATS
 {{- end }}
 
 {{/*
+Create the name of the service account to use for the precompile worker
+*/}}
+{{- define "precompile.serviceAccountName" -}}
+{{- if .Values.precompile.serviceAccount.create }}
+{{- default (printf "%s-precompile" (include "runtime-operator.fullname" .)) .Values.precompile.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.precompile.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
 Create the imagePullSecrets section for the chart.
 */}}
 {{- define "runtime-operator.imagePullSecrets" -}}

@@ -1,0 +1,51 @@
+{{- if .Values.precompile.enabled }}
+{{- $registry := .Values.precompile.workers.image.registry | default .Values.global.image.registry -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "runtime-operator.fullname" . }}-precompile-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    wasmcloud.com/name: precompile-worker
+    {{- include "runtime-operator.labels" . | nindent 4 }}
+spec:
+  # KEDA's ScaledObject manages the replica count. Set an initial replica
+  # count matching minReplicas so workers come up on fresh installs before
+  # KEDA reconciles.
+  replicas: {{ .Values.precompile.workers.minReplicas }}
+  selector:
+    matchLabels:
+      wasmcloud.com/name: precompile-worker
+  template:
+    metadata:
+      labels:
+        wasmcloud.com/name: precompile-worker
+        {{- include "runtime-operator.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "precompile.serviceAccountName" . }}
+      {{- include "runtime-operator.imagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: precompile-worker
+          image: {{ if $registry }}{{ printf "%s/%s" $registry .Values.precompile.workers.image.repository }}{{ else }}{{ .Values.precompile.workers.image.repository }}{{ end }}:{{ .Values.precompile.workers.image.tag | default .Chart.AppVersion }}
+          imagePullPolicy: {{ .Values.precompile.workers.image.pull_policy }}
+          env:
+            - name: NATS_URL
+              value: "nats://nats:4222"
+            - name: PRECOMPILE_STREAM
+              value: {{ .Values.precompile.queue.stream | quote }}
+            - name: PRECOMPILE_CONSUMER
+              value: {{ .Values.precompile.queue.consumer | quote }}
+            - name: PRECOMPILE_BUCKET
+              value: {{ .Values.precompile.store.bucket | quote }}
+            - name: RUST_LOG
+              value: info
+          resources:
+            {{- toYaml .Values.precompile.workers.resources | nindent 12 }}
+          securityContext:
+            capabilities:
+              drop:
+                - NET_RAW
+            # Compilation writes temp files via wasmtime; allow a writable /tmp.
+            readOnlyRootFilesystem: false
+      terminationGracePeriodSeconds: 30
+{{- end }}
