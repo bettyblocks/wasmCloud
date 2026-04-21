@@ -100,6 +100,11 @@ type WorkloadComponent struct {
 	MaxInvocations int32 `json:"maxInvocations,omitempty"`
 	// +kubebuilder:validation:Optional
 	LocalResources *LocalResources `json:"localResources,omitempty"`
+	// Precompiled variants published for this component's Artifact. Copied
+	// from Artifact.status.precompiled at dispatch time; the host prefers a
+	// matching variant to inline compilation.
+	// +kubebuilder:validation:Optional
+	Precompiled []PrecompiledVariant `json:"precompiled,omitempty"`
 }
 
 // WorkloadService represents a long-running service that is part of the workload.
@@ -119,6 +124,11 @@ type WorkloadService struct {
 	MaxRestarts int32 `json:"maxRestarts"`
 	// +kubebuilder:validation:Optional
 	LocalResources *LocalResources `json:"localResources,omitempty"`
+	// Precompiled variants published for this service's Artifact. Copied from
+	// Artifact.status.precompiled at dispatch time; the host prefers a
+	// matching variant to inline compilation.
+	// +kubebuilder:validation:Optional
+	Precompiled []PrecompiledVariant `json:"precompiled,omitempty"`
 }
 
 type HostInterface struct {

@@ -264,6 +264,10 @@
                 </li>
               
                 <li>
+                  <a href="#wasmcloud.runtime.v2.PrecompiledVariant"><span class="badge">M</span>PrecompiledVariant</a>
+                </li>
+              
+                <li>
                   <a href="#wasmcloud.runtime.v2.Service"><span class="badge">M</span>Service</a>
                 </li>
               
@@ -761,6 +765,14 @@ This information is used by the Runtime Operator to monitor the health of the Wa
                   <td><p> </p></td>
                 </tr>
               
+                <tr>
+                  <td>precompiled</td>
+                  <td><a href="#wasmcloud.runtime.v2.PrecompiledVariant">PrecompiledVariant</a></td>
+                  <td>repeated</td>
+                  <td><p>Precompiled variants published for this component. The host prefers a
+matching variant to inline compilation. </p></td>
+                </tr>
+              
             </tbody>
           </table>
 
@@ -954,6 +966,58 @@ Upon a successful lookup, the host will allow outbound connections to the specif
 
         
       
+        <h3 id="wasmcloud.runtime.v2.PrecompiledVariant">PrecompiledVariant</h3>
+        <p>A precompiled `.cwasm` published for a specific host configuration. The host</p><p>uses a variant only when all three of (target, wasmtime_version, compat_hash)</p><p>match its own values; any mismatch falls back to pulling and compiling the</p><p>source `.wasm`.</p>
+
+        
+          <table class="field-table">
+            <thead>
+              <tr><td>Field</td><td>Type</td><td>Label</td><td>Description</td></tr>
+            </thead>
+            <tbody>
+              
+                <tr>
+                  <td>target</td>
+                  <td><a href="#string">string</a></td>
+                  <td></td>
+                  <td><p>Target triple this variant was compiled for, e.g. &#34;x86_64-unknown-linux-gnu&#34;. </p></td>
+                </tr>
+              
+                <tr>
+                  <td>wasmtime_version</td>
+                  <td><a href="#string">string</a></td>
+                  <td></td>
+                  <td><p>Exact wasmtime crate version the precompile worker was built against. </p></td>
+                </tr>
+              
+                <tr>
+                  <td>compat_hash</td>
+                  <td><a href="#string">string</a></td>
+                  <td></td>
+                  <td><p>Stable hex string from Engine::precompile_compatibility_hash. </p></td>
+                </tr>
+              
+                <tr>
+                  <td>artifact_url</td>
+                  <td><a href="#string">string</a></td>
+                  <td></td>
+                  <td><p>URL an ArtifactStore can fetch. Scheme selects the backend (e.g. nats://). </p></td>
+                </tr>
+              
+                <tr>
+                  <td>digest</td>
+                  <td><a href="#string">string</a></td>
+                  <td></td>
+                  <td><p>sha256 digest of the precompiled bytes. </p></td>
+                </tr>
+              
+            </tbody>
+          </table>
+
+          
+
+        
+      
         <h3 id="wasmcloud.runtime.v2.Service">Service</h3>
         <p></p>
 
@@ -997,6 +1061,14 @@ Upon a successful lookup, the host will allow outbound connections to the specif
                   <td><a href="#wasmcloud.runtime.v2.ImagePullPolicy">ImagePullPolicy</a></td>
                   <td></td>
                   <td><p> </p></td>
+                </tr>
+              
+                <tr>
+                  <td>precompiled</td>
+                  <td><a href="#wasmcloud.runtime.v2.PrecompiledVariant">PrecompiledVariant</a></td>
+                  <td>repeated</td>
+                  <td><p>Precompiled variants published for this service&#39;s component. The host
+prefers a matching variant to inline compilation. </p></td>
                 </tr>
               
             </tbody>

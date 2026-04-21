@@ -28,6 +28,10 @@ type WorkloadDeploymentReconciler struct {
 	client.Client
 	Scheme     *runtime.Scheme
 	reconciler condition.AnyConditionedReconciler
+
+	// DefaultHostPoolTargets is the target matrix used when a WorkloadDeployment
+	// omits HostPoolTargets. Wired from operator config in cmd/main.go.
+	DefaultHostPoolTargets []string
 }
 
 func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -35,20 +39,77 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.R
 }
 
 func (r *WorkloadDeploymentReconciler) reconcileArtifacts(ctx context.Context, deployment *runtimev1alpha1.WorkloadDeployment) error {
-	for _, configArtifact := range deployment.Spec.Artifacts {
+	mode := deployment.Spec.PrecompileMode
+	if mode == "" {
+		mode = runtimev1alpha1.PrecompileModeFallback
+	}
+	targets := deployment.Spec.HostPoolTargets
+	if len(targets) == 0 {
+		targets = r.defaultHostPoolTargets()
+	}
+
+	for i := range deployment.Spec.Artifacts {
+		configArtifact := &deployment.Spec.Artifacts[i]
+
+		// If the WD inlines an image, upsert the corresponding auto-Artifact
+		// (no-op when artifactFrom is used).
+		if err := upsertInlineArtifact(ctx, r.Client, deployment.Namespace, configArtifact); err != nil {
+			return err
+		}
+
+		name, err := resolveArtifactName(configArtifact)
+		if err != nil {
+			return err
+		}
+
 		artifact := &runtimev1alpha1.Artifact{}
-		if err := r.Get(ctx, client.ObjectKey{Name: configArtifact.ArtifactFrom.Name, Namespace: deployment.Namespace}, artifact); err != nil {
+		if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: deployment.Namespace}, artifact); err != nil {
 			if client.IgnoreNotFound(err) == nil {
-				return condition.ErrStatusUnknown(fmt.Errorf("artifact %s not found", configArtifact.ArtifactFrom.Name))
+				return condition.ErrStatusUnknown(fmt.Errorf("artifact %s not found", name))
 			}
 			return err
 		}
 		if !artifact.Status.AllTrue(runtimev1alpha1.ArtifactConditionPublished) {
-			return condition.ErrStatusUnknown(fmt.Errorf("artifact %s not published", configArtifact.ArtifactFrom.Name))
+			return condition.ErrStatusUnknown(fmt.Errorf("artifact %s not published", name))
+		}
+
+		// Strict mode: every referenced Artifact must have a precompiled
+		// variant for every target in the host pool. Any miss keeps the
+		// reconciler requeuing.
+		if mode == runtimev1alpha1.PrecompileModeStrict {
+			for _, target := range targets {
+				if !hasPrecompiledVariantForTarget(artifact, target) {
+					return condition.ErrStatusUnknown(fmt.Errorf(
+						"artifact %s not precompiled for target %s", name, target))
+				}
+			}
 		}
 	}
 
 	return nil
+}
+
+// defaultHostPoolTargets returns the cluster-wide target matrix used when a
+// WorkloadDeployment omits HostPoolTargets. For M2 we hardcode a single
+// target; in M3 this moves to operator config.
+func (r *WorkloadDeploymentReconciler) defaultHostPoolTargets() []string {
+	if len(r.DefaultHostPoolTargets) > 0 {
+		return r.DefaultHostPoolTargets
+	}
+	return []string{"x86_64-unknown-linux-gnu"}
+}
+
+// hasPrecompiledVariantForTarget reports whether `artifact.Status.Precompiled`
+// contains an entry for `target`. Wasmtime version and compat hash are
+// checked on the host side at load time — the WD controller only gates on
+// target coverage.
+func hasPrecompiledVariantForTarget(artifact *runtimev1alpha1.Artifact, target string) bool {
+	for _, v := range artifact.Status.Precompiled {
+		if v.Target == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *WorkloadDeploymentReconciler) reconcileSync(ctx context.Context, deployment *runtimev1alpha1.WorkloadDeployment) error {
@@ -290,11 +351,16 @@ func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error 
 
 func resolveArtifacts(ctx context.Context, kubeClient client.Client, namespace string, tpl *runtimev1alpha1.WorkloadReplicaTemplate, artifactsFrom []runtimev1alpha1.WorkloadDeploymentArtifact) error {
 	artifactMap := make(map[string]runtimev1alpha1.Artifact)
-	for _, a := range artifactsFrom {
+	for i := range artifactsFrom {
+		a := &artifactsFrom[i]
+		name, err := resolveArtifactName(a)
+		if err != nil {
+			return err
+		}
 		artifact := &runtimev1alpha1.Artifact{}
-		if err := kubeClient.Get(ctx, client.ObjectKey{Name: a.ArtifactFrom.Name, Namespace: namespace}, artifact); err != nil {
+		if err := kubeClient.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, artifact); err != nil {
 			if client.IgnoreNotFound(err) == nil {
-				return condition.ErrStatusUnknown(fmt.Errorf("artifact %s not found", a.ArtifactFrom.Name))
+				return condition.ErrStatusUnknown(fmt.Errorf("artifact %s not found", name))
 			}
 			return err
 		}
@@ -311,6 +377,7 @@ func resolveArtifacts(ctx context.Context, kubeClient client.Client, namespace s
 			return fmt.Errorf("artifact %s not found in deployment spec", artifactName)
 		}
 		comp.Image = artifact.Status.ArtifactURL
+		comp.Precompiled = append([]runtimev1alpha1.PrecompiledVariant(nil), artifact.Status.Precompiled...)
 		tpl.Spec.Components[i] = comp
 	}
 
@@ -322,6 +389,7 @@ func resolveArtifacts(ctx context.Context, kubeClient client.Client, namespace s
 				return fmt.Errorf("artifact %s not found in deployment spec", artifactName)
 			}
 			tpl.Spec.Service.Image = artifact.Status.ArtifactURL
+			tpl.Spec.Service.Precompiled = append([]runtimev1alpha1.PrecompiledVariant(nil), artifact.Status.Precompiled...)
 		}
 	}
 

@@ -75,8 +75,14 @@ func (r *ArtifactReconciler) finalize(ctx context.Context, artifact *runtimev1al
 		if deployment.DeletionTimestamp != nil {
 			continue
 		}
-		for _, configArtifact := range deployment.Spec.Artifacts {
-			if configArtifact.ArtifactFrom.Name == artifact.Name {
+		for i := range deployment.Spec.Artifacts {
+			configArtifact := &deployment.Spec.Artifacts[i]
+			refName, err := resolveArtifactName(configArtifact)
+			if err != nil {
+				// A malformed artifact entry can't reference anything; skip.
+				continue
+			}
+			if refName == artifact.Name {
 				log.Info("artifact deletion blocked: still referenced by WorkloadDeployment",
 					"deployment", fmt.Sprintf("%s/%s", deployment.Namespace, deployment.Name))
 				return fmt.Errorf("artifact is still referenced by WorkloadDeployment %s/%s",

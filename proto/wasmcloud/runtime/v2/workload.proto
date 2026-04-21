@@ -70,6 +70,9 @@ message Service {
   // Optional credentials for pulling the image from a private registry
   ImagePullSecret image_pull_secret = 4;
   ImagePullPolicy image_pull_policy = 5;
+  // Precompiled variants published for this service's component. The host
+  // prefers a matching variant to inline compilation.
+  repeated PrecompiledVariant precompiled = 6;
 }
 
 // Represents the WIT World (WebAssembly Interface Types)
@@ -93,6 +96,26 @@ message Component {
   ImagePullSecret image_pull_secret = 5;
   string name = 6;
   ImagePullPolicy image_pull_policy = 7;
+  // Precompiled variants published for this component. The host prefers a
+  // matching variant to inline compilation.
+  repeated PrecompiledVariant precompiled = 8;
+}
+
+// A precompiled `.cwasm` published for a specific host configuration. The host
+// uses a variant only when all three of (target, wasmtime_version, compat_hash)
+// match its own values; any mismatch falls back to pulling and compiling the
+// source `.wasm`.
+message PrecompiledVariant {
+  // Target triple this variant was compiled for, e.g. "x86_64-unknown-linux-gnu".
+  string target = 1;
+  // Exact wasmtime crate version the precompile worker was built against.
+  string wasmtime_version = 2;
+  // Stable hex string from Engine::precompile_compatibility_hash.
+  string compat_hash = 3;
+  // URL an ArtifactStore can fetch. Scheme selects the backend (e.g. nats://).
+  string artifact_url = 4;
+  // sha256 digest of the precompiled bytes.
+  string digest = 5;
 }
 
 message LocalResources {

@@ -18,6 +18,25 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// toProtoPrecompiled converts CRD precompiled variants to their proto wire form
+// for dispatch to the host.
+func toProtoPrecompiled(variants []runtimev1alpha1.PrecompiledVariant) []*runtimev2.PrecompiledVariant {
+	if len(variants) == 0 {
+		return nil
+	}
+	out := make([]*runtimev2.PrecompiledVariant, 0, len(variants))
+	for _, v := range variants {
+		out = append(out, &runtimev2.PrecompiledVariant{
+			Target:          v.Target,
+			WasmtimeVersion: v.WasmtimeVersion,
+			CompatHash:      v.CompatHash,
+			ArtifactUrl:     v.ArtifactURL,
+			Digest:          v.Digest,
+		})
+	}
+	return out
+}
+
 func translatePullPolicy(policy corev1.PullPolicy) runtimev2.ImagePullPolicy {
 	switch policy {
 	case corev1.PullAlways:

@@ -406,7 +406,12 @@ async fn workload_start(
                     .unwrap_or_default(),
                 pool_size: component.pool_size,
                 max_invocations: component.max_invocations,
-                precompiled: Vec::new(),
+                precompiled: component
+                    .precompiled
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
             })
         }
         (
@@ -450,7 +455,12 @@ async fn workload_start(
                 .map(Into::into)
                 .unwrap_or_default(),
             max_restarts: service.max_restarts,
-            precompiled: Vec::new(),
+            precompiled: service
+                .precompiled
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
         })
     } else {
         None
@@ -504,6 +514,30 @@ async fn workload_status(
     host.workload_status(req.into())
         .await
         .map(|resp| resp.into())
+}
+
+impl From<types::v2::PrecompiledVariant> for crate::component_loader::PrecompiledVariant {
+    fn from(v: types::v2::PrecompiledVariant) -> Self {
+        crate::component_loader::PrecompiledVariant {
+            target: v.target,
+            wasmtime_version: v.wasmtime_version,
+            compat_hash: v.compat_hash,
+            url: v.artifact_url,
+            digest: v.digest,
+        }
+    }
+}
+
+impl From<crate::component_loader::PrecompiledVariant> for types::v2::PrecompiledVariant {
+    fn from(v: crate::component_loader::PrecompiledVariant) -> Self {
+        types::v2::PrecompiledVariant {
+            target: v.target,
+            wasmtime_version: v.wasmtime_version,
+            compat_hash: v.compat_hash,
+            artifact_url: v.url,
+            digest: v.digest,
+        }
+    }
 }
 
 impl From<types::v2::WitInterface> for crate::wit::WitInterface {

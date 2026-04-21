@@ -48,11 +48,35 @@ spec:
             properties:
               artifacts:
                 items:
+                  description: |-
+                    WorkloadDeploymentArtifact references a component artifact to include in
+                    the deployment. Exactly one of ArtifactFrom or Image must be set:
+
+                      - ArtifactFrom references an existing Artifact CR by name.
+                      - Image inlines an OCI ref; the controller upserts an Artifact named
+                        "auto-<sha256(image+pullSecret)[:12]>" in the same namespace.
                   properties:
                     artifactFrom:
-                      description: |-
-                        LocalObjectReference contains enough information to let you locate the
-                        referenced object inside the same namespace.
+                      description: Reference an existing Artifact CR in the same namespace.
+                      properties:
+                        name:
+                          default: ""
+                          description: |-
+                            Name of the referent.
+                            This field is effectively required, but due to backwards compatibility is
+                            allowed to be empty. Instances of this type with an empty value here are
+                            almost certainly wrong.
+                            More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                          type: string
+                      type: object
+                      x-kubernetes-map-type: atomic
+                    image:
+                      description: Inline OCI image reference. The controller will
+                        upsert an Artifact for this image.
+                      type: string
+                    imagePullSecret:
+                      description: Pull secret for the inline image form. Ignored
+                        when ArtifactFrom is set.
                       properties:
                         name:
                           default: ""
@@ -66,15 +90,29 @@ spec:
                       type: object
                       x-kubernetes-map-type: atomic
                     name:
+                      description: Local name used to refer to this artifact elsewhere
+                        in the workload.
                       type: string
                   required:
-                  - artifactFrom
                   - name
                   type: object
+                  x-kubernetes-validations:
+                  - message: exactly one of artifactFrom or image must be set
+                    rule: '(has(self.artifactFrom) ? 1 : 0) + (has(self.image) ? 1
+                      : 0) == 1'
                 type: array
               deployPolicy:
                 default: RollingUpdate
                 type: string
+              hostPoolTargets:
+                description: |-
+                  HostPoolTargets is the set of target triples this deployment may run on.
+                  Used in Strict mode to check that every referenced Artifact has a
+                  precompiled variant for each target before dispatching. When empty, the
+                  operator's default target matrix is used.
+                items:
+                  type: string
+                type: array
               kubernetes:
                 description: |-
                   Kubernetes groups Kubernetes-specific configuration such as Service
@@ -97,6 +135,15 @@ spec:
                     - name
                     type: object
                 type: object
+              precompileMode:
+                default: Fallback
+                description: |-
+                  PrecompileMode controls rollout behavior when precompiled variants are
+                  missing. Defaults to Fallback.
+                enum:
+                - Fallback
+                - Strict
+                type: string
               replicas:
                 format: int32
                 type: integer
@@ -244,6 +291,48 @@ spec:
                             poolSize:
                               format: int32
                               type: integer
+                            precompiled:
+                              description: |-
+                                Precompiled variants published for this component's Artifact. Copied
+                                from Artifact.status.precompiled at dispatch time; the host prefers a
+                                matching variant to inline compilation.
+                              items:
+                                description: |-
+                                  PrecompiledVariant describes a single precompiled .cwasm artifact published
+                                  for a specific host configuration.
+
+                                  A host consumes a variant only when all three of Target, WasmtimeVersion, and
+                                  CompatHash match its own values. Any drift forces a cache miss — either a
+                                  fallback compile (WorkloadDeployment PrecompileMode=Fallback) or a blocked
+                                  rollout (PrecompileMode=Strict).
+                                properties:
+                                  artifactUrl:
+                                    description: URL an ArtifactStore can fetch. Scheme
+                                      selects the backend (e.g. nats://).
+                                    type: string
+                                  compatHash:
+                                    description: Stable hex string derived from Engine::precompile_compatibility_hash.
+                                    type: string
+                                  digest:
+                                    description: sha256 digest of the precompiled
+                                      bytes, for integrity checks.
+                                    type: string
+                                  target:
+                                    description: Target triple this variant was compiled
+                                      for, e.g. "x86_64-unknown-linux-gnu".
+                                    type: string
+                                  wasmtimeVersion:
+                                    description: Exact wasmtime crate version the
+                                      worker was built against.
+                                    type: string
+                                required:
+                                - artifactUrl
+                                - compatHash
+                                - digest
+                                - target
+                                - wasmtimeVersion
+                                type: object
+                              type: array
                           required:
                           - image
                           - name
@@ -476,6 +565,48 @@ spec:
                           maxRestarts:
                             format: int32
                             type: integer
+                          precompiled:
+                            description: |-
+                              Precompiled variants published for this service's Artifact. Copied from
+                              Artifact.status.precompiled at dispatch time; the host prefers a
+                              matching variant to inline compilation.
+                            items:
+                              description: |-
+                                PrecompiledVariant describes a single precompiled .cwasm artifact published
+                                for a specific host configuration.
+
+                                A host consumes a variant only when all three of Target, WasmtimeVersion, and
+                                CompatHash match its own values. Any drift forces a cache miss — either a
+                                fallback compile (WorkloadDeployment PrecompileMode=Fallback) or a blocked
+                                rollout (PrecompileMode=Strict).
+                              properties:
+                                artifactUrl:
+                                  description: URL an ArtifactStore can fetch. Scheme
+                                    selects the backend (e.g. nats://).
+                                  type: string
+                                compatHash:
+                                  description: Stable hex string derived from Engine::precompile_compatibility_hash.
+                                  type: string
+                                digest:
+                                  description: sha256 digest of the precompiled bytes,
+                                    for integrity checks.
+                                  type: string
+                                target:
+                                  description: Target triple this variant was compiled
+                                    for, e.g. "x86_64-unknown-linux-gnu".
+                                  type: string
+                                wasmtimeVersion:
+                                  description: Exact wasmtime crate version the worker
+                                    was built against.
+                                  type: string
+                              required:
+                              - artifactUrl
+                              - compatHash
+                              - digest
+                              - target
+                              - wasmtimeVersion
+                              type: object
+                            type: array
                         required:
                         - image
                         type: object

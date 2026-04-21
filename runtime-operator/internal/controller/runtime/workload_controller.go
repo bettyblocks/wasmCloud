@@ -246,6 +246,7 @@ func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *r
 			PoolSize:        c.PoolSize,
 			MaxInvocations:  c.MaxInvocations,
 			LocalResources:  localResources,
+			Precompiled:     toProtoPrecompiled(c.Precompiled),
 		})
 	}
 
@@ -274,6 +275,7 @@ func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *r
 			ImagePullPolicy: translatePullPolicy(s.ImagePullPolicy),
 			LocalResources:  localResources,
 			MaxRestarts:     uint64(s.MaxRestarts),
+			Precompiled:     toProtoPrecompiled(s.Precompiled),
 		}
 	}
 

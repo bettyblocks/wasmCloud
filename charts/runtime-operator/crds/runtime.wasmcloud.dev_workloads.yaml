@@ -180,6 +180,48 @@ spec:
                     poolSize:
                       format: int32
                       type: integer
+                    precompiled:
+                      description: |-
+                        Precompiled variants published for this component's Artifact. Copied
+                        from Artifact.status.precompiled at dispatch time; the host prefers a
+                        matching variant to inline compilation.
+                      items:
+                        description: |-
+                          PrecompiledVariant describes a single precompiled .cwasm artifact published
+                          for a specific host configuration.
+
+                          A host consumes a variant only when all three of Target, WasmtimeVersion, and
+                          CompatHash match its own values. Any drift forces a cache miss — either a
+                          fallback compile (WorkloadDeployment PrecompileMode=Fallback) or a blocked
+                          rollout (PrecompileMode=Strict).
+                        properties:
+                          artifactUrl:
+                            description: URL an ArtifactStore can fetch. Scheme selects
+                              the backend (e.g. nats://).
+                            type: string
+                          compatHash:
+                            description: Stable hex string derived from Engine::precompile_compatibility_hash.
+                            type: string
+                          digest:
+                            description: sha256 digest of the precompiled bytes, for
+                              integrity checks.
+                            type: string
+                          target:
+                            description: Target triple this variant was compiled for,
+                              e.g. "x86_64-unknown-linux-gnu".
+                            type: string
+                          wasmtimeVersion:
+                            description: Exact wasmtime crate version the worker was
+                              built against.
+                            type: string
+                        required:
+                        - artifactUrl
+                        - compatHash
+                        - digest
+                        - target
+                        - wasmtimeVersion
+                        type: object
+                      type: array
                   required:
                   - image
                   - name
@@ -412,6 +454,48 @@ spec:
                   maxRestarts:
                     format: int32
                     type: integer
+                  precompiled:
+                    description: |-
+                      Precompiled variants published for this service's Artifact. Copied from
+                      Artifact.status.precompiled at dispatch time; the host prefers a
+                      matching variant to inline compilation.
+                    items:
+                      description: |-
+                        PrecompiledVariant describes a single precompiled .cwasm artifact published
+                        for a specific host configuration.
+
+                        A host consumes a variant only when all three of Target, WasmtimeVersion, and
+                        CompatHash match its own values. Any drift forces a cache miss — either a
+                        fallback compile (WorkloadDeployment PrecompileMode=Fallback) or a blocked
+                        rollout (PrecompileMode=Strict).
+                      properties:
+                        artifactUrl:
+                          description: URL an ArtifactStore can fetch. Scheme selects
+                            the backend (e.g. nats://).
+                          type: string
+                        compatHash:
+                          description: Stable hex string derived from Engine::precompile_compatibility_hash.
+                          type: string
+                        digest:
+                          description: sha256 digest of the precompiled bytes, for
+                            integrity checks.
+                          type: string
+                        target:
+                          description: Target triple this variant was compiled for,
+                            e.g. "x86_64-unknown-linux-gnu".
+                          type: string
+                        wasmtimeVersion:
+                          description: Exact wasmtime crate version the worker was
+                            built against.
+                          type: string
+                      required:
+                      - artifactUrl
+                      - compatHash
+                      - digest
+                      - target
+                      - wasmtimeVersion
+                      type: object
+                    type: array
                 required:
                 - image
                 type: object
