@@ -121,8 +121,8 @@ func (in *ArtifactStatus) DeepCopyInto(out *ArtifactStatus) {
 	if in.CompiledArtifacts != nil {
 		in, out := &in.CompiledArtifacts, &out.CompiledArtifacts
 		*out = make(map[string]string, len(*in))
-		for k, v := range *in {
-			(*out)[k] = v
+		for key, val := range *in {
+			(*out)[key] = val
 		}
 	}
 }
@@ -420,8 +420,8 @@ func (in *WorkloadComponent) DeepCopyInto(out *WorkloadComponent) {
 	if in.CompiledImages != nil {
 		in, out := &in.CompiledImages, &out.CompiledImages
 		*out = make(map[string]string, len(*in))
-		for k, v := range *in {
-			(*out)[k] = v
+		for key, val := range *in {
+			(*out)[key] = val
 		}
 	}
 	if in.ImagePullSecret != nil {
@@ -742,8 +742,8 @@ func (in *WorkloadService) DeepCopyInto(out *WorkloadService) {
 	if in.CompiledImages != nil {
 		in, out := &in.CompiledImages, &out.CompiledImages
 		*out = make(map[string]string, len(*in))
-		for k, v := range *in {
-			(*out)[k] = v
+		for key, val := range *in {
+			(*out)[key] = val
 		}
 	}
 	if in.ImagePullSecret != nil {

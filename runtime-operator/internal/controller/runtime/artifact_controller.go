@@ -79,7 +79,7 @@ func (r *ArtifactReconciler) reconcileCompile(ctx context.Context, artifact *run
 	jobName := fmt.Sprintf("%s-compile-%d", artifact.Name, artifact.Generation)
 
 	job := &batchv1.Job{}
-	err := r.Client.Get(ctx, types.NamespacedName{Name: jobName, Namespace: artifact.Namespace}, job)
+	err := r.Get(ctx, types.NamespacedName{Name: jobName, Namespace: artifact.Namespace}, job)
 	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
@@ -89,7 +89,7 @@ func (r *ArtifactReconciler) reconcileCompile(ctx context.Context, artifact *run
 		if err := ctrl.SetControllerReference(artifact, newJob, r.Scheme); err != nil {
 			return err
 		}
-		return r.Client.Create(ctx, newJob)
+		return r.Create(ctx, newJob)
 	}
 
 	if job.Status.Succeeded > 0 {
