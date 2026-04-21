@@ -15,7 +15,7 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
-default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel", "wasmcloud-smtp"]
+default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel", "wasmcloud-smtp", "wasmcloud-metadata"]
 oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:sha2", "dep:wit-component"]
 wasi-otel = []
 washlet = ["oci"]
@@ -32,6 +32,7 @@ wasmcloud-postgres = [
     "dep:ulid",
 ]
 wasmcloud-smtp = ["dep:html2text", "dep:lettre"]
+wasmcloud-metadata = []
 
 [dependencies]
 anyhow = { workspace = true }

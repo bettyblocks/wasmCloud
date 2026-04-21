@@ -1,0 +1,12 @@
+package wasmcloud:metadata@0.1.0;
+
+interface host {
+    /// Returns the unique execution context ID (UUID v4) for this component instance.
+    get-ctx-id: func() -> string;
+
+    /// Returns the component ID this execution context belongs to.
+    get-component-id: func() -> string;
+
+    /// Returns the workload ID this execution context belongs to.
+    get-workload-id: func() -> string;
+}

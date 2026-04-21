@@ -53,6 +53,9 @@ pub mod wasi_otel;
 #[cfg(feature = "wasmcloud-smtp")]
 pub mod smtp;
 
+#[cfg(feature = "wasmcloud-metadata")]
+pub mod wasmcloud_metadata;
+
 pub mod wasmcloud_messaging;
 
 #[cfg(all(feature = "wasi-webgpu", not(target_os = "windows")))]
