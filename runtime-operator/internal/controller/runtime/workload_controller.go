@@ -24,6 +24,7 @@ const (
 	workloadStopTimeout           = 30 * time.Second
 	workloadFinalizerName         = "runtime.wasmcloud.dev/workload-finalizer"
 	workloadSchedulableHostsIndex = "spec.isSchedulable"
+	hostIDIndex                   = "host.hostId"
 )
 
 // WorkloadReconciler reconciles a Workload object
@@ -118,6 +119,24 @@ func (r *WorkloadReconciler) findFreeHost(ctx context.Context, workload *runtime
 	return "", fmt.Errorf("no suitable host found")
 }
 
+func (r *WorkloadReconciler) findHostByID(ctx context.Context, hostID string) (*runtimev1alpha1.Host, error) {
+	hostList := runtimev1alpha1.HostList{}
+	if err := r.List(ctx, &hostList, client.MatchingFields{hostIDIndex: hostID}); err != nil {
+		return nil, err
+	}
+	if len(hostList.Items) == 0 {
+		return nil, fmt.Errorf("host %s not found", hostID)
+	}
+	return &hostList.Items[0], nil
+}
+
+func compiledImageForArch(compiledImages map[string]string, osArch string) string {
+	if compiledImages == nil {
+		return ""
+	}
+	return compiledImages[osArch]
+}
+
 func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *runtimev1alpha1.Workload) error {
 	if workload.Status.HostID == "" {
 		return condition.ErrStatusUnknown(fmt.Errorf("waiting for Host Selection"))
@@ -126,6 +145,12 @@ func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *r
 	if workload.Status.WorkloadID != "" {
 		return nil
 	}
+
+	host, err := r.findHostByID(ctx, workload.Status.HostID)
+	if err != nil {
+		return err
+	}
+	hostArch := host.Status.OSArch
 
 	volumes := make([]*runtimev2.Volume, 0, len(workload.Spec.Volumes))
 	for _, v := range workload.Spec.Volumes {
@@ -195,10 +220,15 @@ func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *r
 			}
 		}
 
+		componentImage := c.Image
+		if compiled := compiledImageForArch(c.CompiledImages, hostArch); compiled != "" {
+			componentImage = compiled
+		}
+
 		var imagePullSecret *runtimev2.ImagePullSecret = nil
 		if c.ImagePullSecret != nil {
 			var err error
-			imagePullSecret, err = MaterializeImagePullSecret(ctx, r.Client, workload.Namespace, c.ImagePullSecret.Name, c.Image)
+			imagePullSecret, err = MaterializeImagePullSecret(ctx, r.Client, workload.Namespace, c.ImagePullSecret.Name, componentImage)
 			if err != nil {
 				return fmt.Errorf("materializing image pull secret for component %q: %w", c.Name, err)
 			}
@@ -206,7 +236,7 @@ func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *r
 
 		witWorld.Components = append(witWorld.Components, &runtimev2.Component{
 			Name:            c.Name,
-			Image:           c.Image,
+			Image:           componentImage,
 			ImagePullSecret: imagePullSecret,
 			ImagePullPolicy: translatePullPolicy(c.ImagePullPolicy),
 			PoolSize:        c.PoolSize,
@@ -246,17 +276,22 @@ func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *r
 			}
 		}
 
+		serviceImage := s.Image
+		if compiled := compiledImageForArch(s.CompiledImages, hostArch); compiled != "" {
+			serviceImage = compiled
+		}
+
 		var imagePullSecret *runtimev2.ImagePullSecret = nil
 		if s.ImagePullSecret != nil {
 			var err error
-			imagePullSecret, err = MaterializeImagePullSecret(ctx, r.Client, workload.Namespace, s.ImagePullSecret.Name, s.Image)
+			imagePullSecret, err = MaterializeImagePullSecret(ctx, r.Client, workload.Namespace, s.ImagePullSecret.Name, serviceImage)
 			if err != nil {
 				return fmt.Errorf("materializing image pull secret for service: %w", err)
 			}
 		}
 
 		service = &runtimev2.Service{
-			Image:           s.Image,
+			Image:           serviceImage,
 			ImagePullSecret: imagePullSecret,
 			ImagePullPolicy: translatePullPolicy(s.ImagePullPolicy),
 			LocalResources:  localResources,
@@ -379,6 +414,15 @@ func (r *WorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return []string{}
 	})
 	if err != nil {
+		return err
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &runtimev1alpha1.Host{}, hostIDIndex, func(rawObj client.Object) []string {
+		if host, ok := rawObj.(*runtimev1alpha1.Host); ok {
+			return []string{host.HostID}
+		}
+		return []string{}
+	}); err != nil {
 		return err
 	}
 
