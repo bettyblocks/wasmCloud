@@ -1,9 +1,26 @@
 use anyhow::{Context as _, Result};
+use serde::Deserialize;
 use wstd::http::{Body, Request, Response, StatusCode};
 use wstd::io::{AsyncRead, AsyncWrite};
 use wstd::net::TcpStream;
 
+mod bindings {
+    wit_bindgen::generate!({
+        path: "../wit",
+        world: "http-gateway",
+        generate_all,
+    });
+}
+
+use bindings::wasmcloud::messaging::{consumer, types::BrokerMessage};
+
 const SSE_SERVICE_ADDR: &str = "127.0.0.1:9090";
+
+#[derive(Deserialize)]
+struct PublishRequest {
+    subject: String,
+    data: String,
+}
 
 #[wstd::http_server]
 async fn main(req: Request<Body>) -> Result<Response<Body>> {
@@ -26,12 +43,47 @@ async fn main(req: Request<Body>) -> Result<Response<Body>> {
             proxy_sse_stream(&path, last_event_id.as_deref()).await
         }
         (wstd::http::Method::POST, _) if path == "/push" => proxy_request(req, &path).await,
+        (wstd::http::Method::POST, _) if path == "/publish" => publish_message(req).await,
         (wstd::http::Method::GET, _) if path.starts_with("/connections") => {
             proxy_request(req, &path).await
         }
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body("Not Found\n".into())
+            .map_err(Into::into),
+    }
+}
+
+/// Publish a message via the wasmcloud:messaging plugin. Under `wash dev` this
+/// hits the in-memory plugin and is delivered to any component exporting
+/// `wasmcloud:messaging/handler` — i.e. `nats-bridge`, which then pushes to the
+/// SSE service. Substitutes for an external `nats pub`.
+async fn publish_message(mut req: Request<Body>) -> Result<Response<Body>> {
+    let body_bytes = req.body_mut().contents().await.unwrap_or(&[]);
+    let publish_req: PublishRequest = match serde_json::from_slice(body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(format!("invalid JSON: {e}\n").into())
+                .map_err(Into::into);
+        }
+    };
+
+    let msg = BrokerMessage {
+        subject: publish_req.subject.clone(),
+        body: publish_req.data.into_bytes(),
+        reply_to: None,
+    };
+
+    match consumer::publish(&msg) {
+        Ok(()) => Response::builder()
+            .status(StatusCode::OK)
+            .body(format!("Published to {}\n", publish_req.subject).into())
+            .map_err(Into::into),
+        Err(e) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(format!("Publish failed: {e}\n").into())
             .map_err(Into::into),
     }
 }

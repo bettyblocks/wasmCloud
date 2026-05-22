@@ -6,6 +6,9 @@ build:
 
 dev:
   service_file: target/wasm32-wasip2/release/sse-service.wasm
+  components:
+    - name: nats-bridge
+      file: target/wasm32-wasip2/release/nats_bridge.wasm
 
 new:
   command: cargo fetch
