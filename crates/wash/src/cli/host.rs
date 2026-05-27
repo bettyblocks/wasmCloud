@@ -197,6 +197,9 @@ impl CliCommand for HostCommand {
             .with_plugin(Arc::new(plugin::wasmcloud_messaging::NatsMessaging::new(
                 data_nats_client.clone(),
             )))?
+            .with_plugin(Arc::new(
+                plugin::betty_blocks_stream_broker::StreamBroker::default(),
+            ))?
             .with_plugin(Arc::new(plugin::wasi_keyvalue::NatsKeyValue::new(
                 &data_nats_client,
             )))?
@@ -252,7 +255,7 @@ impl CliCommand for HostCommand {
         }
 
         // Enable WASI WebGPU if requested
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(all(feature = "wasi-webgpu", not(target_os = "windows")))]
         if self.wasi_webgpu {
             tracing::info!("WASI WebGPU support enabled");
             cluster_host_builder = cluster_host_builder
