@@ -45,11 +45,26 @@ impl Guest for Component {
 fn route(path: &str) -> (u16, String) {
     if let Some(token) = path.strip_prefix("/cancel/") {
         (200, cancel(token).to_string())
+    } else if path.starts_with("/spin-cpu") {
+        spin_cpu()
     } else if path.starts_with("/spin") {
         spin()
     } else {
         (404, format!("no route for {path}"))
     }
+}
+
+/// Pure CPU-bound loop with NO host calls: invisible to the Layer 1
+/// host-boundary gate, cancellable only via epoch interruption (Layer 2).
+/// Iteration-bounded so a broken cancel can't hang the test suite forever.
+const CPU_SPIN_ITERATIONS: u64 = 20_000_000_000;
+
+fn spin_cpu() -> (u16, String) {
+    let mut acc: u64 = 0;
+    for i in 0..CPU_SPIN_ITERATIONS {
+        acc = acc.wrapping_add(std::hint::black_box(i));
+    }
+    (200, format!("completed cpu spin: {acc}"))
 }
 
 fn spin() -> (u16, String) {

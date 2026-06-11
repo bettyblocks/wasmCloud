@@ -1208,7 +1208,24 @@ impl ResolvedWorkload {
                 .insert(linked_component_id.clone(), linked_component_ctx);
         }
 
-        let store = wasmtime::Store::new(metadata.engine(), shared_ctx);
+        let mut store = wasmtime::Store::new(metadata.engine(), shared_ctx);
+
+        // Arm the epoch policy with this invocation's cancellation handle:
+        // on every epoch tick the callback re-arms and keeps running, unless
+        // the handle was tripped — then the guest traps mid-wasm, which
+        // covers even pure CPU-bound guests that never make a host call
+        // (Layer 2 of docs/WORKLOAD_CANCELLATION.md; the host-boundary
+        // checks remain as Layer 1). On engines built without epoch
+        // interruption these setters are inert.
+        store.set_epoch_deadline(1);
+        let epoch_cancel_handle = cancel_handle.clone();
+        store.epoch_deadline_callback(move |_store_ctx| {
+            if epoch_cancel_handle.load(std::sync::atomic::Ordering::Relaxed) {
+                Ok(wasmtime::UpdateDeadline::Interrupt)
+            } else {
+                Ok(wasmtime::UpdateDeadline::Continue(1))
+            }
+        });
 
         Ok(store)
     }

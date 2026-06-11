@@ -82,6 +82,9 @@ async fn start_nats() -> Result<(ContainerAsync<GenericImage>, String)> {
 fn precompile_minimal_component() -> Result<Vec<u8>> {
     let mut config = wasmtime::Config::new();
     config.wasm_component_model(true);
+    // Must match the runtime engine's codegen config (epoch interruption is
+    // on by default there) or deserialization rejects the artifact.
+    config.epoch_interruption(true);
     let engine = wasmtime::Engine::new(&config)?;
     let wasm = wat::parse_str("(component)")?;
     let cwasm = engine.precompile_component(&wasm)?;

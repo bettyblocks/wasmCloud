@@ -719,9 +719,15 @@ pub struct EngineBuilder {
     compilation_cache_ttl: Option<Duration>,
     fuel_consumption: bool,
     compiled_cache_dir: Option<PathBuf>,
+    epoch_interruption: Option<bool>,
     #[cfg(feature = "wasip3")]
     wasip3: bool,
 }
+
+/// How often the background ticker bumps the engine epoch. This bounds how
+/// quickly a cancelled, CPU-bound guest observes its cancellation (one
+/// atomic load per running guest per tick — negligible).
+const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(10);
 
 impl EngineBuilder {
     /// Creates a new `EngineBuilder` with default configuration.
@@ -748,6 +754,22 @@ impl EngineBuilder {
     /// Enables or disables fuel consumption for the engine.
     pub fn with_fuel_consumption(mut self, enable: bool) -> Self {
         self.fuel_consumption = enable;
+        self
+    }
+
+    /// Enables or disables epoch interruption (default: **enabled**).
+    ///
+    /// When enabled, compiled wasm includes epoch checks at loop headers and
+    /// function entries, a background ticker bumps the engine epoch every
+    /// [`EPOCH_TICK_INTERVAL`], and every workload store is armed with a
+    /// callback that traps the invocation when its cancellation handle is
+    /// tripped — making even pure CPU-bound guests cancellable mid-wasm.
+    ///
+    /// NOTE: this is a code-generation flag. Precompiled `.cwasm` artifacts
+    /// must be compiled with the same setting (see `wash-precompile`) or
+    /// they will fail to deserialize.
+    pub fn with_epoch_interruption(mut self, enable: bool) -> Self {
+        self.epoch_interruption = Some(enable);
         self
     }
 
@@ -809,12 +831,22 @@ impl EngineBuilder {
     /// # Errors
     /// Returns an error if the wasmtime engine creation fails.
     pub fn build(mut self) -> anyhow::Result<Engine> {
+        // Whether this engine ticks epochs. For the default config path this
+        // defaults to true; a custom with_config() keeps full control and
+        // only gets epochs when explicitly requested on the builder.
+        let epoch_interruption = self
+            .epoch_interruption
+            .unwrap_or(self.config.is_none());
+
         // If a custom config was provided, use it as-is
-        let config = if let Some(cfg) = self.config.take() {
+        let config = if let Some(mut cfg) = self.config.take() {
             if self.max_instances.is_some() || self.use_pooling_allocator.is_some() {
                 bail!(
                     "cannot use with_config() together with with_max_instances() or with_pooling_allocator()"
                 );
+            }
+            if let Some(enable) = self.epoch_interruption {
+                cfg.epoch_interruption(enable);
             }
             cfg
         } else {
@@ -837,6 +869,7 @@ impl EngineBuilder {
             }
 
             cfg.consume_fuel(self.fuel_consumption);
+            cfg.epoch_interruption(epoch_interruption);
 
             #[cfg(feature = "wasip3")]
             if self.wasip3 {
@@ -847,6 +880,26 @@ impl EngineBuilder {
         };
 
         let inner = wasmtime::Engine::new(&config)?;
+
+        if epoch_interruption {
+            // A dedicated OS thread (not a tokio task: it must keep ticking
+            // while CPU-bound guests pin worker threads) bumps the epoch
+            // until the engine is dropped — the weak handle fails to upgrade
+            // and the thread exits.
+            let weak = inner.weak();
+            std::thread::Builder::new()
+                .name("wasmtime-epoch-ticker".to_string())
+                .spawn(move || {
+                    loop {
+                        match weak.upgrade() {
+                            Some(engine) => engine.increment_epoch(),
+                            None => break,
+                        }
+                        std::thread::sleep(EPOCH_TICK_INTERVAL);
+                    }
+                })
+                .context("failed to spawn epoch ticker thread")?;
+        }
         let cache = Cache::builder()
             .max_capacity(self.compilation_cache_size.unwrap_or(100))
             .time_to_idle(

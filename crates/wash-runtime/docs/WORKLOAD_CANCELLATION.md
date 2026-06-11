@@ -7,16 +7,20 @@
 > under `wash dev` as async-submit job groups with live SSE progress and
 > group cancel — see [Demo](#demo-job-groups-under-wash-dev).
 >
-> **Layer 2 (epoch) is NOT built.** The epoch spike in
-> `integration_guest_cancellation.rs` proves the primitive in an isolated
-> wasmtime setup *inside the test*; the production engine still has no
-> `epoch_interruption(true)`, no ticker, and arms no callback. All shipped
-> cancellation is host-boundary only: a cancelled guest dies at its **next
-> host call**, never mid-wasm.
+> **Layer 2 (epoch) is built** (2026-06-11): the engine enables
+> `epoch_interruption` by default (`EngineBuilder::with_epoch_interruption`
+> escape hatch), a per-engine ticker thread bumps the epoch every 10ms, and
+> every workload store is armed in `new_store_from_metadata` with a callback
+> that reads the invocation's cancel handle — `Interrupt` if tripped,
+> `Continue(1)` otherwise. Proven through the real path by
+> `cancel_traps_cpu_bound_invocation` (a pure-CPU guest with zero host
+> calls traps mid-wasm in well under a second). NOTE: epoch is a codegen
+> flag — `wash-precompile` sets it identically, and previously precompiled
+> `.cwasm` artifacts must be rebuilt.
 >
 > Production gaps: registry entry removal (RAII), enforcement across all
-> host-call surfaces, the async-submit `202`+token response on the HTTP
-> trigger path, epoch (Layer 2).
+> host-call surfaces incl. `select!` for in-flight host calls, the
+> async-submit `202`+token response on the HTTP trigger path.
 > Companion docs: [`LONG_RUNNING_WORKLOADS.md`](./LONG_RUNNING_WORKLOADS.md),
 > [`CPU_BOUND_GUEST_STARVATION.md`](./CPU_BOUND_GUEST_STARVATION.md).
 >
@@ -507,10 +511,11 @@ Result delivery (no connection is held open) — two composable options, per
 
 ### Epoch (Layer 2) stays per-invocation
 
-> Reminder: Layer 2 is **not built**. The engine has no `epoch_interruption`,
-> no ticker, no armed callbacks; the only epoch code in the repo is the
-> self-contained spike test. This section records *how* it would compose with
-> Layer 1 when it lands.
+> Status: **built** (2026-06-11) exactly as described below — flag + ticker
+> in `EngineBuilder::build` (`engine/mod.rs`), per-store arming next to the
+> handle minting in `new_store_from_metadata`. The plugin/listener side
+> needed zero changes: detectors only ever set the handle; epoch is just a
+> second reader.
 
 A natural worry: the epoch ticker is **engine-global**, so does enabling it
 cancel everyone? No — the ticker is just a clock. The *trap decision* is
@@ -601,10 +606,14 @@ states:
   (`host/http.rs:931` still awaits the oneshot); the demo's create/submit is
   application-level, via a plugin import.
 - A NATS **`invocation.cancel`** control verb (optional second listener).
-- (Layer 2, deliberately not built) epoch interruption / ticker / per-store
-  callback — `engine/mod.rs` has none; the epoch spike exists only inside
-  `integration_guest_cancellation.rs`'s own wasmtime setup. (Also note
-  `CPU_BOUND_GUEST_STARVATION.md` implies epoch landed; it did not.)
+
+**Layer 2 (done 2026-06-11):** epoch interruption on by default
+(`EngineBuilder`), 10ms ticker thread per engine (exits via `EngineWeak`
+when the engine drops), per-store callback reading the invocation's cancel
+handle. Pure-CPU guests now trap mid-wasm
+(`cancel_traps_cpu_bound_invocation`). `wash-precompile` sets the same
+codegen flag; old precompiled artifacts must be rebuilt. (This also
+delivers what `CPU_BOUND_GUEST_STARVATION.md` implied had landed.)
 
 ## Layer 1 work list (with status)
 
@@ -637,9 +646,9 @@ states:
 
 ## Deferred / open
 
-- Terminating the pathological pure-CPU-loop (Layer 2 / epoch — see
-  [Epoch (Layer 2) stays per-invocation](#epoch-layer-2-stays-per-invocation)
-  for why it composes per-invocation).
+- ~~Terminating the pathological pure-CPU-loop~~ — done: Layer 2 / epoch
+  landed 2026-06-11 (see
+  [Epoch (Layer 2) stays per-invocation](#epoch-layer-2-stays-per-invocation)).
 - Aborting *in-flight* effects rather than letting them land (the `select!`
   strengthening of item 4 covers abandoning the host future; whether the
   underlying I/O is correctly cleaned up per host fn is still open).

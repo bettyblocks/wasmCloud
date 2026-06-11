@@ -4,6 +4,11 @@ use wasmtime::{Config, Engine};
 pub fn compile(wasm_bytes: &[u8]) -> Result<Vec<u8>> {
     let mut config = Config::new();
     config.wasm_component_model(true);
+    // MUST match the runtime's codegen-relevant config (wash-runtime
+    // EngineBuilder::build): epoch interruption changes generated code, and
+    // artifacts compiled without it fail to deserialize on an engine that
+    // has it enabled (and vice versa).
+    config.epoch_interruption(true);
     let engine = Engine::new(&config)
         .map_err(|e| anyhow::anyhow!("Error setting up wasmtime engine: {e}"))?;
     let cwasm = engine

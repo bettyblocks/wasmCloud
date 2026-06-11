@@ -193,12 +193,15 @@ fn spinner_workload_request(workload_id: &str) -> WorkloadStartRequest {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn cancel_request_traps_spinning_invocation() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
+/// Start a host with the cancel-spinner workload deployed. Returns the HTTP
+/// address, the cancel plugin (for registry inspection), the workload id,
+/// and the running host (which must be kept alive by the caller).
+async fn start_spinner_host() -> Result<(
+    std::net::SocketAddr,
+    Arc<CancelPlugin>,
+    String,
+    impl HostApi,
+)> {
     let engine = Engine::builder().build()?;
     let http_server = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
     let addr = http_server.addr();
@@ -216,6 +219,34 @@ async fn cancel_request_traps_spinning_invocation() -> Result<()> {
     host.workload_start(spinner_workload_request(&workload_id))
         .await
         .context("failed to start cancel-spinner workload")?;
+
+    Ok((addr, cancel_plugin, workload_id, host))
+}
+
+/// Poll the registry until exactly one invocation token is present.
+async fn wait_for_single_token(
+    cancel_plugin: &CancelPlugin,
+) -> Result<((String, String), Arc<AtomicBool>)> {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let entries = cancel_plugin.entries();
+            if let [entry] = entries.as_slice() {
+                break entry.clone();
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("invocation never registered a cancellation token")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_request_traps_spinning_invocation() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let (addr, cancel_plugin, workload_id, _host) = start_spinner_host().await?;
 
     let client = reqwest::Client::new();
 
@@ -237,17 +268,7 @@ async fn cancel_request_traps_spinning_invocation() -> Result<()> {
     // The spinner's token appears in the registry at store creation, before
     // any guest code runs — so polling for exactly one entry can only
     // observe the spin invocation (no cancel request has been sent yet).
-    let (registry_key, spin_handle) = timeout(Duration::from_secs(10), async {
-        loop {
-            let entries = cancel_plugin.entries();
-            if let [entry] = entries.as_slice() {
-                break entry.clone();
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .context("spin invocation never registered a cancellation token")?;
+    let (registry_key, spin_handle) = wait_for_single_token(&cancel_plugin).await?;
 
     let (registered_workload_id, token) = registry_key;
     assert_eq!(
@@ -337,6 +358,84 @@ async fn cancel_request_traps_spinning_invocation() -> Result<()> {
         .context("post-cancel request failed")?;
     assert_eq!(after.status(), 200);
     assert_eq!(after.text().await?, "false");
+
+    Ok(())
+}
+
+/// Layer 2 proof through the real invocation path: a PURE CPU-bound guest
+/// (the `/spin-cpu` route makes zero host calls inside its loop) is
+/// invisible to the Layer 1 host-boundary gate — only epoch interruption
+/// can stop it. Cancelling must trap it mid-wasm, promptly.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_traps_cpu_bound_invocation() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let (addr, cancel_plugin, workload_id, _host) = start_spinner_host().await?;
+    let client = reqwest::Client::new();
+
+    let spin_task = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .get(format!("http://{addr}/spin-cpu"))
+                .header("HOST", HOST_HEADER)
+                .timeout(Duration::from_secs(120))
+                .send()
+                .await
+        }
+    });
+
+    let ((registered_workload_id, token), spin_handle) =
+        wait_for_single_token(&cancel_plugin).await?;
+    assert_eq!(registered_workload_id, workload_id);
+
+    // Give the guest a moment to be deep inside its CPU loop, so the trap
+    // provably lands mid-wasm rather than before the loop started.
+    sleep(Duration::from_millis(250)).await;
+
+    let cancelled_at = Instant::now();
+    let real = client
+        .get(format!("http://{addr}/cancel/{token}"))
+        .header("HOST", HOST_HEADER)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .context("cancel request failed")?;
+    assert_eq!(real.text().await?, "true");
+    assert!(spin_handle.load(Ordering::Relaxed));
+
+    // Without epoch interruption this would only return after the full CPU
+    // spin (tens of seconds); the timeout is the failure detector.
+    let spin_response = timeout(Duration::from_secs(10), spin_task)
+        .await
+        .context("CPU-bound invocation survived cancel — epoch interruption ineffective")?
+        .context("spin task panicked")?;
+
+    match spin_response {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            assert!(
+                !status.is_success(),
+                "cancelled CPU-bound invocation must not succeed, got {status}: {body}"
+            );
+            assert!(
+                !body.starts_with("completed"),
+                "cpu spin must not run to completion: {body}"
+            );
+        }
+        Err(e) => {
+            assert!(!e.is_timeout(), "spin request timed out instead of dying");
+        }
+    }
+
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(5),
+        "epoch trap should land within ticks, took {:?}",
+        cancelled_at.elapsed()
+    );
 
     Ok(())
 }
