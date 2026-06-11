@@ -891,7 +891,7 @@ async fn handle_http_request<T: Router>(
                 reason = ?reason,
                 "no route matched incoming request",
             );
-            return Ok(error_response(400, &trace_id));
+            return Ok(error_response(reason.status(), &trace_id));
         }
     };
 
