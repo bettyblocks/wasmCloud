@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["frontend", "counter", "sse-service"]
+
+[workspace.dependencies]
+wit-bindgen = "0.54.0"
+wstd = "0.6"
+futures = { version = "0.3", default-features = false }

@@ -9,6 +9,8 @@ pub mod cli;
 pub mod config;
 /// Component inspection and analysis
 pub mod inspect;
+/// Demo job-group plugin backing examples/cancellable-jobs
+pub mod jobs_plugin;
 /// Create new wash projects
 pub mod new;
 /// Manage WebAssembly Interface Types (WIT) for wash components

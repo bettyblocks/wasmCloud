@@ -149,6 +149,12 @@ impl CliCommand for DevCommand {
             host_builder.with_plugin(Arc::new(plugin::wasi_logging::TracingLogger::default()))?;
         debug!("Logging plugin registered");
 
+        // Add the demo job-group plugin (examples/cancellable-jobs).
+        // Inert unless a workload declares demo:jobs interfaces.
+        host_builder = host_builder
+            .with_plugin(Arc::new(crate::jobs_plugin::JobsPlugin::default()))?;
+        debug!("demo:jobs plugin registered");
+
         // Add keyvalue plugin — Redis > NATS > filesystem > in-memory
         if let Some(redis_url) = &dev_config.wasi_keyvalue_redis_url {
             host_builder = host_builder.with_plugin(Arc::new(

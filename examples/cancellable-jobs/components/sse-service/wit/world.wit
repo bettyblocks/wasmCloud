@@ -1,0 +1,5 @@
+package demo:sse-service@0.1.0;
+
+world sse-service {
+    import demo:jobs/events@0.1.0;
+}

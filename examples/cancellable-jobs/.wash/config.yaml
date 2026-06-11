@@ -1,0 +1,42 @@
+build:
+  command: cargo build --manifest-path components/Cargo.toml --target wasm32-wasip2 --release
+  component_path: components/target/wasm32-wasip2/release/frontend.wasm
+
+dev:
+  # Pinned service owning the client-facing SSE connections.
+  service_file: components/target/wasm32-wasip2/release/sse-service.wasm
+  components:
+    # Counter component; invocations are started programmatically by the
+    # demo:jobs plugin, ten per created job group.
+    - name: counter
+      file: components/target/wasm32-wasip2/release/counter.wasm
+  # Declare the demo:jobs surface explicitly, one entry per interface:
+  # wash dev merges auto-extracted interfaces by namespace+package, so the
+  # first component's subset (frontend: control) would otherwise shadow the
+  # others — and a component only matches an entry whose interface set its
+  # world fully covers, so the entries must stay separate.
+  host_interfaces:
+    - namespace: demo
+      package: jobs
+      interfaces: [control]
+      version: 0.1.0
+      config: {}
+      name: null
+    - namespace: demo
+      package: jobs
+      interfaces: [reporter]
+      version: 0.1.0
+      config: {}
+      name: null
+    - namespace: demo
+      package: jobs
+      interfaces: [events]
+      version: 0.1.0
+      config: {}
+      name: null
+    - namespace: demo
+      package: jobs
+      interfaces: [runner]
+      version: 0.1.0
+      config: {}
+      name: null
