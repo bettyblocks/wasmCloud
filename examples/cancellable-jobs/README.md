@@ -92,19 +92,40 @@ queues — before the fix, fan-out already degraded at 8 groups):
 | 1–12 | ~98/conn (~10/s) | perfect |
 | 13+ (tested 14/16/18/20/40/…) | ~1/conn, 12 total | hard collapse |
 
-The remaining wall is **not in the demo components**: it sits at exactly
-13 concurrent groups, is independent of CPU count (8-core run handles 10
-groups perfectly; 16-core collapses at 13), independent of epoch
-interruption (verified disabled), and is not pool exhaustion (no
-instantiation errors — everything wedges silently, including groups that
-were healthy below the threshold). Suspect: cross-store contention in
-wasmtime 44's component-async scheduling (the #11869/#11870 family —
-each group holds two long-driven P3 stores plus ten in-flight concurrent
-linked calls). Runtime correctness holds throughout: register/cancel
-work at every level and teardown cancels trap all groups (the
-`wasm trap: interrupt` ERROR lines during cleanup are those cancels
-working as designed). Follow-up: instrument the host (tokio-console /
-custom tracing in the driver) to find what the 13th group blocks on.
+The wall at 13 groups was investigated (2026-06-11) and root-caused to
+**scheduling starvation in the sse-service's guest executor (wstd)**, not
+the wasm runtime. Evidence chain:
+
+- Counters stay healthy through the wedge (1550 sustained feed writes
+  over 12s at n=13) — stores, concurrent linked calls, and the virtual
+  loopback all keep working.
+- All 16 tokio workers are *idle-parked* mid-wedge (gdb-as-parent stack
+  capture) — not thread exhaustion; CPU stays low. Epoch ruled out by a
+  kill-switch test; pool limits ruled out (no instantiation errors); the
+  loopback stream mutexes ruled out (instrumented, zero contention).
+- Flow instrumentation: the service keeps *receiving* counts, but each
+  watcher task delivers exactly one frame and never runs again while its
+  queue fills. Watcher tasks are woken by guest-internal channels — not
+  by pollables — and starve.
+- Heisenbug clincher: adding an eprintln per received message (= extra
+  host calls = extra reactor turns) partially restored delivery
+  (12 → 446 events).
+
+Mechanism: wstd's reactor performs a **full-list nonblocking pollable
+check after nearly every task run** (`nonblock_check_pollables`), which
+constructs and polls a `ready()` future for every registered pollable
+(~11 per group: 10 feeds + 1 watcher, each doing host-side mutex/channel
+work). Per-turn cost is O(connections) and turns scale with message rate
+(10·N/s), so the single-threaded service's work grows ~O(N²) — at 13
+groups (~144 pollables) the one fiber's budget is exceeded and
+non-pollable wakes starve. A single-core budget is also why the wall is
+independent of total CPU count.
+
+Remedies (not yet applied): upstream, wstd's per-turn full-list check
+wants throttling; demo-side, all 10 counters of a group share one store
+and one counter instance, so they could share **one feed connection**
+(instance-static writer) — cutting pollables ~6× and moving the wall to
+~70+ groups. A drain-all-frames-per-wake watcher loop helps too.
 
 ## Known demo limits
 
