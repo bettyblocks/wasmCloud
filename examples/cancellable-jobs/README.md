@@ -81,6 +81,29 @@ curl ──POST /cancel/<id>──▶ frontend ── control.cancel ──▶ J
   calls execute in the `/create` invocation's store — group cancel is a
   single handle, and counters are concurrent, not parallel.
 
+## Measured load ceiling (see `loadtest.sh`)
+
+Ramp on a fresh host per level, 10s windows, sleep mode:
+
+| groups (×10 counters) | counter feeds connected | watcher events |
+|---|---|---|
+| 1 | 10/10 | ~90 (healthy: ~9/s) |
+| 8 | 80/80 | ~32/conn (~3/s, degraded) |
+| 20 | 200/200 | ~1/conn (collapsed) |
+| 40 | 313/400 | collapsed |
+| 80+ | partial | creates start timing out |
+
+The bottleneck is this demo's **sse-service**, not the runtime: it reads
+every feed byte-at-a-time on a single-threaded reactor and broadcasts
+inline, and since a counter's tick awaits its TCP write, service
+backpressure throttles the counters themselves. Runtime operations stay
+correct throughout — register/cancel work at every level, and teardown
+cancels still trap all groups (the `wasm trap: interrupt` ERROR lines in
+the host log during cleanup are those cancels, working as designed).
+Obvious fixes if this graduates: buffered line reading, decoupling feed
+ingestion from watcher writes (per-watcher queues), and chasing the
+cross-run degradation noted in the loadtest commit.
+
 ## Known demo limits
 
 - Counters in one store are cooperatively scheduled: the burn loop yields
