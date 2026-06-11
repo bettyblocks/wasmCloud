@@ -897,11 +897,16 @@ async fn invoke_component_handler(
     fuel_meter: FuelConsumptionMeter,
 ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
     // Create a new store for this request with plugin contexts
-    let store = workload_handle.new_store(component_id).await?;
+    #[cfg_attr(not(feature = "wasip3"), allow(unused_mut))]
+    let mut store = workload_handle.new_store(component_id).await?;
 
     // Check if this component targets WASIP3 and dispatch accordingly
     #[cfg(feature = "wasip3")]
     if crate::engine::targets_wasip3_http(instance_pre.component()) {
+        // Concurrent linked-call trampolines cannot instantiate components
+        // (no instantiate-under-Accessor API), so eagerly instantiate the
+        // store's linked callees before guest code runs.
+        workload_handle.instantiate_linked(&mut store).await?;
         let resp =
             crate::host::http_p3::handle_component_request_p3(store, instance_pre, req, fuel_meter)
                 .await?;

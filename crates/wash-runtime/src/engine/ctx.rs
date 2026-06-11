@@ -65,14 +65,29 @@ pub struct SharedCtx {
     pub table: wasmtime::component::ResourceTable,
     /// Contexts for linked components
     pub contexts: HashMap<Arc<str>, Ctx>,
+    /// Instances of linked components in this store, keyed by component id.
+    /// Populated eagerly on the P3 dispatch path (concurrent host functions
+    /// cannot instantiate) and lazily by the classic async trampoline.
+    pub linked_instances: HashMap<Arc<str>, wasmtime::component::Instance>,
+    /// In-flight linked calls (callee component ids), used to switch the
+    /// active context around inter-component calls. See
+    /// [`SharedCtx::enter_linked_call`] for the isolation contract.
+    linked_call_stack: Vec<Arc<str>>,
+    /// The store's root (dispatched) component, restored when the linked
+    /// call stack empties.
+    root_component_id: Arc<str>,
 }
 
 impl SharedCtx {
     pub fn new(context: Ctx) -> Self {
+        let root_component_id = context.component_id.clone();
         Self {
             active_ctx: context,
             table: ResourceTable::new(),
             contexts: Default::default(),
+            linked_instances: Default::default(),
+            linked_call_stack: Vec::new(),
+            root_component_id,
         }
     }
 
@@ -90,6 +105,47 @@ impl SharedCtx {
                 "Context for component {id} not found"
             ))
         }
+    }
+
+    /// Switch the active context to `callee` for the duration of a linked
+    /// inter-component call. Must be paired with
+    /// [`SharedCtx::exit_linked_call`] (including on error paths).
+    ///
+    /// Isolation contract: the active-context slot is a single value, so
+    /// per-component context isolation is exact only while linked calls do
+    /// not overlap, or while every overlapping call targets the *same*
+    /// callee and the caller performs no context-sensitive host calls in
+    /// the meantime. Wasmtime exposes no caller identity to host functions,
+    /// so overlapping calls into *different* callees leave a window where a
+    /// host call observes the wrong component's context — detected and
+    /// warned about here.
+    pub fn enter_linked_call(&mut self, callee: &Arc<str>) -> wasmtime::Result<()> {
+        if let Some(top) = self.linked_call_stack.last()
+            && top != callee
+        {
+            tracing::warn!(
+                in_flight = top.as_ref(),
+                entering = callee.as_ref(),
+                "overlapping linked calls into different components: \
+                 per-component context isolation is best-effort here"
+            );
+        }
+        self.linked_call_stack.push(callee.clone());
+        self.set_active_ctx(callee)
+    }
+
+    /// Pop one in-flight linked call to `callee` and restore the context of
+    /// the most recent remaining call (or the root component).
+    pub fn exit_linked_call(&mut self, callee: &Arc<str>) -> wasmtime::Result<()> {
+        if let Some(pos) = self.linked_call_stack.iter().rposition(|c| c == callee) {
+            self.linked_call_stack.remove(pos);
+        }
+        let target = self
+            .linked_call_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| self.root_component_id.clone());
+        self.set_active_ctx(&target)
     }
 }
 
