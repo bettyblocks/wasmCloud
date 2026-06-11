@@ -224,6 +224,8 @@ const P3_FIXTURES: &[&str] = &[
     "http-blobstore-p3",
     "cli-service-p3",
     "socket-test-p3",
+    "http-async-submit-p3",
+    "http-streaming-p3",
     "inter-component-call-p3-caller",
     "inter-component-call-p3-callee",
 ];

@@ -591,6 +591,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-async-submit-p3"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.54.0",
+]
+
+[[package]]
 name = "http-blobstore"
 version = "0.1.0"
 dependencies = [
@@ -644,6 +651,13 @@ dependencies = [
 
 [[package]]
 name = "http-handler-p3"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.54.0",
+]
+
+[[package]]
+name = "http-streaming-p3"
 version = "0.0.0"
 dependencies = [
  "wit-bindgen 0.54.0",

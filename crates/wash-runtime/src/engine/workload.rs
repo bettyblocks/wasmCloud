@@ -722,7 +722,7 @@ impl ResolvedWorkload {
             let linked_components = self.components.read().await.keys().cloned().collect();
 
             let res = match self
-                .resolve_component_imports(&component, linker, interface_map)
+                .resolve_component_imports(&component_id, &component, linker, interface_map)
                 .await
             {
                 Ok(_) => {
@@ -744,10 +744,11 @@ impl ResolvedWorkload {
 
         if let Some(mut service) = self.service.take() {
             let component = service.metadata.component.clone();
+            let service_id = service.metadata.id().to_string();
             let linker = &mut service.metadata.linker;
 
             let res = match self
-                .resolve_component_imports(&component, linker, interface_map)
+                .resolve_component_imports(&service_id, &component, linker, interface_map)
                 .await
             {
                 Ok(_) => {
@@ -768,6 +769,7 @@ impl ResolvedWorkload {
 
     async fn resolve_component_imports(
         &self,
+        importer_id: &str,
         component: &wasmtime::component::Component,
         linker: &mut Linker<SharedCtx>,
         interface_map: &HashMap<String, Arc<str>>,
@@ -794,6 +796,18 @@ impl ResolvedWorkload {
                             );
                             continue;
                         };
+                        if exporter_component.as_ref() == importer_id {
+                            // A component that both imports and exports the same
+                            // interface (e.g. a P3 component serving wasi:http
+                            // while also making outbound wasi:http calls) must
+                            // not be linked to itself — the import is
+                            // host-provided.
+                            debug!(
+                                name = import_name,
+                                "import is exported by the importing component itself, assuming host-provided"
+                            );
+                            continue;
+                        }
                         let Some(plugin_component) = all_components.get_mut(exporter_component)
                         else {
                             anyhow::bail!(
@@ -1074,12 +1088,13 @@ impl ResolvedWorkload {
         &self,
         component_id: &str,
         cancel_handle: Arc<std::sync::atomic::AtomicBool>,
+        host_work: Arc<crate::engine::ctx::HostWorkTracker>,
     ) -> anyhow::Result<Ctx> {
         let components = self.components.read().await;
         let component = components
             .get(component_id)
             .context("component ID not found in workload")?;
-        self.new_ctx_from_metadata(&component.metadata, false, cancel_handle)
+        self.new_ctx_from_metadata(&component.metadata, false, cancel_handle, host_work)
             .await
     }
 
@@ -1089,6 +1104,7 @@ impl ResolvedWorkload {
         metadata: &WorkloadMetadata,
         is_service: bool,
         cancel_handle: Arc<std::sync::atomic::AtomicBool>,
+        host_work: Arc<crate::engine::ctx::HostWorkTracker>,
     ) -> anyhow::Result<Ctx> {
         let components = self.components.read().await;
 
@@ -1147,7 +1163,8 @@ impl ResolvedWorkload {
             .with_wasi_ctx(wasi_ctx_builder.build())
             .with_sockets(sockets_ctx)
             .with_allowed_hosts(metadata.local_resources.allowed_hosts.clone())
-            .with_cancel_handle(cancel_handle);
+            .with_cancel_handle(cancel_handle)
+            .with_host_work(host_work);
 
         if let Some(plugins) = &metadata.plugins {
             ctx_builder = ctx_builder.with_plugins(plugins.clone());
@@ -1177,11 +1194,13 @@ impl ResolvedWorkload {
     ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
         // One cancellation handle per store: the active context and every
         // linked context share it, so tripping it cancels the whole
-        // invocation's linked graph together.
+        // invocation's linked graph together. The host-work tracker is
+        // likewise one-per-store (see HostWorkTracker).
         let cancel_handle = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let host_work = Arc::new(crate::engine::ctx::HostWorkTracker::default());
 
         let active_ctx = self
-            .new_ctx_from_metadata(metadata, is_service, cancel_handle.clone())
+            .new_ctx_from_metadata(metadata, is_service, cancel_handle.clone(), host_work.clone())
             .await?;
 
         // The active context's id doubles as the invocation token. Register
@@ -1201,7 +1220,7 @@ impl ResolvedWorkload {
 
         for linked_component_id in metadata.linked_components.iter() {
             let linked_component_ctx = self
-                .new_ctx(linked_component_id, cancel_handle.clone())
+                .new_ctx(linked_component_id, cancel_handle.clone(), host_work.clone())
                 .await?;
             shared_ctx
                 .contexts

@@ -69,6 +69,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 hostname = { workspace = true }
+http-body = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["server", "http1", "http2"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "tokio", "server-auto"] }
@@ -81,7 +82,7 @@ uuid = { workspace = true, features = ["v4"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "macros"] }
 tracing = { workspace = true }
-wasmtime = { workspace = true, features = ["anyhow", "component-model", "component-model-async", "winch", "pooling-allocator", "gc", "gc-null"] }
+wasmtime = { workspace = true, features = ["anyhow", "component-model", "component-model-async", "cranelift", "winch", "pooling-allocator", "gc", "gc-null"] }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-io = { workspace = true }
 wasmtime-wasi-http = { workspace = true, features = ["default-send-request", "p2"] }

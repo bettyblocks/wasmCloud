@@ -19,6 +19,44 @@ use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
 
 use crate::plugin::HostPlugin;
 
+/// Counts in-flight host-side work performed on behalf of one invocation
+/// (store). Used by the P3 HTTP driver to decide when a store with
+/// post-response background guest work may be dropped: background work is
+/// guaranteed to stay alive while it has tracked host activity in flight.
+///
+/// Pure-compute gaps between host operations are bridged by a grace window
+/// in the driver, not by this counter — see `host/http_p3.rs`.
+#[derive(Default)]
+pub struct HostWorkTracker {
+    count: std::sync::atomic::AtomicUsize,
+}
+
+impl HostWorkTracker {
+    /// Number of in-flight tracked operations.
+    pub fn in_flight(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// Track one host-side operation; the returned guard decrements on drop.
+    pub fn track(self: &Arc<Self>) -> HostWorkGuard {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        HostWorkGuard {
+            tracker: self.clone(),
+        }
+    }
+}
+
+/// RAII guard for one tracked host-side operation.
+pub struct HostWorkGuard {
+    tracker: Arc<HostWorkTracker>,
+}
+
+impl Drop for HostWorkGuard {
+    fn drop(&mut self) {
+        self.tracker.count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Shared context for linked components
 pub struct SharedCtx {
     /// Current active context
@@ -113,6 +151,13 @@ pub struct Ctx {
     /// Detectors (e.g. a cancel plugin) set it; host-call boundaries read it
     /// via [`Ctx::ensure_not_cancelled`] and trap the invocation if tripped.
     pub cancel_handle: Arc<AtomicBool>,
+    /// Per-invocation tracker of in-flight host-side work (outbound HTTP
+    /// requests, concurrent linked-component calls, ...). One tracker per
+    /// store, shared by all contexts like `cancel_handle`. The P3 HTTP
+    /// driver keeps the store alive after the response was returned for as
+    /// long as tracked work remains — this is what makes guest background
+    /// work (async submit) survive past the response.
+    pub host_work: Arc<HostWorkTracker>,
     /// Plugin instances stored by string ID for access during component execution.
     /// These all implement the [`HostPlugin`] trait, but they are cast as `Arc<dyn Any + Send + Sync>`
     /// to support downcasting to the specific plugin type in [`Ctx::get_plugin`]
@@ -229,6 +274,9 @@ impl WasiHttpHooks for CtxHttpHooks {
 #[cfg(feature = "wasip3")]
 struct CtxHttpHooksP3 {
     allowed_hosts: Arc<[String]>,
+    /// Outbound requests count as in-flight host work so the P3 driver
+    /// keeps the store alive while a background guest task awaits one.
+    host_work: Arc<HostWorkTracker>,
 }
 
 #[cfg(feature = "wasip3")]
@@ -283,10 +331,14 @@ impl wasmtime_wasi_http::p3::WasiHttpHooks for CtxHttpHooksP3 {
             });
         }
 
-        // Delegate to the default send_request implementation
+        // Delegate to the default send_request implementation. The guard
+        // keeps the request counted as in-flight host work until the
+        // response (head) has arrived.
         _ = fut;
+        let guard = self.host_work.track();
         Box::new(async move {
             use http_body_util::BodyExt;
+            let _guard = guard;
             let (res, io) = wasmtime_wasi_http::p3::default_send_request(request, options).await?;
             Ok((
                 res.map(BodyExt::boxed_unsync),
@@ -308,6 +360,7 @@ pub struct CtxBuilder {
     http_handler: Option<Arc<dyn crate::host::http::HostHandler>>,
     allowed_hosts: Arc<[String]>,
     cancel_handle: Option<Arc<AtomicBool>>,
+    host_work: Option<Arc<HostWorkTracker>>,
 }
 
 impl CtxBuilder {
@@ -322,6 +375,7 @@ impl CtxBuilder {
             plugins: HashMap::new(),
             allowed_hosts: Default::default(),
             cancel_handle: None,
+            host_work: None,
         }
     }
 
@@ -365,6 +419,14 @@ impl CtxBuilder {
         self
     }
 
+    /// Share an existing host-work tracker with this context. All contexts
+    /// of one store must hold the same tracker; if none is provided, a fresh
+    /// one is created in [`CtxBuilder::build`].
+    pub fn with_host_work(mut self, host_work: Arc<HostWorkTracker>) -> Self {
+        self.host_work = Some(host_work);
+        self
+    }
+
     pub fn build(self) -> Ctx {
         let plugins = self
             .plugins
@@ -372,9 +434,12 @@ impl CtxBuilder {
             .map(|(k, v)| (k, v as Arc<dyn Any + Send + Sync>))
             .collect();
 
+        let host_work = self.host_work.unwrap_or_default();
+
         #[cfg(feature = "wasip3")]
         let http_hooks_p3 = CtxHttpHooksP3 {
             allowed_hosts: self.allowed_hosts.clone(),
+            host_work: host_work.clone(),
         };
 
         let http_hooks = CtxHttpHooks {
@@ -396,6 +461,7 @@ impl CtxBuilder {
             http: WasiHttpCtx::new(),
             sockets: self.sockets.unwrap_or_default(),
             cancel_handle: self.cancel_handle.unwrap_or_default(),
+            host_work,
             plugins,
             http_hooks,
             #[cfg(feature = "wasip3")]

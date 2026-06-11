@@ -7549,6 +7549,7 @@ dependencies = [
  "geo-types",
  "hostname",
  "html2text",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
