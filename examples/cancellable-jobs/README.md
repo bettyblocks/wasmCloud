@@ -83,26 +83,28 @@ curl ──POST /cancel/<id>──▶ frontend ── control.cancel ──▶ J
 
 ## Measured load ceiling (see `loadtest.sh`)
 
-Ramp on a fresh host per level, 10s windows, sleep mode:
+Ramp on a verified-fresh host per level, 10s windows, sleep mode, after
+the sse-service throughput fix (buffered line reads + per-watcher
+queues — before the fix, fan-out already degraded at 8 groups):
 
-| groups (×10 counters) | counter feeds connected | watcher events |
+| groups (×10 counters) | watcher events | verdict |
 |---|---|---|
-| 1 | 10/10 | ~90 (healthy: ~9/s) |
-| 8 | 80/80 | ~32/conn (~3/s, degraded) |
-| 20 | 200/200 | ~1/conn (collapsed) |
-| 40 | 313/400 | collapsed |
-| 80+ | partial | creates start timing out |
+| 1–12 | ~98/conn (~10/s) | perfect |
+| 13+ (tested 14/16/18/20/40/…) | ~1/conn, 12 total | hard collapse |
 
-The bottleneck is this demo's **sse-service**, not the runtime: it reads
-every feed byte-at-a-time on a single-threaded reactor and broadcasts
-inline, and since a counter's tick awaits its TCP write, service
-backpressure throttles the counters themselves. Runtime operations stay
-correct throughout — register/cancel work at every level, and teardown
-cancels still trap all groups (the `wasm trap: interrupt` ERROR lines in
-the host log during cleanup are those cancels, working as designed).
-Obvious fixes if this graduates: buffered line reading, decoupling feed
-ingestion from watcher writes (per-watcher queues), and chasing the
-cross-run degradation noted in the loadtest commit.
+The remaining wall is **not in the demo components**: it sits at exactly
+13 concurrent groups, is independent of CPU count (8-core run handles 10
+groups perfectly; 16-core collapses at 13), independent of epoch
+interruption (verified disabled), and is not pool exhaustion (no
+instantiation errors — everything wedges silently, including groups that
+were healthy below the threshold). Suspect: cross-store contention in
+wasmtime 44's component-async scheduling (the #11869/#11870 family —
+each group holds two long-driven P3 stores plus ten in-flight concurrent
+linked calls). Runtime correctness holds throughout: register/cancel
+work at every level and teardown cancels trap all groups (the
+`wasm trap: interrupt` ERROR lines during cleanup are those cancels
+working as designed). Follow-up: instrument the host (tokio-console /
+custom tracing in the driver) to find what the 13th group blocks on.
 
 ## Known demo limits
 

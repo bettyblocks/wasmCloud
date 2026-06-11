@@ -13,26 +13,46 @@
 //!               ends: every live counter's counts as they arrive, then
 //!               "event: done" or "event: cancelled".
 //!
-//! Single-threaded: wstd tasks share state via Rc<RefCell<..>>; RefCell
-//! borrows are never held across an await.
+//! Throughput design (shaped by load testing — see loadtest.sh):
+//! - **Buffered line reads**: feeds are read in 4KiB chunks and split into
+//!   lines, instead of one byte per poll.
+//! - **Per-watcher queues**: a feed pushes frames into each watcher's
+//!   queue synchronously and never awaits a watcher's socket. Each
+//!   watcher connection drains its own queue in its own task, so a slow
+//!   watcher can't backpressure the feeds (and thereby the counters,
+//!   whose tick loops await their feed writes). Queues are unbounded —
+//!   acceptable at demo scale; a slow client costs memory, not group
+//!   throughput.
+//!
+//! Single-threaded: wstd tasks share state via Rc<RefCell<..>>; pushes
+//! are synchronous, so no RefCell borrow ever spans an await.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use futures::StreamExt;
+use futures::channel::mpsc;
 use wstd::io::{AsyncRead, AsyncWrite};
 use wstd::iter::AsyncIterator;
 use wstd::net::{TcpListener, TcpStream};
 
 const LISTEN_ADDR: &str = "127.0.0.1:8081";
+const READ_CHUNK: usize = 4096;
+
+/// A frame queued for one watcher. Terminal frames close the connection
+/// after delivery.
+enum Frame {
+    Data(String),
+    Terminal(String),
+}
 
 #[derive(Default)]
 struct Group {
-    seen_feeds: u32,
     active_feeds: u32,
     any_aborted: bool,
     terminal: Option<&'static str>,
-    watchers: Vec<TcpStream>,
+    watchers: Vec<mpsc::UnboundedSender<Frame>>,
 }
 
 type Groups = Rc<RefCell<HashMap<String, Group>>>;
@@ -63,29 +83,105 @@ fn main() -> Result<(), std::io::Error> {
     })
 }
 
-async fn handle_connection(mut stream: TcpStream, groups: Groups) -> Result<(), std::io::Error> {
-    let hello = read_line(&mut stream).await?;
+/// Buffered line reader over a TcpStream: reads in chunks, yields complete
+/// lines. Returns None on EOF or error (a partial trailing line counts as
+/// an abrupt close).
+struct LineReader {
+    stream: TcpStream,
+    buf: Vec<u8>,
+    start: usize,
+}
+
+impl LineReader {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            buf: Vec::with_capacity(READ_CHUNK),
+            start: 0,
+        }
+    }
+
+    fn into_stream(self) -> TcpStream {
+        self.stream
+    }
+
+    async fn next_line(&mut self) -> Option<String> {
+        loop {
+            if let Some(nl) = self.buf[self.start..].iter().position(|&b| b == b'\n') {
+                let end = self.start + nl;
+                let line = String::from_utf8_lossy(&self.buf[self.start..end])
+                    .trim()
+                    .to_string();
+                self.start = end + 1;
+                return Some(line);
+            }
+
+            // No complete line buffered: compact, then read another chunk.
+            if self.start > 0 {
+                self.buf.drain(..self.start);
+                self.start = 0;
+            }
+            let mut chunk = [0u8; READ_CHUNK];
+            match self.stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+}
+
+async fn handle_connection(stream: TcpStream, groups: Groups) -> Result<(), std::io::Error> {
+    let mut lines = LineReader::new(stream);
+    let Some(hello) = lines.next_line().await else {
+        return Ok(());
+    };
+
     let mut parts = hello.split_whitespace();
     match (parts.next(), parts.next(), parts.next()) {
         (Some("feed"), Some(request_id), Some(index)) => {
             let index: u32 = index.parse().unwrap_or(u32::MAX);
-            handle_feed(stream, groups, request_id.to_string(), index).await
+            handle_feed(lines, groups, request_id.to_string(), index).await
         }
         (Some("watch"), Some(request_id), None) => {
-            handle_watch(stream, groups, request_id.to_string()).await
+            handle_watch(lines.into_stream(), groups, request_id.to_string()).await
         }
         _ => {
+            let mut stream = lines.into_stream();
             stream.write_all(b"bad hello\n").await?;
             Ok(())
         }
     }
 }
 
+/// Push a data frame to every watcher of the group; dead watchers (queue
+/// receiver dropped) are pruned. Synchronous — never blocks the feed.
+fn push_data(groups: &Groups, request_id: &str, frame: &str) {
+    let mut groups = groups.borrow_mut();
+    let Some(group) = groups.get_mut(request_id) else {
+        return;
+    };
+    group
+        .watchers
+        .retain(|tx| tx.unbounded_send(Frame::Data(frame.to_string())).is_ok());
+}
+
+/// Deliver the terminal frame to every watcher and drop them.
+fn push_terminal(groups: &Groups, request_id: &str, terminal: &'static str) {
+    let frame = format!("event: {terminal}\ndata: {{}}\n\n");
+    let mut groups = groups.borrow_mut();
+    let Some(group) = groups.get_mut(request_id) else {
+        return;
+    };
+    for tx in group.watchers.drain(..) {
+        let _ = tx.unbounded_send(Frame::Terminal(frame.clone()));
+    }
+}
+
 /// Ingest one counter's feed until it completes ("done") or dies abruptly
 /// (cancelled/trapped). When the group's last feed ends, emit the terminal
-/// event to all watchers and close them.
+/// event to all watchers.
 async fn handle_feed(
-    mut stream: TcpStream,
+    mut lines: LineReader,
     groups: Groups,
     request_id: String,
     index: u32,
@@ -93,25 +189,19 @@ async fn handle_feed(
     {
         let mut groups = groups.borrow_mut();
         let group = groups.entry(request_id.clone()).or_default();
-        group.seen_feeds += 1;
         group.active_feeds += 1;
     }
     eprintln!("[sse-service] feed connected: {request_id} #{index}");
 
     let mut completed = false;
-    loop {
-        let line = match read_line(&mut stream).await {
-            Ok(line) if line.is_empty() => break, // EOF
-            Ok(line) => line,
-            Err(_) => break, // abrupt close (trapped counter)
-        };
+    while let Some(line) = lines.next_line().await {
         if line == "done" {
             completed = true;
             break;
         }
         if let Some(count) = line.strip_prefix("count ") {
             let frame = format!("event: count\ndata: {{\"index\":{index},\"count\":{count}}}\n\n");
-            broadcast(&groups, &request_id, &frame, false).await;
+            push_data(&groups, &request_id, &frame);
         }
     }
 
@@ -139,8 +229,7 @@ async fn handle_feed(
                 return Ok(());
             };
             if group.active_feeds == 0 && group.terminal.is_none() {
-                group.terminal =
-                    Some(if group.any_aborted { "cancelled" } else { "done" });
+                group.terminal = Some(if group.any_aborted { "cancelled" } else { "done" });
                 group.terminal
             } else {
                 None
@@ -148,86 +237,55 @@ async fn handle_feed(
         };
         if let Some(terminal) = finalized {
             eprintln!("[sse-service] group {request_id}: {terminal}");
-            let frame = format!("event: {terminal}\ndata: {{}}\n\n");
-            broadcast(&groups, &request_id, &frame, true).await;
+            push_terminal(&groups, &request_id, terminal);
         }
     }
 
     Ok(())
 }
 
-/// Register a watcher: it receives frames as feeds produce them. The
-/// stream's ownership moves into the group; a watcher of an already-ended
-/// group gets the terminal frame immediately.
+/// Serve one watcher: register a queue with the group and drain it into
+/// the connection. The feed side never touches this socket — a slow
+/// watcher only grows its own queue.
 async fn handle_watch(
     mut stream: TcpStream,
     groups: Groups,
     request_id: String,
 ) -> Result<(), std::io::Error> {
-    let terminal = {
-        let groups = groups.borrow();
-        groups.get(&request_id).and_then(|g| g.terminal)
+    let mut rx = {
+        let mut groups = groups.borrow_mut();
+        let group = groups.entry(request_id.clone()).or_default();
+        if let Some(terminal) = group.terminal {
+            // Group already ended: deliver the outcome immediately.
+            let frame = format!("event: {terminal}\ndata: {{}}\n\n");
+            drop(groups);
+            stream.write_all(frame.as_bytes()).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+        let (tx, rx) = mpsc::unbounded();
+        group.watchers.push(tx);
+        rx
     };
 
-    if let Some(terminal) = terminal {
-        let frame = format!("event: {terminal}\ndata: {{}}\n\n");
-        stream.write_all(frame.as_bytes()).await?;
-        stream.flush().await?;
-        return Ok(());
-    }
-
-    // Group may not have started yet (watcher raced the counters): create
-    // it so the watcher is registered either way.
-    let mut groups = groups.borrow_mut();
-    let group = groups.entry(request_id).or_default();
-    group.watchers.push(stream);
-    Ok(())
-}
-
-/// Write a frame to every watcher of the group; drop watchers whose client
-/// went away. With `close`, all watchers are dropped after the write
-/// (terminal event).
-async fn broadcast(groups: &Groups, request_id: &str, frame: &str, close: bool) {
-    let watchers = {
-        let mut groups = groups.borrow_mut();
-        match groups.get_mut(request_id) {
-            Some(group) => std::mem::take(&mut group.watchers),
-            None => return,
-        }
-    };
-
-    let mut kept = Vec::new();
-    for mut watcher in watchers {
-        let alive = watcher.write_all(frame.as_bytes()).await.is_ok()
-            && watcher.flush().await.is_ok();
-        if alive && !close {
-            kept.push(watcher);
-        }
-    }
-
-    if !close {
-        let mut groups = groups.borrow_mut();
-        if let Some(group) = groups.get_mut(request_id) {
-            // New watchers may have registered while we were writing.
-            group.watchers.append(&mut kept);
-        }
-    }
-}
-
-async fn read_line(stream: &mut TcpStream) -> Result<String, std::io::Error> {
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match stream.read(&mut byte).await? {
-            0 => break,
-            _ if byte[0] == b'\n' => break,
-            _ => {
-                line.push(byte[0]);
-                if line.len() > 256 {
+    while let Some(frame) = rx.next().await {
+        match frame {
+            Frame::Data(data) => {
+                if stream.write_all(data.as_bytes()).await.is_err()
+                    || stream.flush().await.is_err()
+                {
+                    // Client went away; dropping rx prunes us from the
+                    // group on the next push.
                     break;
                 }
             }
+            Frame::Terminal(data) => {
+                let _ = stream.write_all(data.as_bytes()).await;
+                let _ = stream.flush().await;
+                break;
+            }
         }
     }
-    Ok(String::from_utf8_lossy(&line).trim().to_string())
+
+    Ok(())
 }
