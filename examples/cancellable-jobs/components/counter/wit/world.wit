@@ -1,8 +1,5 @@
 package demo:counter@0.1.0;
 
 world counter {
-    import demo:jobs/reporter@0.1.0;
-    import wasi:clocks/monotonic-clock@0.2.2;
-
     export demo:jobs/runner@0.1.0;
 }

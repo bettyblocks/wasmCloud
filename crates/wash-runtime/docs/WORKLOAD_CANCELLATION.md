@@ -222,14 +222,19 @@ end-to-end on 2026-06-11. Zero further wash-runtime changes; the runtime's
 extension surface (plugin trait + the POC's hook + pub `cancel_handle`) was
 sufficient.
 
-The shape: `POST /create` (frontend component) → plugin spawns **10 counter
-invocations** programmatically and returns a request-id immediately (async
-submit at the *application* level); counters report once/second through a
-plugin import (`ensure_not_cancelled()?` first — the actuator); a pinned
-**service component** streams each group's events as SSE; `POST /cancel/<id>`
-trips all 10 handles after a creator-workload tenancy check. Verified: 10/10
-counters trap (`invocation cancelled` backtraces), cancel is idempotent,
-bogus ids are no-ops, late subscribers get the terminal event.
+The shape (v2, after Layer 2 landed): `POST /create[?mode=burn]` (frontend
+component) → plugin spawns **10 counter invocations** programmatically and
+returns a request-id immediately (async submit at the *application* level);
+counters report **directly to the pinned SSE service over the workload's
+virtual loopback TCP** (the documented component→service channel — the
+plugin is out of the data path entirely and keeps only `control`:
+spawn + trip); `POST /cancel/<id>` trips all 10 handles after a
+creator-workload tenancy check, and the *runtime* actuators (Layer 1 host
+checks + Layer 2 epoch) trap the counters. The service infers
+cancelled-vs-done from whether feeds close abruptly or send `done`.
+Verified: sleep-mode counters die ≤1s; **burn-mode counters (pure CPU,
+zero host calls) die within epoch ticks** — the Layer 2 showcase; cancel
+is idempotent, bogus ids are no-ops, late watchers get the terminal event.
 
 What the demo established beyond the POC:
 

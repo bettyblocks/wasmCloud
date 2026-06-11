@@ -24,18 +24,6 @@ dev:
       name: null
     - namespace: demo
       package: jobs
-      interfaces: [reporter]
-      version: 0.1.0
-      config: {}
-      name: null
-    - namespace: demo
-      package: jobs
-      interfaces: [events]
-      version: 0.1.0
-      config: {}
-      name: null
-    - namespace: demo
-      package: jobs
       interfaces: [runner]
       version: 0.1.0
       config: {}

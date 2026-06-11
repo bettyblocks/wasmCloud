@@ -37,6 +37,7 @@ name = "counter"
 version = "0.1.0"
 dependencies = [
  "wit-bindgen 0.54.0",
+ "wstd",
 ]
 
 [[package]]
@@ -298,7 +299,6 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "sse-service"
 version = "0.1.0"
 dependencies = [
- "wit-bindgen 0.54.0",
  "wstd",
 ]
 

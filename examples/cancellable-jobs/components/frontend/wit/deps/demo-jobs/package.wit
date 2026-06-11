@@ -1,12 +1,21 @@
 package demo:jobs@0.1.0;
 
 /// Job-group control, called by the frontend component. Backed by the
-/// JobsPlugin in the wash host.
+/// JobsPlugin in the wash host — the plugin's two irreducible jobs are
+/// spawning the counter invocations (guests cannot start background
+/// invocations) and tripping their cancellation handles (host-side state).
+///
+/// Counts no longer flow through the plugin: counters report directly to
+/// the SSE service over the workload's virtual loopback network, the
+/// documented component-to-service channel.
 interface control {
     /// Submit a job group: starts the counter invocations and returns the
-    /// request-id immediately (async submit). Errors if the counter
-    /// component is not (yet) available.
-    create: func() -> result<string, string>;
+    /// request-id immediately (async submit). `burn` selects the counter
+    /// mode: false = count once per second (host-blocked between ticks),
+    /// true = a pure CPU loop with zero host calls — cancellable only via
+    /// epoch interruption (Layer 2). Errors if the counter component is
+    /// not (yet) available.
+    create: func(burn: bool) -> result<string, string>;
 
     /// Trip the cancellation handle of every counter invocation in the
     /// group. Scoped to the calling workload: a workload can only cancel
@@ -14,50 +23,14 @@ interface control {
     cancel: func(request-id: string) -> bool;
 }
 
-/// Progress reporting, called by counter invocations. The host function is
-/// also the cancellation actuator: it traps the invocation if its cancel
-/// handle has been tripped.
-interface reporter {
-    report: func(request-id: string, index: u32, count: u32);
-}
-
-/// Event feed for the SSE service. Non-blocking by design: one service
-/// instance multiplexes many client connections, so nothing here may block
-/// and subscription identity is managed by the caller.
-interface events {
-    record count-data {
-        index: u32,
-        count: u32,
-    }
-
-    variant event {
-        count(count-data),
-        cancelled,
-        done,
-    }
-
-    /// Subscribe to a group's events; returns a subscription id.
-    /// Errors on an unknown request-id.
-    subscribe: func(request-id: string) -> result<u64, string>;
-
-    /// Return the next pending event, or none if there is none right now.
-    /// Never blocks. A terminal event (cancelled/done) ends the
-    /// subscription.
-    poll-next: func(subscription: u64) -> option<event>;
-
-    unsubscribe: func(subscription: u64);
-}
-
 /// Exported by the counter component; one invocation per counter, started
 /// programmatically by the JobsPlugin.
 interface runner {
-    run: func(request-id: string, index: u32);
+    run: func(request-id: string, index: u32, burn: bool);
 }
 
 /// World used by the host-side bindgen in the JobsPlugin.
 world plugin-host {
     import control;
-    import reporter;
-    import events;
     export runner;
 }

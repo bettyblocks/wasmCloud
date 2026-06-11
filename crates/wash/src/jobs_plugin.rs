@@ -1,12 +1,18 @@
 //! Demo job-group plugin backing the `examples/cancellable-jobs` example.
 //!
-//! Implements the `demo:jobs` package as host functions:
-//! - `control` — create a job group (spawns N counter invocations) and
-//!   cancel it (trips every invocation's cancellation handle).
-//! - `reporter` — progress reporting from counters; doubles as the
-//!   cancellation actuator via [`ensure_not_cancelled`].
-//! - `events` — a non-blocking subscribe/poll feed consumed by the SSE
-//!   service component.
+//! The plugin implements only the two things a guest cannot do and that
+//! must live host-side (`demo:jobs/control`):
+//! - **create**: spawn N counter invocations programmatically (guests
+//!   cannot start background invocations) and capture each store's
+//!   cancellation handle.
+//! - **cancel**: trip every handle in a group, scoped to the workload
+//!   that created it.
+//!
+//! The data path bypasses the plugin entirely: counters report to the SSE
+//! service over the workload's virtual loopback network. Cancellation is
+//! enforced by the runtime — host-boundary checks (Layer 1) and the epoch
+//! callback armed on every store (Layer 2), both reading the same handle
+//! this plugin trips.
 //!
 //! The plugin is inert unless a workload declares `demo:jobs` interfaces.
 
@@ -14,12 +20,12 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use anyhow::Context as _;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use wash_runtime::{
     engine::{
@@ -33,7 +39,6 @@ use wash_runtime::{
 
 const JOBS_PLUGIN_ID: &str = "demo-jobs";
 const COUNTERS_PER_GROUP: u32 = 10;
-const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 mod bindings {
     use wash_runtime::wasmtime;
@@ -47,46 +52,21 @@ mod bindings {
             package demo:jobs@0.1.0;
 
             interface control {
-                create: func() -> result<string, string>;
+                create: func(burn: bool) -> result<string, string>;
                 cancel: func(request-id: string) -> bool;
             }
 
-            interface reporter {
-                report: func(request-id: string, index: u32, count: u32);
-            }
-
-            interface events {
-                record count-data {
-                    index: u32,
-                    count: u32,
-                }
-
-                variant event {
-                    count(count-data),
-                    cancelled,
-                    done,
-                }
-
-                subscribe: func(request-id: string) -> result<u64, string>;
-                poll-next: func(subscription: u64) -> option<event>;
-                unsubscribe: func(subscription: u64);
-            }
-
             interface runner {
-                run: func(request-id: string, index: u32);
+                run: func(request-id: string, index: u32, burn: bool);
             }
 
             world plugin-host {
                 import control;
-                import reporter;
-                import events;
                 export runner;
             }
         ",
     });
 }
-
-use bindings::demo::jobs::events::{CountData, Event};
 
 #[derive(Clone, Copy, PartialEq)]
 enum GroupState {
@@ -102,15 +82,6 @@ struct Group {
     state: GroupState,
     /// Cancellation handles of the counter invocations, one per store.
     handles: Vec<Arc<AtomicBool>>,
-    events_tx: broadcast::Sender<Event>,
-}
-
-/// A subscription created by the SSE service. A group that is already in a
-/// terminal state subscribes as `Terminal` so the first poll still delivers
-/// the outcome.
-enum Subscription {
-    Live(broadcast::Receiver<Event>),
-    Terminal(Event),
 }
 
 /// Everything needed to programmatically invoke the counter component.
@@ -124,8 +95,6 @@ struct RunnerTarget {
 #[derive(Default)]
 pub struct JobsPlugin {
     groups: Arc<RwLock<HashMap<String, Group>>>,
-    subscriptions: Arc<RwLock<HashMap<u64, Subscription>>>,
-    next_subscription: AtomicU64,
     runner_component_id: RwLock<Option<String>>,
     runner_target: Arc<RwLock<Option<RunnerTarget>>>,
 }
@@ -133,7 +102,7 @@ pub struct JobsPlugin {
 impl JobsPlugin {
     /// Spawn the group's counter invocations and a supervisor that marks
     /// the group done once they have all finished.
-    fn spawn_group(&self, target: RunnerTarget, request_id: String) {
+    fn spawn_group(&self, target: RunnerTarget, request_id: String, burn: bool) {
         let groups = self.groups.clone();
 
         tokio::spawn(async move {
@@ -175,7 +144,7 @@ impl JobsPlugin {
 
                     instance
                         .demo_jobs_runner()
-                        .call_run(&mut store, &request_id, index)
+                        .call_run(&mut store, &request_id, index, burn)
                         .await
                         .map_err(anyhow::Error::from)
                         .with_context(|| format!("counter {index} ended"))
@@ -196,7 +165,6 @@ impl JobsPlugin {
                 && group.state == GroupState::Running
             {
                 group.state = GroupState::Done;
-                let _ = group.events_tx.send(Event::Done);
                 info!(request_id, "job group completed");
             }
         });
@@ -204,7 +172,7 @@ impl JobsPlugin {
 }
 
 impl bindings::demo::jobs::control::Host for ActiveCtx<'_> {
-    async fn create(&mut self) -> wasmtime::Result<Result<String, String>> {
+    async fn create(&mut self, burn: bool) -> wasmtime::Result<Result<String, String>> {
         let Some(plugin) = self.get_plugin::<JobsPlugin>(JOBS_PLUGIN_ID) else {
             return Ok(Err("jobs plugin not available".to_string()));
         };
@@ -214,7 +182,6 @@ impl bindings::demo::jobs::control::Host for ActiveCtx<'_> {
         };
 
         let request_id = uuid::Uuid::new_v4().to_string();
-        let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
         plugin.groups.write().await.insert(
             request_id.clone(),
@@ -222,12 +189,11 @@ impl bindings::demo::jobs::control::Host for ActiveCtx<'_> {
                 creator_workload_id: self.workload_id.to_string(),
                 state: GroupState::Running,
                 handles: Vec::with_capacity(COUNTERS_PER_GROUP as usize),
-                events_tx,
             },
         );
 
-        plugin.spawn_group(target, request_id.clone());
-        info!(request_id, "job group created");
+        plugin.spawn_group(target, request_id.clone(), burn);
+        info!(request_id, burn, "job group created");
 
         Ok(Ok(request_id))
     }
@@ -260,94 +226,9 @@ impl bindings::demo::jobs::control::Host for ActiveCtx<'_> {
         for handle in &group.handles {
             handle.store(true, Ordering::Relaxed);
         }
-        let _ = group.events_tx.send(Event::Cancelled);
         info!(request_id, "job group cancelled");
 
         Ok(true)
-    }
-}
-
-impl bindings::demo::jobs::reporter::Host for ActiveCtx<'_> {
-    async fn report(&mut self, request_id: String, index: u32, count: u32) -> wasmtime::Result<()> {
-        // The cancellation actuator: a cancelled invocation traps here and
-        // unwinds before producing any further effects.
-        self.ensure_not_cancelled()?;
-
-        let Some(plugin) = self.get_plugin::<JobsPlugin>(JOBS_PLUGIN_ID) else {
-            return Ok(());
-        };
-
-        if let Some(group) = plugin.groups.read().await.get(&request_id) {
-            // No receivers yet is fine; counts before a subscriber are dropped.
-            let _ = group.events_tx.send(Event::Count(CountData { index, count }));
-        }
-
-        Ok(())
-    }
-}
-
-impl bindings::demo::jobs::events::Host for ActiveCtx<'_> {
-    async fn subscribe(&mut self, request_id: String) -> wasmtime::Result<Result<u64, String>> {
-        let Some(plugin) = self.get_plugin::<JobsPlugin>(JOBS_PLUGIN_ID) else {
-            return Ok(Err("jobs plugin not available".to_string()));
-        };
-
-        let subscription = match plugin.groups.read().await.get(&request_id) {
-            None => return Ok(Err(format!("unknown request-id: {request_id}"))),
-            Some(group) => match group.state {
-                GroupState::Running => Subscription::Live(group.events_tx.subscribe()),
-                GroupState::Cancelled => Subscription::Terminal(Event::Cancelled),
-                GroupState::Done => Subscription::Terminal(Event::Done),
-            },
-        };
-
-        let id = plugin.next_subscription.fetch_add(1, Ordering::Relaxed);
-        plugin.subscriptions.write().await.insert(id, subscription);
-        Ok(Ok(id))
-    }
-
-    async fn poll_next(&mut self, subscription: u64) -> wasmtime::Result<Option<Event>> {
-        let Some(plugin) = self.get_plugin::<JobsPlugin>(JOBS_PLUGIN_ID) else {
-            return Ok(None);
-        };
-
-        let mut subscriptions = plugin.subscriptions.write().await;
-        let Some(sub) = subscriptions.get_mut(&subscription) else {
-            // Unknown or already-terminal subscription: report done so the
-            // caller closes its connection.
-            return Ok(Some(Event::Done));
-        };
-
-        match sub {
-            Subscription::Terminal(event) => {
-                let event = event.clone();
-                subscriptions.remove(&subscription);
-                Ok(Some(event))
-            }
-            Subscription::Live(rx) => loop {
-                match rx.try_recv() {
-                    Ok(event @ (Event::Cancelled | Event::Done)) => {
-                        subscriptions.remove(&subscription);
-                        break Ok(Some(event));
-                    }
-                    Ok(event) => break Ok(Some(event)),
-                    Err(broadcast::error::TryRecvError::Empty) => break Ok(None),
-                    // Skipped some counts under load; keep draining.
-                    Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::TryRecvError::Closed) => {
-                        subscriptions.remove(&subscription);
-                        break Ok(Some(Event::Done));
-                    }
-                }
-            },
-        }
-    }
-
-    async fn unsubscribe(&mut self, subscription: u64) -> wasmtime::Result<()> {
-        if let Some(plugin) = self.get_plugin::<JobsPlugin>(JOBS_PLUGIN_ID) {
-            plugin.subscriptions.write().await.remove(&subscription);
-        }
-        Ok(())
     }
 }
 
@@ -359,7 +240,7 @@ impl HostPlugin for JobsPlugin {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: [WitInterface::from("demo:jobs/control,reporter,events@0.1.0")]
+            imports: [WitInterface::from("demo:jobs/control@0.1.0")]
                 .into_iter()
                 .collect(),
             exports: [WitInterface::from("demo:jobs/runner@0.1.0")]
@@ -380,17 +261,7 @@ impl HostPlugin for JobsPlugin {
             return Ok(());
         }
 
-        // Each item has its own linker; register all three host-side
-        // interfaces — definitions a component doesn't import are ignored.
         bindings::demo::jobs::control::add_to_linker::<_, SharedCtx>(
-            item.linker(),
-            extract_active_ctx,
-        )?;
-        bindings::demo::jobs::reporter::add_to_linker::<_, SharedCtx>(
-            item.linker(),
-            extract_active_ctx,
-        )?;
-        bindings::demo::jobs::events::add_to_linker::<_, SharedCtx>(
             item.linker(),
             extract_active_ctx,
         )?;
@@ -441,7 +312,6 @@ impl HostPlugin for JobsPlugin {
         *self.runner_target.write().await = None;
         *self.runner_component_id.write().await = None;
         self.groups.write().await.clear();
-        self.subscriptions.write().await.clear();
         Ok(())
     }
 }
