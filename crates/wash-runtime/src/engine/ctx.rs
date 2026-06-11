@@ -9,6 +9,7 @@ use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use wasmtime::component::ResourceTable;
@@ -107,6 +108,11 @@ pub struct Ctx {
     pub http: WasiHttpCtx,
     /// The sockets context used to provide socket functionality (with loopback support).
     pub sockets: crate::sockets::WasiSocketsCtx,
+    /// Per-invocation cancellation handle. One underlying flag per store: the
+    /// active context and every linked context hold clones of the same `Arc`.
+    /// Detectors (e.g. a cancel plugin) set it; host-call boundaries read it
+    /// via [`Ctx::ensure_not_cancelled`] and trap the invocation if tripped.
+    pub cancel_handle: Arc<AtomicBool>,
     /// Plugin instances stored by string ID for access during component execution.
     /// These all implement the [`HostPlugin`] trait, but they are cast as `Arc<dyn Any + Send + Sync>`
     /// to support downcasting to the specific plugin type in [`Ctx::get_plugin`]
@@ -122,6 +128,18 @@ impl Ctx {
     /// Get a plugin by its string ID and downcast to the expected type
     pub fn get_plugin<T: HostPlugin + 'static>(&self, plugin_id: &str) -> Option<Arc<T>> {
         self.plugins.get(plugin_id)?.clone().downcast().ok()
+    }
+
+    /// Returns an error if this invocation's cancellation handle has been
+    /// tripped. Host-call implementations call this on entry; the returned
+    /// error surfaces as a trap, so the guest unwinds and the store (with
+    /// every linked component) is torn down.
+    pub fn ensure_not_cancelled(&self) -> wasmtime::Result<()> {
+        if self.cancel_handle.load(Ordering::Relaxed) {
+            Err(wasmtime::format_err!("invocation cancelled"))
+        } else {
+            Ok(())
+        }
     }
 
     /// Create a new [`CtxBuilder`] to construct a [`Ctx`]
@@ -289,6 +307,7 @@ pub struct CtxBuilder {
     plugins: HashMap<&'static str, Arc<dyn HostPlugin + Send + Sync>>,
     http_handler: Option<Arc<dyn crate::host::http::HostHandler>>,
     allowed_hosts: Arc<[String]>,
+    cancel_handle: Option<Arc<AtomicBool>>,
 }
 
 impl CtxBuilder {
@@ -302,6 +321,7 @@ impl CtxBuilder {
             http_handler: None,
             plugins: HashMap::new(),
             allowed_hosts: Default::default(),
+            cancel_handle: None,
         }
     }
 
@@ -337,6 +357,14 @@ impl CtxBuilder {
         self
     }
 
+    /// Share an existing cancellation handle with this context. All contexts
+    /// of one store must hold the same handle; if none is provided, a fresh
+    /// (never-tripped) one is created in [`CtxBuilder::build`].
+    pub fn with_cancel_handle(mut self, cancel_handle: Arc<AtomicBool>) -> Self {
+        self.cancel_handle = Some(cancel_handle);
+        self
+    }
+
     pub fn build(self) -> Ctx {
         let plugins = self
             .plugins
@@ -367,6 +395,7 @@ impl CtxBuilder {
             component_id: self.component_id,
             http: WasiHttpCtx::new(),
             sockets: self.sockets.unwrap_or_default(),
+            cancel_handle: self.cancel_handle.unwrap_or_default(),
             plugins,
             http_hooks,
             #[cfg(feature = "wasip3")]

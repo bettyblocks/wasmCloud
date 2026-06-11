@@ -92,6 +92,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key: String,
     ) -> wasmtime::Result<Result<Option<Vec<u8>>, StoreError>> {
+        self.ensure_not_cancelled()?;
         let bucket_name = self.table.get(&bucket)?;
 
         let Some(plugin) = self.get_plugin::<InMemoryKeyValue>(WASI_KEYVALUE_ID) else {
@@ -271,6 +272,7 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
         key: String,
         delta: u64,
     ) -> wasmtime::Result<Result<u64, StoreError>> {
+        self.ensure_not_cancelled()?;
         let bucket_name = self.table.get(&bucket)?;
 
         let Some(plugin) = self.get_plugin::<InMemoryKeyValue>(WASI_KEYVALUE_ID) else {

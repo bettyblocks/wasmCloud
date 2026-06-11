@@ -216,6 +216,7 @@ const P2_FIXTURES: &[&str] = &[
     "inter-component-call-callee",
     "inter-component-call-middleware",
     "http-allowed-hosts",
+    "cancel-spinner",
 ];
 
 const P3_FIXTURES: &[&str] = &[

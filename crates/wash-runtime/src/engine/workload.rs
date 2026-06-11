@@ -1070,12 +1070,17 @@ impl ResolvedWorkload {
     }
 
     /// Helper to create a new wasmtime Store for a given component in the workload.
-    async fn new_ctx(&self, component_id: &str) -> anyhow::Result<Ctx> {
+    async fn new_ctx(
+        &self,
+        component_id: &str,
+        cancel_handle: Arc<std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<Ctx> {
         let components = self.components.read().await;
         let component = components
             .get(component_id)
             .context("component ID not found in workload")?;
-        self.new_ctx_from_metadata(&component.metadata, false).await
+        self.new_ctx_from_metadata(&component.metadata, false, cancel_handle)
+            .await
     }
 
     /// Creates a new wasmtime Store from the given workload metadata.
@@ -1083,6 +1088,7 @@ impl ResolvedWorkload {
         &self,
         metadata: &WorkloadMetadata,
         is_service: bool,
+        cancel_handle: Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<Ctx> {
         let components = self.components.read().await;
 
@@ -1140,7 +1146,8 @@ impl ResolvedWorkload {
             .with_http_handler(self.http_handler.clone())
             .with_wasi_ctx(wasi_ctx_builder.build())
             .with_sockets(sockets_ctx)
-            .with_allowed_hosts(metadata.local_resources.allowed_hosts.clone());
+            .with_allowed_hosts(metadata.local_resources.allowed_hosts.clone())
+            .with_cancel_handle(cancel_handle);
 
         if let Some(plugins) = &metadata.plugins {
             ctx_builder = ctx_builder.with_plugins(plugins.clone());
@@ -1168,11 +1175,34 @@ impl ResolvedWorkload {
         metadata: &WorkloadMetadata,
         is_service: bool,
     ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
-        let active_ctx = self.new_ctx_from_metadata(metadata, is_service).await?;
+        // One cancellation handle per store: the active context and every
+        // linked context share it, so tripping it cancels the whole
+        // invocation's linked graph together.
+        let cancel_handle = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let active_ctx = self
+            .new_ctx_from_metadata(metadata, is_service, cancel_handle.clone())
+            .await?;
+
+        // The active context's id doubles as the invocation token. Register
+        // it with the bound plugins before any guest code runs, so a cancel
+        // can never race ahead of registration.
+        if let Some(plugins) = &metadata.plugins {
+            for plugin in plugins.values() {
+                plugin.on_invocation_start(
+                    metadata.workload_id(),
+                    &active_ctx.id,
+                    cancel_handle.clone(),
+                );
+            }
+        }
+
         let mut shared_ctx = SharedCtx::new(active_ctx);
 
         for linked_component_id in metadata.linked_components.iter() {
-            let linked_component_ctx = self.new_ctx(linked_component_id).await?;
+            let linked_component_ctx = self
+                .new_ctx(linked_component_id, cancel_handle.clone())
+                .await?;
             shared_ctx
                 .contexts
                 .insert(linked_component_id.clone(), linked_component_ctx);

@@ -1,0 +1,19 @@
+package wasmcloud:cancel-spinner@0.1.0;
+
+/// Host-provided cancellation control, implemented by a cancel host plugin.
+interface canceller {
+    /// Trip the cancellation handle of the in-flight invocation identified
+    /// by `token`. The lookup is scoped to the calling workload, so a
+    /// workload can only cancel its own invocations. Returns true if the
+    /// token matched a registered invocation.
+    cancel: func(token: string) -> bool;
+}
+
+world spinner {
+    import canceller;
+    import wasi:keyvalue/store@0.2.0-draft;
+    import wasi:keyvalue/atomics@0.2.0-draft;
+    import wasi:clocks/monotonic-clock@0.2.2;
+
+    export wasi:http/incoming-handler@0.2.2;
+}
