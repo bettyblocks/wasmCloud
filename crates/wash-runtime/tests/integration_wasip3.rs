@@ -168,6 +168,7 @@ async fn test_p2_http_component_works_with_p3_enabled() -> Result<()> {
                 },
                 pool_size: 1,
                 max_invocations: 100,
+                ..Default::default()
             }],
             host_interfaces: http_counter_host_interfaces("p2-test"),
             volumes: vec![],
@@ -220,6 +221,7 @@ async fn test_p2_concurrent_requests_with_p3_enabled() -> Result<()> {
                 local_resources: LocalResources::default(),
                 pool_size: 1,
                 max_invocations: 100,
+                ..Default::default()
             }],
             host_interfaces: http_counter_host_interfaces("concurrent-test"),
             volumes: vec![],
@@ -281,6 +283,7 @@ async fn test_p3_linker_accepts_p2_component() -> Result<()> {
             local_resources: LocalResources::default(),
             pool_size: 1,
             max_invocations: 100,
+            ..Default::default()
         }],
         host_interfaces: http_counter_host_interfaces("linker-test"),
         volumes: vec![],
@@ -313,6 +316,7 @@ async fn test_p3_disabled_engine_rejects_nothing() -> Result<()> {
             local_resources: LocalResources::default(),
             pool_size: 1,
             max_invocations: 100,
+            ..Default::default()
         }],
         host_interfaces: http_counter_host_interfaces("no-p3-test"),
         volumes: vec![],
