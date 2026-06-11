@@ -1,13 +1,22 @@
 # Cancelling a Running Workload
 
-> Status: **design agreed (Layer 1); POC wired through the real invocation
-> path** (2026-06-11). `tests/integration_invocation_cancel.rs` proves the
-> full flow — handle minted per store, registered with a cancel plugin via a
-> new `on_invocation_start` hook, tripped by a guest-routed `/cancel/<token>`
-> request, enforced by a check in the keyvalue host fns; the spinning
-> invocation traps in well under a second against a 30s bound. Production
-> gaps: registry entry removal (RAII), enforcement across all host-call
-> surfaces, the async-submit `202`+token response, epoch (Layer 2).
+> Status: **Layer 1 implemented (POC, committed `205ee9b30`) and demoed as a
+> product flow** (2026-06-11). `tests/integration_invocation_cancel.rs`
+> proves the mechanism through the real invocation path;
+> `examples/cancellable-jobs` (+ `JobsPlugin` in `crates/wash`) demos it
+> under `wash dev` as async-submit job groups with live SSE progress and
+> group cancel — see [Demo](#demo-job-groups-under-wash-dev).
+>
+> **Layer 2 (epoch) is NOT built.** The epoch spike in
+> `integration_guest_cancellation.rs` proves the primitive in an isolated
+> wasmtime setup *inside the test*; the production engine still has no
+> `epoch_interruption(true)`, no ticker, and arms no callback. All shipped
+> cancellation is host-boundary only: a cancelled guest dies at its **next
+> host call**, never mid-wasm.
+>
+> Production gaps: registry entry removal (RAII), enforcement across all
+> host-call surfaces, the async-submit `202`+token response on the HTTP
+> trigger path, epoch (Layer 2).
 > Companion docs: [`LONG_RUNNING_WORKLOADS.md`](./LONG_RUNNING_WORKLOADS.md),
 > [`CPU_BOUND_GUEST_STARVATION.md`](./CPU_BOUND_GUEST_STARVATION.md).
 >
@@ -201,6 +210,53 @@ POC simplifications vs the work list: no registry entry removal (RAII), the
 token is discovered from the registry rather than returned via an async
 submit `202`, and only the keyvalue host fns enforce.
 
+## Demo: job groups under `wash dev`
+
+`examples/cancellable-jobs` (+ `JobsPlugin` in `crates/wash/src/jobs_plugin.rs`,
+registered in `cli/dev.rs`) turns the mechanism into a product flow — verified
+end-to-end on 2026-06-11. Zero further wash-runtime changes; the runtime's
+extension surface (plugin trait + the POC's hook + pub `cancel_handle`) was
+sufficient.
+
+The shape: `POST /create` (frontend component) → plugin spawns **10 counter
+invocations** programmatically and returns a request-id immediately (async
+submit at the *application* level); counters report once/second through a
+plugin import (`ensure_not_cancelled()?` first — the actuator); a pinned
+**service component** streams each group's events as SSE; `POST /cancel/<id>`
+trips all 10 handles after a creator-workload tenancy check. Verified: 10/10
+counters trap (`invocation cancelled` backtraces), cancel is idempotent,
+bogus ids are no-ops, late subscribers get the terminal event.
+
+What the demo established beyond the POC:
+
+- **Group cancellation is just N handles under one key.** The unit of *cancel*
+  stays the invocation (one store, one handle); a "job" is an
+  application-level grouping `request_id → Vec<handle>` in the plugin. No new
+  runtime concept needed.
+- **A plugin can be the trigger, not just the listener.** Following the
+  messaging-plugin pattern (`wasmcloud_messaging/in_memory.rs:295-397`), a
+  plugin holding a `ResolvedWorkload` clone can mint invocations itself
+  (`new_store` → bindgen `Pre` → `call_*`) and capture each store's handle
+  directly — registration-before-guest-code falls out naturally.
+- **Guests can never bind real host ports.** The runtime virtualizes loopback
+  per workload (`sockets/tcp.rs:940`; the bind addr-check in
+  `engine/workload.rs` permits services loopback only). So client-facing
+  streams must enter through the host HTTP server: the demo's SSE service
+  listens on the *virtual* `127.0.0.1:8081` and a per-request frontend route
+  pipes bytes between the wash HTTP ingress and that virtual connection.
+  This constrains the "push" result-delivery option below: in-process push
+  is service + pipe, not a guest-owned port.
+- **Cancel latency equals host-call cadence, observably.** The demo counters
+  touch the host once per second, so cancel lands within ~1s. This is the
+  Layer 1 contract working as specified — and the concrete illustration of
+  what Layer 2 (epoch) would tighten.
+
+Dev-tooling caveats (wash, not wash-runtime — details in the example README):
+`wash dev` merges auto-extracted interfaces by namespace:package (first
+component shadows the rest) and per-item plugin matching requires the item's
+world to fully cover a `host_interfaces` entry — so custom interfaces must be
+declared one-entry-per-interface in `.wash/config.yaml`.
+
 ---
 
 ## Options to fix this
@@ -286,11 +342,17 @@ synthesis is in the session log; the essentials:
   invocation it started is wrong/misconfigured and aborts *that one* to prevent
   further effects. Deliberate, rare, not latency-critical.
 - **How:** one concept — a per-invocation **cancellation handle** (a plain
-  observable value) living in `SharedCtx` (one per store = one per invocation,
-  shared by the active + all linked contexts). One enforcement seam — the
-  host-call wrapper consults the handle and, if tripped, returns a **trap**
-  (not a WIT-level error the guest could swallow). The guest self-unwinds → task
-  ends → store drops → all linked components torn down together.
+  observable value), one underlying flag per store. *Placement decided during
+  implementation:* the field lives on **`Ctx`** (`Ctx.cancel_handle`), with the
+  active and every linked context holding clones of the same `Arc` — not on
+  `SharedCtx` as originally sketched, because host functions only see
+  `ActiveCtx` (which derefs to `Ctx`); `SharedCtx` fields are invisible at the
+  enforcement seam without reworking `extract_active_ctx`. Same semantics
+  (one flag per invocation), reachable where it's read. One enforcement seam —
+  the host-call wrapper consults the handle via `Ctx::ensure_not_cancelled()`
+  and, if tripped, returns a **trap** (not a WIT-level error the guest could
+  swallow). The guest self-unwinds → task ends → store drops → all linked
+  components torn down together.
 - **When/Where:** one operation; the primary **detector** is an HTTP `/cancel`
   route handled by a guest component that calls a **cancel host plugin**
   carrying the token (see below). A NATS `invocation.cancel` control verb can
@@ -385,14 +447,21 @@ caller ──HTTP /cancel?id=<token>──▶ guest HTTP component (fresh store)
 
 Design points:
 
-- **The registry is its own value**, not plugin-owned: one
-  `Arc<DashMap<(WorkloadId, Token), Handle>>` created at host build time and
-  handed to *both* the engine (insert at store creation, remove via RAII
-  guard) and the plugin (lookup on cancel). Plugin hooks are workload-level
-  only (`plugin/mod.rs:71` — `on_workload_bind` etc.; there is no
-  per-invocation hook), so insertion *must* happen in store-creation code —
-  keeping the plugin a pure listener avoids complecting registry ownership
-  into it.
+- **Registration: two working paths** (both implemented 2026-06-11). The POC
+  added the per-invocation plugin hook that was missing:
+  `HostPlugin::on_invocation_start(workload_id, token, handle)` (default
+  no-op), called from `new_store_from_metadata` **before any guest code
+  runs** — so a fast cancel can never race registration. A plugin that
+  offers cancellation records the mapping there (the POC's `CancelPlugin`
+  keeps a `(workload_id, token) → handle` map). Alternatively, when the
+  plugin *itself* spawns the invocations (the demo's job groups, following
+  the messaging-plugin pattern), it creates the store and captures
+  `store.data().active_ctx.cancel_handle` directly — no hook needed. The
+  original "registry as its own value handed to engine + plugin" shape
+  remains the cleaner production target (keeps the plugin a pure listener),
+  but the hook makes a plugin-owned registry workable without engine
+  changes. Entry *removal* (RAII at invocation end) exists in neither path
+  yet.
 - **Tenancy comes for free at this seam.** The plugin's host fn executes
   inside the *calling* `Ctx`, which carries `workload_id` / `component_id`
   (`engine/ctx.rs:101-103`). Keying the registry by `(workload_id, token)`
@@ -437,6 +506,11 @@ Result delivery (no connection is held open) — two composable options, per
   via the existing NATS→SSE bridge.
 
 ### Epoch (Layer 2) stays per-invocation
+
+> Reminder: Layer 2 is **not built**. The engine has no `epoch_interruption`,
+> no ticker, no armed callbacks; the only epoch code in the repo is the
+> self-contained spike test. This section records *how* it would compose with
+> Layer 1 when it lands.
 
 A natural worry: the epoch ticker is **engine-global**, so does enabling it
 cancel everyone? No — the ticker is just a clock. The *trap decision* is
@@ -503,49 +577,63 @@ states:
   and the plugin host functions (keyvalue, blobstore, messaging, smtp, outgoing
   HTTP). They just don't consult any cancel state.
 
-**Missing (what makes cancellation impossible today):**
-- No per-invocation **cancellation handle** in `SharedCtx`.
-- No **registry** mapping a token → handle.
-- No **invocation token** minted at trigger time and surfaced to the caller
-  (`Ctx.id` exists but is internal and never returned); the HTTP trigger path
-  holds the connection open instead of returning a token (`host/http.rs:931`).
-- Host calls **do not consult** any cancel state — no enforcement seam.
-- No **cancel host plugin** (and no `invocation.cancel` control verb).
-- No per-invocation plugin hook — plugin hooks are workload-level only
-  (`plugin/mod.rs:71`), which is why registry insertion belongs in
-  store-creation code, not in a plugin hook.
-- (Layer 2, out of scope) no epoch interruption / ticker (`engine/mod.rs:821-846`
-  has none, despite `CPU_BOUND_GUEST_STARVATION.md` implying otherwise).
+**Done by the POC + demo (2026-06-11, commit `205ee9b30` + uncommitted demo):**
+- Per-invocation **cancellation handle**: `Ctx.cancel_handle` (one flag per
+  store, cloned into linked ctxs), minted in `new_store_from_metadata`, with
+  `Ctx::ensure_not_cancelled()` as the trap-returning check.
+- Per-invocation **plugin hook**: `HostPlugin::on_invocation_start(workload_id,
+  token, handle)` (default no-op), fired before any guest code runs; token =
+  the active ctx id.
+- **Registry + listener**: plugin-owned `(workload_id, token) → handle` maps —
+  the POC's test `CancelPlugin` (guest `/cancel/<token>` route) and the demo's
+  `JobsPlugin` (group key, programmatic spawn). Tenancy check on the caller's
+  `workload_id` works as designed.
+- **Enforcement (partial surface)**: in-memory keyvalue `get`/`increment` and
+  the demo's `reporter.report`.
 
-## What we need to add (Layer 1 work list)
+**Still missing:**
+- Registry entry **removal** (RAII at invocation end) — entries currently live
+  until workload unbind.
+- Enforcement across **all** host-call surfaces (dynamic inter-component
+  wrapper, blobstore, messaging, smtp, outgoing HTTP, …), and the `select!`
+  strengthening for in-flight host calls.
+- The **`202` + token async-submit response on the HTTP trigger path itself**
+  (`host/http.rs:931` still awaits the oneshot); the demo's create/submit is
+  application-level, via a plugin import.
+- A NATS **`invocation.cancel`** control verb (optional second listener).
+- (Layer 2, deliberately not built) epoch interruption / ticker / per-store
+  callback — `engine/mod.rs` has none; the epoch spike exists only inside
+  `integration_guest_cancellation.rs`'s own wasmtime setup. (Also note
+  `CPU_BOUND_GUEST_STARVATION.md` implies epoch landed; it did not.)
 
-1. **Cancellation handle** in `SharedCtx` — e.g. an `Arc<AtomicBool>` (or
-   `CancellationToken`). Created at store/invocation construction in
-   `new_store_from_metadata`.
-2. **Invocation token + registry** — mint a token at invocation start; a host-held
-   `DashMap<(WorkloadId, Token), Handle>` (clone of the `Arc`), created at host
-   build and handed to both the engine and the cancel plugin. Insert **before
-   spawn** (registration race), remove at completion via an RAII guard so
-   entries can't leak.
-3. **Async submit trigger** — return `202` + the token immediately instead of
-   awaiting the oneshot (`host/http.rs:931`); result delivery via `/status`
-   poll and/or NATS→SSE push (ties into `LONG_RUNNING_WORKLOADS.md`).
-4. **Host-boundary enforcement** — each host-call wrapper checks the handle and
-   returns a **trap** if tripped (a trap, not a WIT `result::error`, so a guest
-   can't catch-and-continue). Surfaces to cover: the dynamic inter-component
-   wrapper, plus each plugin host fn (keyvalue, blobstore, messaging, smtp,
-   outgoing HTTP). For prompt cancel of host-blocked guests, `select!` against
-   the handle rather than checking only on entry. This is the bulk of the
-   mechanical work.
-5. **Cancel host plugin** — a plugin exposing a cancel import; guest `/cancel`
-   route calls it; plugin looks up `(caller workload_id, token)` in the
-   registry and trips the handle. Optionally also a NATS `invocation.cancel`
-   arm in `handle_command` — same registry, same handle.
-6. **Tests:** extend the spike to cancel through a *real* `WorkloadComponent`
-   invocation that makes a host call — assert the trap, the store teardown, and
-   that no further host calls fire after the cancel point. Also cover the
-   registration race (cancel issued immediately after submit) and the tenancy
-   scope (a different workload's token must not match).
+## Layer 1 work list (with status)
+
+1. ✅ **Cancellation handle** — `Ctx.cancel_handle` (`Arc<AtomicBool>`; on
+   `Ctx`, not `SharedCtx` — see the How bullet), minted in
+   `new_store_from_metadata`, shared across linked ctxs.
+2. ◐ **Invocation token + registry** — token = ctx id, announced via the new
+   `on_invocation_start` hook before guest code runs (registration race
+   solved); plugin-owned maps in POC/demo. **Open:** registry as its own
+   value (engine + plugin share it) and RAII removal so entries can't leak.
+3. ◐ **Async submit trigger** — proven at application level (the demo's
+   `create` import returns the id immediately while the work runs detached).
+   **Open:** the platform-level `202` + token on the HTTP trigger path itself
+   (`host/http.rs:931` still awaits the oneshot); result delivery via
+   `/status` poll and/or push (in-process push = pinned service + frontend
+   pipe, per the demo; ties into `LONG_RUNNING_WORKLOADS.md`).
+4. ◐ **Host-boundary enforcement** — `ensure_not_cancelled()` in keyvalue
+   `get`/`increment` + demo `reporter`. **Open:** every other host-call
+   surface (dynamic inter-component wrapper, blobstore, messaging, smtp,
+   outgoing HTTP), and the `select!` strengthening so an in-flight host call
+   aborts instead of completing first. Still the bulk of the mechanical work.
+5. ◐ **Cancel host plugin** — proven twice (test `CancelPlugin` with the
+   guest `/cancel/<token>` route; demo `JobsPlugin` with group cancel +
+   tenancy check). **Open:** a production-grade plugin and optionally the
+   NATS `invocation.cancel` arm in `handle_command`.
+6. ◐ **Tests** — `integration_invocation_cancel.rs` covers the real-path trap,
+   teardown, tenancy scope, and unaffected sibling invocations. **Open:**
+   explicit registration-race test (cancel issued in the same instant as
+   submit), and asserting no further host calls fire after the cancel point.
 
 ## Deferred / open
 
@@ -566,10 +654,17 @@ states:
 
 ## Pointers
 
-- Spike test: `crates/wash-runtime/tests/integration_guest_cancellation.rs`
-- Handle home: `crates/wash-runtime/src/engine/ctx.rs:22-29` (`SharedCtx`)
-- Store creation (mint token + handle, register, arm callback — all here):
-  `crates/wash-runtime/src/engine/workload.rs:1166-1184`
+- Spike test (epoch primitive, isolated): `crates/wash-runtime/tests/integration_guest_cancellation.rs`
+- POC test (real path): `crates/wash-runtime/tests/integration_invocation_cancel.rs` + `tests/fixtures/cancel-spinner/`
+- Demo: `examples/cancellable-jobs/` + `crates/wash/src/jobs_plugin.rs` (registered in `crates/wash/src/cli/dev.rs`)
+- Handle home: `crates/wash-runtime/src/engine/ctx.rs` (`Ctx.cancel_handle` + `ensure_not_cancelled()`)
+- Per-invocation hook: `HostPlugin::on_invocation_start` in `crates/wash-runtime/src/plugin/mod.rs`
+- Store creation (mint handle + notify plugins; epoch callback would also go here):
+  `crates/wash-runtime/src/engine/workload.rs` (`new_store_from_metadata`)
+- Programmatic-invocation pattern (plugin spawns stores, captures handles):
+  `crates/wash-runtime/src/plugin/wasmcloud_messaging/in_memory.rs:295-397`
+- Virtual loopback (guests can't bind real ports): `crates/wash-runtime/src/sockets/tcp.rs:940`,
+  bind policy in `engine/workload.rs` (`SocketAddrUse::TcpBind`)
 - Host-call enforcement seam: `engine/workload.rs` `func_new_async` (`CALL_TIMEOUT` at `:931`) + plugin host fns
 - Plugin trait (workload-level hooks only): `crates/wash-runtime/src/plugin/mod.rs:71`
 - Plugin injection into every `Ctx`: `engine/ctx.rs:113`, `engine/workload.rs:1145`
