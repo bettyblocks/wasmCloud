@@ -1,20 +1,14 @@
 //! Demo job-group plugin backing the `examples/cancellable-jobs` example.
 //!
-//! The plugin implements only the two things a guest cannot do and that
-//! must live host-side (`demo:jobs/control`):
-//! - **create**: spawn N counter invocations programmatically (guests
-//!   cannot start background invocations) and capture each store's
-//!   cancellation handle.
-//! - **cancel**: trip every handle in a group, scoped to the workload
-//!   that created it.
+//! Reduced to the single thing a guest cannot do: reach the host-side
+//! cancellation handles. The frontend component spawns the counter work
+//! itself (concurrent linked calls + P3 async submit), reports flow over
+//! the workload's virtual loopback network, and cancellation is enforced
+//! by the runtime (host-boundary checks + epoch interruption) — this
+//! plugin only maps a request-id to the registering invocation's handle
+//! and trips it on cancel.
 //!
-//! The data path bypasses the plugin entirely: counters report to the SSE
-//! service over the workload's virtual loopback network. Cancellation is
-//! enforced by the runtime — host-boundary checks (Layer 1) and the epoch
-//! callback armed on every store (Layer 2), both reading the same handle
-//! this plugin trips.
-//!
-//! The plugin is inert unless a workload declares `demo:jobs` interfaces.
+//! The plugin is inert unless a workload declares `demo:jobs/control`.
 
 use std::{
     collections::HashMap,
@@ -24,13 +18,12 @@ use std::{
     },
 };
 
-use anyhow::Context as _;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use wash_runtime::{
     engine::{
         ctx::{ActiveCtx, SharedCtx, extract_active_ctx},
-        workload::{ResolvedWorkload, WorkloadItem},
+        workload::WorkloadItem,
     },
     plugin::HostPlugin,
     wasmtime,
@@ -38,7 +31,6 @@ use wash_runtime::{
 };
 
 const JOBS_PLUGIN_ID: &str = "demo-jobs";
-const COUNTERS_PER_GROUP: u32 = 10;
 
 mod bindings {
     use wash_runtime::wasmtime;
@@ -47,155 +39,60 @@ mod bindings {
         world: "plugin-host",
         wasmtime_crate: wash_runtime::wasmtime,
         imports: { default: async | trappable },
-        exports: { default: async },
         inline: "
             package demo:jobs@0.1.0;
 
             interface control {
-                create: func(burn: bool) -> result<string, string>;
+                register: func(request-id: string);
                 cancel: func(request-id: string) -> bool;
-            }
-
-            interface runner {
-                run: func(request-id: string, index: u32, burn: bool);
             }
 
             world plugin-host {
                 import control;
-                export runner;
             }
         ",
     });
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum GroupState {
-    Running,
-    Cancelled,
-    Done,
-}
-
-/// One job group: the unit /create returns and /cancel targets.
-struct Group {
-    /// Workload that created the group; cancel is scoped to it.
+/// One registration: the unit /create returns and /cancel targets.
+struct Registration {
+    /// Workload that registered the id; cancel is scoped to it.
     creator_workload_id: String,
-    state: GroupState,
-    /// Cancellation handles of the counter invocations, one per store.
-    handles: Vec<Arc<AtomicBool>>,
-}
-
-/// Everything needed to programmatically invoke the counter component.
-#[derive(Clone)]
-struct RunnerTarget {
-    workload: ResolvedWorkload,
-    component_id: String,
-    pre: bindings::PluginHostPre<SharedCtx>,
+    cancelled: bool,
+    /// The registering invocation's cancellation handle (one per store).
+    handle: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
 pub struct JobsPlugin {
-    groups: Arc<RwLock<HashMap<String, Group>>>,
-    runner_component_id: RwLock<Option<String>>,
-    runner_target: Arc<RwLock<Option<RunnerTarget>>>,
-}
-
-impl JobsPlugin {
-    /// Spawn the group's counter invocations and a supervisor that marks
-    /// the group done once they have all finished.
-    fn spawn_group(&self, target: RunnerTarget, request_id: String, burn: bool) {
-        let groups = self.groups.clone();
-
-        tokio::spawn(async move {
-            let mut set = tokio::task::JoinSet::new();
-
-            for index in 0..COUNTERS_PER_GROUP {
-                let target = target.clone();
-                let groups = groups.clone();
-                let request_id = request_id.clone();
-
-                set.spawn(async move {
-                    let mut store = target
-                        .workload
-                        .new_store(&target.component_id)
-                        .await
-                        .context("failed to create counter store")?;
-
-                    // Register the invocation's cancel handle with the
-                    // group before any guest code runs. If the group was
-                    // cancelled in the meantime, trip it immediately.
-                    let handle = store.data().active_ctx.cancel_handle.clone();
-                    {
-                        let mut groups = groups.write().await;
-                        let Some(group) = groups.get_mut(&request_id) else {
-                            anyhow::bail!("group disappeared before counter start");
-                        };
-                        group.handles.push(handle.clone());
-                        if group.state == GroupState::Cancelled {
-                            handle.store(true, Ordering::Relaxed);
-                        }
-                    }
-
-                    let instance = target
-                        .pre
-                        .instantiate_async(&mut store)
-                        .await
-                        .map_err(anyhow::Error::from)
-                        .context("failed to instantiate counter")?;
-
-                    instance
-                        .demo_jobs_runner()
-                        .call_run(&mut store, &request_id, index, burn)
-                        .await
-                        .map_err(anyhow::Error::from)
-                        .with_context(|| format!("counter {index} ended"))
-                });
-            }
-
-            while let Some(result) = set.join_next().await {
-                match result {
-                    // A trap here is the expected way a cancelled counter ends.
-                    Ok(Err(e)) => debug!(request_id, "counter ended with error: {e:#}"),
-                    Err(e) => warn!(request_id, "counter task panicked: {e}"),
-                    Ok(Ok(())) => {}
-                }
-            }
-
-            let mut groups = groups.write().await;
-            if let Some(group) = groups.get_mut(&request_id)
-                && group.state == GroupState::Running
-            {
-                group.state = GroupState::Done;
-                info!(request_id, "job group completed");
-            }
-        });
-    }
+    registrations: Arc<RwLock<HashMap<String, Registration>>>,
 }
 
 impl bindings::demo::jobs::control::Host for ActiveCtx<'_> {
-    async fn create(&mut self, burn: bool) -> wasmtime::Result<Result<String, String>> {
+    async fn register(&mut self, request_id: String) -> wasmtime::Result<()> {
         let Some(plugin) = self.get_plugin::<JobsPlugin>(JOBS_PLUGIN_ID) else {
-            return Ok(Err("jobs plugin not available".to_string()));
+            return Err(wasmtime::format_err!("jobs plugin not available"));
         };
 
-        let Some(target) = plugin.runner_target.read().await.clone() else {
-            return Ok(Err("counter component not available".to_string()));
-        };
-
-        let request_id = uuid::Uuid::new_v4().to_string();
-
-        plugin.groups.write().await.insert(
+        // The caller's OWN cancellation handle: tripping it later cancels
+        // the registering invocation's whole store.
+        let handle = self.cancel_handle.clone();
+        let mut registrations = plugin.registrations.write().await;
+        if registrations.contains_key(&request_id) {
+            return Err(wasmtime::format_err!(
+                "request-id '{request_id}' already registered"
+            ));
+        }
+        registrations.insert(
             request_id.clone(),
-            Group {
+            Registration {
                 creator_workload_id: self.workload_id.to_string(),
-                state: GroupState::Running,
-                handles: Vec::with_capacity(COUNTERS_PER_GROUP as usize),
+                cancelled: false,
+                handle,
             },
         );
-
-        plugin.spawn_group(target, request_id.clone(), burn);
-        info!(request_id, burn, "job group created");
-
-        Ok(Ok(request_id))
+        info!(request_id, "job registered");
+        Ok(())
     }
 
     async fn cancel(&mut self, request_id: String) -> wasmtime::Result<bool> {
@@ -203,30 +100,28 @@ impl bindings::demo::jobs::control::Host for ActiveCtx<'_> {
             return Ok(false);
         };
 
-        let mut groups = plugin.groups.write().await;
-        let Some(group) = groups.get_mut(&request_id) else {
+        let mut registrations = plugin.registrations.write().await;
+        let Some(registration) = registrations.get_mut(&request_id) else {
             return Ok(false);
         };
 
-        // Tenancy seam: only the workload that created a group may cancel it.
-        if group.creator_workload_id != self.workload_id.as_ref() {
+        // Tenancy seam: only the workload that registered an id may cancel it.
+        if registration.creator_workload_id != self.workload_id.as_ref() {
             warn!(
                 request_id,
                 caller = self.workload_id.as_ref(),
-                "cancel denied: caller is not the creating workload"
+                "cancel denied: caller is not the registering workload"
             );
             return Ok(false);
         }
 
-        if group.state != GroupState::Running {
+        if registration.cancelled {
             return Ok(false);
         }
 
-        group.state = GroupState::Cancelled;
-        for handle in &group.handles {
-            handle.store(true, Ordering::Relaxed);
-        }
-        info!(request_id, "job group cancelled");
+        registration.cancelled = true;
+        registration.handle.store(true, Ordering::Relaxed);
+        info!(request_id, "job cancelled");
 
         Ok(true)
     }
@@ -243,9 +138,7 @@ impl HostPlugin for JobsPlugin {
             imports: [WitInterface::from("demo:jobs/control@0.1.0")]
                 .into_iter()
                 .collect(),
-            exports: [WitInterface::from("demo:jobs/runner@0.1.0")]
-                .into_iter()
-                .collect(),
+            ..Default::default()
         }
     }
 
@@ -265,40 +158,6 @@ impl HostPlugin for JobsPlugin {
             item.linker(),
             extract_active_ctx,
         )?;
-
-        if item
-            .world()
-            .exports
-            .contains(&WitInterface::from("demo:jobs/runner@0.1.0"))
-        {
-            debug!(component_id = item.id(), "tracking counter component");
-            *self.runner_component_id.write().await = Some(item.id().to_string());
-        }
-
-        Ok(())
-    }
-
-    async fn on_workload_resolved(
-        &self,
-        workload: &ResolvedWorkload,
-        component_id: &str,
-    ) -> anyhow::Result<()> {
-        if self.runner_component_id.read().await.as_deref() != Some(component_id) {
-            return Ok(());
-        }
-
-        let instance_pre = workload.instantiate_pre(component_id).await?;
-        let pre = bindings::PluginHostPre::new(instance_pre)
-            .map_err(anyhow::Error::from)
-            .context("counter component does not match the demo:jobs runner world")?;
-
-        *self.runner_target.write().await = Some(RunnerTarget {
-            workload: workload.clone(),
-            component_id: component_id.to_string(),
-            pre,
-        });
-        debug!(component_id, "counter runner target resolved");
-
         Ok(())
     }
 
@@ -309,9 +168,7 @@ impl HostPlugin for JobsPlugin {
     ) -> anyhow::Result<()> {
         // Single-workload demo plugin: drop everything on unbind so a dev
         // reload starts clean.
-        *self.runner_target.write().await = None;
-        *self.runner_component_id.write().await = None;
-        self.groups.write().await.clear();
+        self.registrations.write().await.clear();
         Ok(())
     }
 }

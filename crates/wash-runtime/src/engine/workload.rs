@@ -911,9 +911,18 @@ impl ResolvedWorkload {
                                                 let plugin_component_id = exit_id.clone();
                                                 Box::pin(async move {
                                                     // Phase 1 (sync store access): switch
-                                                    // ctx, look up the instance, lower.
+                                                    // ctx, look up the instance, lower. The
+                                                    // host-work guard keeps the invocation's
+                                                    // store alive (async-submit driver) while
+                                                    // this call is in flight.
                                                     let prepared = accessor.with(
                                                         |mut access| -> wasmtime::Result<_> {
+                                                            let work_guard = access
+                                                                .as_context_mut()
+                                                                .data()
+                                                                .active_ctx
+                                                                .host_work
+                                                                .track();
                                                             access
                                                                 .as_context_mut()
                                                                 .data_mut()
@@ -927,18 +936,24 @@ impl ResolvedWorkload {
                                                                     func_idx,
                                                                     params,
                                                                 );
-                                                            if prepared.is_err() {
-                                                                let _ = access
-                                                                    .as_context_mut()
-                                                                    .data_mut()
-                                                                    .exit_linked_call(
-                                                                        &plugin_component_id,
-                                                                    );
+                                                            match prepared {
+                                                                Ok((func, params_buf)) => Ok((
+                                                                    func, params_buf, work_guard,
+                                                                )),
+                                                                Err(e) => {
+                                                                    let _ = access
+                                                                        .as_context_mut()
+                                                                        .data_mut()
+                                                                        .exit_linked_call(
+                                                                            &plugin_component_id,
+                                                                        );
+                                                                    Err(e)
+                                                                }
                                                             }
-                                                            prepared
                                                         },
                                                     );
-                                                    let (func, params_buf) = prepared?;
+                                                    let (func, params_buf, _work_guard) =
+                                                        prepared?;
 
                                                     // Phase 2: the call itself — the store
                                                     // is not held, everything interleaves.

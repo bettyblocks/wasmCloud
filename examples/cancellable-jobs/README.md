@@ -2,100 +2,97 @@
 
 End-to-end demo of **per-invocation cancellation** (see
 `crates/wash-runtime/docs/WORKLOAD_CANCELLATION.md`) as a product flow,
-running under `wash dev`:
+built on the P3 (component-model async) platform features:
 
-- `POST /create` returns a request-id immediately (async submit) and starts
-  **10 concurrent invocations** of the counter component.
-- Counters report their counts **directly to a long-lived SSE service over
-  the workload's virtual loopback network** — the documented
-  component→service channel ("components cannot call service exports via
-  WIT, they can connect to TCP ports the service is listening on",
-  [wash create-services docs](https://wasmcloud.com/docs/wash/developer-guide/create-services/)).
-- `POST /cancel/<id>` trips the cancellation handle of all 10 invocations.
-  Cancellation is enforced by the **runtime**, not by app code:
-  - **Layer 1** — host functions check the handle and trap;
-  - **Layer 2** — the epoch callback traps the guest **mid-wasm**, even in
-    a pure CPU loop that never calls the host.
-- `POST /create?mode=burn` showcases Layer 2: counters that compute
-  silently with zero host calls — and still die within milliseconds of a
-  cancel.
+- `POST /create` — the **P3 frontend component** registers a request-id,
+  spawns **ten concurrent WIT calls** into the counter component
+  (`demo:jobs/runner.run`, an async-lifted export wired
+  component-to-component by the workload linker), and returns its HTTP
+  response **immediately** while the counters keep running — platform
+  async submit: the P3 HTTP driver keeps the invocation's store alive
+  while the linked calls are in flight.
+- Counters report straight to a long-lived **SSE service** over the
+  workload's virtual loopback network (the documented component→service
+  channel); `GET /events/<id>` pipes that stream into a **live streaming
+  response body**.
+- `POST /cancel/<id>` trips one cancellation handle — the `/create`
+  invocation's store — and the runtime's actuators (host-boundary checks +
+  the epoch callback) tear down the frontend's background task **and all
+  ten in-flight counter calls together**.
+- `POST /create?mode=burn` — the Layer 2 showcase: CPU-bound counters that
+  are killed **mid-computation** by epoch interruption (the trap lands
+  within milliseconds of cancel).
 
 ## Run it
 
 ```sh
-# from this directory; wash must include the demo:jobs plugin (this repo's wash)
+# from this directory; wash must be built with --features wasip3
 wash dev
 ```
 
 Then, in other terminals:
 
 ```sh
-# 1. create a job group
 ID=$(curl -s -X POST http://127.0.0.1:8000/create)
+curl -N http://127.0.0.1:8000/events/$ID          # live counts, 10 counters
+curl -X POST http://127.0.0.1:8000/cancel/$ID     # -> true; stream prints
+                                                  #    "event: cancelled"
+curl -X POST http://127.0.0.1:8000/cancel/$ID     # -> false (idempotent)
 
-# 2. follow the live event stream (-N disables curl buffering)
-curl -N http://127.0.0.1:8000/events/$ID
-
-# 3. cancel — the stream prints "event: cancelled" and closes;
-#    all 10 counters trap
-curl -X POST http://127.0.0.1:8000/cancel/$ID    # -> true
-curl -X POST http://127.0.0.1:8000/cancel/$ID    # -> false (idempotent)
-
-# 4. the Layer 2 showcase: pure-CPU counters (no host calls, no counts —
-#    uncancellable by host-boundary checks alone)
+# Layer 2 showcase: CPU-burning counters (no counts — they just burn)
 ID=$(curl -s -X POST "http://127.0.0.1:8000/create?mode=burn")
-curl -N http://127.0.0.1:8000/events/$ID &       # silent until terminal
-curl -X POST http://127.0.0.1:8000/cancel/$ID    # -> true; watcher prints
-                                                 #    "event: cancelled" ~instantly
+curl -N http://127.0.0.1:8000/events/$ID &        # silent until terminal
+curl -X POST http://127.0.0.1:8000/cancel/$ID     # -> true; watcher prints
+                                                  #    "event: cancelled";
+                                                  #    host log shows
+                                                  #    "wasm trap: interrupt"
 ```
 
 ## Architecture
 
 ```
-curl ──POST /create[?mode=burn]──▶ frontend ──demo:jobs/control.create──┐
-curl ──POST /cancel/<id>─────────▶ frontend ──demo:jobs/control.cancel─┤
-                                                                       ▼
-                                                              JobsPlugin (host)
-                                                              · spawns 10 counter
-                                                                invocations, captures
-                                                                their cancel handles
-                                                              · cancel: tenancy check
-                                                                + trip all handles
-                                                                       │ trips
-                                                                       ▼
-                                   runtime actuators read the handle:
-                                   host-boundary checks (L1) + epoch callback (L2)
-                                                                       │ trap
-        counter ×10 ──"feed/count/done" over virtual loopback TCP──▶ sse-service
-                                                                    (pinned service)
-curl ──GET /events/<id>──▶ frontend ──"watch <id>" virtual TCP────▶ sse-service
-        (byte pipe only)                                            pushes SSE frames
+curl ──POST /create[?mode=burn]─▶ frontend (P3) ── control.register ──▶ JobsPlugin
+                                     │                                  (host: id →
+                                     │ spawns 10 CONCURRENT WIT calls    cancel handle)
+                                     ▼
+                              counter component ×10 in-flight calls
+                              (async-lifted runner.run, one shared store)
+                                     │ "feed/count/done" over virtual loopback TCP
+                                     ▼
+curl ──GET /events/<id>──▶ frontend ──"watch <id>" TCP──▶ sse-service (pinned, P2 wstd)
+        (streaming response body, live via the P3 HTTP driver)
+
+curl ──POST /cancel/<id>──▶ frontend ── control.cancel ──▶ JobsPlugin trips the handle
+                                              │
+                       runtime actuators read it: host-boundary checks (L1)
+                       + epoch callback (L2) ──▶ the /create store traps —
+                       frontend bg task + all 10 counter calls die together
 ```
 
-- **JobsPlugin** (`crates/wash/src/jobs_plugin.rs`) does only the two
-  things a guest cannot: spawn background invocations (capturing each
-  store's `cancel_handle`) and trip handles on cancel (host-side state,
-  scoped to the creating workload). The data path never touches it.
-- **Counters** own a TCP feed to the service: `feed <id> <index>`, then
-  `count <n>` per second (sleep mode) or silence (burn mode), then `done`.
-  A cancelled counter traps mid-run — its connection drops without `done`,
-  which is how the service knows the group was cancelled rather than
-  finished.
-- **sse-service** (pure wstd command component, pinned as the workload's
-  service) multiplexes feeds and watchers on one virtual port and pushes
-  frames to watchers as counts arrive. No polling anywhere.
-- Guests can never bind real host ports (the runtime virtualizes loopback
-  per workload), so the client-facing leg enters through the wash HTTP
-  server: the frontend's `/events` route is a dumb byte pipe into the
-  service's virtual port.
+- **JobsPlugin** (`crates/wash/src/jobs_plugin.rs`) is down to the one
+  thing a guest cannot do: the cancellation registry. `register` maps the
+  *calling invocation's own* handle under the id (tenancy-scoped to the
+  workload); `cancel` trips it. No spawning, no data path.
+- **Spawning is guest-side now**: the frontend calls the counter's
+  async-lifted export through the runtime's concurrent linked-call
+  trampolines — ten suspending calls interleave within one store (this
+  used to trap outright: "cannot block a synchronous task").
+- **One store = one group**: separate counter *components*, but linked
+  calls execute in the `/create` invocation's store — group cancel is a
+  single handle, and counters are concurrent, not parallel.
 
 ## Known demo limits
 
-- No replay: watchers see counts from the moment they connect; a watcher
-  that connects after the group ended gets only the terminal event.
-- A watcher on a request-id that never existed waits forever (the service
-  cannot distinguish "unknown" from "not started yet").
-- Sleep-mode counters self-bound at 300 counts (~5 min); burn-mode at a
-  fixed iteration count, so an uncancelled burn also terminates eventually.
-- Burn mode pins one blocking thread per counter at 100% CPU until
-  cancelled — that is the point of the demo, but mind your laptop fans.
+- Counters in one store are cooperatively scheduled: the burn loop yields
+  every ~100M iterations so siblings and the response delivery can
+  progress (wasm in a store is single-threaded; a non-yielding CPU loop
+  also wedges `task.return` — wasmtime #11869). **Cancellation does not
+  depend on those yields** — the epoch trap lands mid-loop.
+- The sse-service finalizes a group ("done"/"cancelled") two seconds after
+  its last feed drops, to tolerate staggered counter start-up.
+- No replay: watchers see counts from the moment they connect.
+- Sleep-mode counters self-bound at 300 counts; burn-mode at a fixed
+  iteration count.
+- The demo's P3 guests build as wasm32-wasip1 core modules componentized
+  by `components/builder` (see `build.sh`) — the wasm32-wasip2 toolchain
+  cannot link component-model-async guests yet.

@@ -1,0 +1,9 @@
+[package]
+name = "builder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+wasi-preview1-component-adapter-provider = "43"
+wit-component = { version = "0.247.0", default-features = false }

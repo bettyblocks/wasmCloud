@@ -115,7 +115,7 @@ async fn handle_feed(
         }
     }
 
-    let group_ended = {
+    let maybe_finalize = {
         let mut groups = groups.borrow_mut();
         let Some(group) = groups.get_mut(&request_id) else {
             return Ok(());
@@ -124,18 +124,33 @@ async fn handle_feed(
         if !completed {
             group.any_aborted = true;
         }
-        if group.active_feeds == 0 && group.terminal.is_none() {
-            group.terminal = Some(if group.any_aborted { "cancelled" } else { "done" });
-            group.terminal
-        } else {
-            None
-        }
+        group.active_feeds == 0 && group.terminal.is_none()
     };
 
-    if let Some(terminal) = group_ended {
-        eprintln!("[sse-service] group {request_id}: {terminal}");
-        let frame = format!("event: {terminal}\ndata: {{}}\n\n");
-        broadcast(&groups, &request_id, &frame, true).await;
+    if maybe_finalize {
+        // Grace window: counters of one group register their feeds in a
+        // staggered fashion, so "no active feeds" right now may just mean
+        // the others have not connected yet. Only finalize if the group is
+        // still quiet after the grace period.
+        wstd::task::sleep(wstd::time::Duration::from_secs(2)).await;
+        let finalized = {
+            let mut groups = groups.borrow_mut();
+            let Some(group) = groups.get_mut(&request_id) else {
+                return Ok(());
+            };
+            if group.active_feeds == 0 && group.terminal.is_none() {
+                group.terminal =
+                    Some(if group.any_aborted { "cancelled" } else { "done" });
+                group.terminal
+            } else {
+                None
+            }
+        };
+        if let Some(terminal) = finalized {
+            eprintln!("[sse-service] group {request_id}: {terminal}");
+            let frame = format!("event: {terminal}\ndata: {{}}\n\n");
+            broadcast(&groups, &request_id, &frame, true).await;
+        }
     }
 
     Ok(())

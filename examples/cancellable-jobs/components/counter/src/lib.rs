@@ -1,7 +1,7 @@
-//! Counter: one invocation per counter, started programmatically by the
-//! JobsPlugin. Reports directly to the sse-service over the workload's
-//! virtual loopback network (the documented component-to-service channel) —
-//! no plugin involvement in the data path.
+//! Counter: an async-lifted export called CONCURRENTLY by the frontend —
+//! ten in-flight `run` calls interleave inside the /create invocation's
+//! store. Reports go directly to the sse-service over the workload's
+//! virtual loopback network; the plugin is not involved in the data path.
 //!
 //! Protocol (line-based, over TCP to 127.0.0.1:8081):
 //!   -> "feed <request-id> <index>"   once, on connect
@@ -11,12 +11,10 @@
 //! service sees the connection drop abruptly and marks it cancelled.
 //!
 //! Modes:
-//! - sleep (default): one count per second; between ticks the guest is
-//!   host-blocked, so a cancel lands at the next wasm instruction after
-//!   the tick (~1s worst case).
-//! - burn: a pure CPU loop with ZERO host calls after the feed line. The
-//!   Layer 1 host-boundary gate never sees it — only epoch interruption
-//!   (Layer 2) can trap it, which it does within a tick.
+//! - sleep (default): one count per second, parked on the P3 clock between
+//!   ticks.
+//! - burn: a pure CPU loop with ZERO host calls after the feed line —
+//!   cancellable only via epoch interruption (Layer 2).
 
 mod bindings {
     wit_bindgen::generate!({
@@ -25,57 +23,75 @@ mod bindings {
 }
 
 use bindings::exports::demo::jobs::runner::Guest;
-use wstd::io::AsyncWrite;
-use wstd::time::Duration;
+use bindings::wasi::clocks::monotonic_clock::wait_for;
+use bindings::wasi::sockets::types::{
+    IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, TcpSocket,
+};
 
-const SSE_SERVICE_ADDR: &str = "127.0.0.1:8081";
+struct Component;
 
 /// Sleep mode: ~5 minutes of once-per-second counts.
 const MAX_COUNTS: u32 = 300;
 /// Burn mode: iteration bound so an uncancelled burn still terminates.
 const BURN_ITERATIONS: u64 = 50_000_000_000;
+/// CPU slice between cooperative yields (~tens of milliseconds).
+const BURN_CHUNK: u64 = 100_000_000;
 
-struct Component;
+const SSE_SERVICE_ADDR: IpSocketAddress = IpSocketAddress::Ipv4(Ipv4SocketAddress {
+    port: 8081,
+    address: (127, 0, 0, 1),
+});
 
 impl Guest for Component {
-    fn run(request_id: String, index: u32, burn: bool) {
-        wstd::runtime::block_on(async move {
-            let Ok(mut feed) = wstd::net::TcpStream::connect(SSE_SERVICE_ADDR).await else {
-                return;
-            };
-            if feed
-                .write_all(format!("feed {request_id} {index}\n").as_bytes())
-                .await
-                .is_err()
-                || feed.flush().await.is_err()
-            {
-                return;
-            }
+    async fn run(request_id: String, index: u32, burn: bool) {
+        let Ok(socket) = TcpSocket::create(IpAddressFamily::Ipv4) else {
+            return;
+        };
+        if socket.connect(SSE_SERVICE_ADDR).await.is_err() {
+            return;
+        }
 
-            if burn {
-                // Pure CPU from here on: no host calls until the loop ends.
-                let mut acc: u64 = 0;
-                for i in 0..BURN_ITERATIONS {
-                    acc = acc.wrapping_add(std::hint::black_box(i));
-                }
-                std::hint::black_box(acc);
-            } else {
-                for count in 0..MAX_COUNTS {
-                    wstd::task::sleep(Duration::from_secs(1)).await;
-                    if feed
-                        .write_all(format!("count {count}\n").as_bytes())
-                        .await
-                        .is_err()
-                        || feed.flush().await.is_err()
-                    {
-                        return;
+        let (mut tx, rx) = bindings::wit_stream::new();
+        futures::join!(
+            async {
+                let _ = socket.send(rx).await;
+            },
+            async move {
+                tx.write_all(format!("feed {request_id} {index}\n").into_bytes())
+                    .await;
+
+                if burn {
+                    // CPU-bound counting. Cancellation does NOT depend on the
+                    // periodic yields below — the epoch callback traps the
+                    // running wasm mid-loop within milliseconds — but wasm in
+                    // one store is single-threaded and cooperatively
+                    // scheduled, so without yields this loop would starve the
+                    // sibling counters and even the /create response delivery
+                    // (wasmtime #11869).
+                    let mut acc: u64 = 0;
+                    let mut i: u64 = 0;
+                    while i < BURN_ITERATIONS {
+                        let chunk_end = (i + BURN_CHUNK).min(BURN_ITERATIONS);
+                        while i < chunk_end {
+                            acc = acc.wrapping_add(std::hint::black_box(i));
+                            i += 1;
+                        }
+                        wit_bindgen::yield_async().await;
+                    }
+                    std::hint::black_box(acc);
+                } else {
+                    for count in 0..MAX_COUNTS {
+                        wait_for(1_000_000_000).await;
+                        // Traps here (or at the next epoch tick) once the
+                        // group is cancelled.
+                        tx.write_all(format!("count {count}\n").into_bytes()).await;
                     }
                 }
-            }
 
-            let _ = feed.write_all(b"done\n").await;
-            let _ = feed.flush().await;
-        });
+                tx.write_all(b"done\n".to_vec()).await;
+                drop(tx);
+            }
+        );
     }
 }
 

@@ -18,9 +18,24 @@
 > flag — `wash-precompile` sets it identically, and previously precompiled
 > `.cwasm` artifacts must be rebuilt.
 >
+> **P3 platform features landed** (2026-06-11, demo v3): the P3 HTTP path
+> now forwards responses at `task.return` with live streaming bodies and
+> keeps driving the store while background guest work has in-flight host
+> activity (`host/http_p3.rs` — this delivers work-list item 3's async
+> submit at the platform level for P3 components), and linked
+> inter-component calls to async-lifted exports run CONCURRENTLY
+> (`func_new_concurrent` trampolines — lifting the resource-cancel POC's
+> blocking-trampoline constraints). Epoch cancellation verified on the P3
+> concurrent path: a CPU-burning guest traps ~10ms after its handle is
+> tripped, killing the whole store (frontend background task + all ten
+> in-flight counter calls).
+>
 > Production gaps: registry entry removal (RAII), enforcement across all
 > host-call surfaces incl. `select!` for in-flight host calls, the
-> async-submit `202`+token response on the HTTP trigger path.
+> async-submit `202`+token response on the P2 HTTP trigger path,
+> linked-call streams (`value.rs` still rejects stream/future Vals), and
+> the active-ctx best-effort isolation under overlapping mixed-callee
+> calls (see `SharedCtx::enter_linked_call`).
 > Companion docs: [`LONG_RUNNING_WORKLOADS.md`](./LONG_RUNNING_WORKLOADS.md),
 > [`CPU_BOUND_GUEST_STARVATION.md`](./CPU_BOUND_GUEST_STARVATION.md).
 >
@@ -222,7 +237,23 @@ end-to-end on 2026-06-11. Zero further wash-runtime changes; the runtime's
 extension surface (plugin trait + the POC's hook + pub `cancel_handle`) was
 sufficient.
 
-The shape (v2, after Layer 2 landed): `POST /create[?mode=burn]` (frontend
+**v3 (current, P3):** the frontend is a P3 async component: `/create`
+registers a request-id with the plugin (mapping its OWN invocation's
+handle), spawns **ten concurrent WIT calls** into the counter component
+(async-lifted `runner.run`, linked component-to-component — no plugin
+spawning at all), and `task.return`s its response immediately while they
+run; `/events/<id>` is a live streaming response body piping the pinned
+SSE service's TCP stream. The plugin is down to `control { register,
+cancel }`. One store now spans the frontend invocation and all ten linked
+counter calls — group cancel is the single store handle; both modes
+verified (`event: cancelled` to watchers; burn mode traps mid-CPU-loop
+~10ms after cancel). Demo-level nuances: the burn loop yields every ~100M
+iterations so the single-threaded store's siblings and response delivery
+can progress (cancellation does NOT depend on the yields), and the SSE
+service finalizes a group 2s after its last feed drops (staggered
+start-up tolerance).
+
+The earlier v2 shape (counters as plugin-spawned separate invocations): `POST /create[?mode=burn]` (frontend
 component) → plugin spawns **10 counter invocations** programmatically and
 returns a request-id immediately (async submit at the *application* level);
 counters report **directly to the pinned SSE service over the workload's

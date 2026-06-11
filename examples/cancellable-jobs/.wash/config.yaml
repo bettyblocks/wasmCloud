@@ -1,30 +1,26 @@
 build:
-  command: cargo build --manifest-path components/Cargo.toml --target wasm32-wasip2 --release
-  component_path: components/target/wasm32-wasip2/release/frontend.wasm
+  command: bash build.sh
+  component_path: components/target/demo/frontend.wasm
 
 dev:
+  # The frontend + counter are P3 (component-model async) components.
+  wasip3: true
   # Pinned service owning the client-facing SSE connections.
   service_file: components/target/wasm32-wasip2/release/sse-service.wasm
   components:
-    # Counter component; invocations are started programmatically by the
-    # demo:jobs plugin, ten per created job group.
+    # Counter component; its async runner export is called CONCURRENTLY by
+    # the frontend through the runtime's linked-call trampoline.
     - name: counter
-      file: components/target/wasm32-wasip2/release/counter.wasm
-  # Declare the demo:jobs surface explicitly, one entry per interface:
-  # wash dev merges auto-extracted interfaces by namespace+package, so the
-  # first component's subset (frontend: control) would otherwise shadow the
-  # others — and a component only matches an entry whose interface set its
-  # world fully covers, so the entries must stay separate.
+      file: components/target/demo/counter.wasm
+  # Declare the plugin-backed interface explicitly: wash dev merges
+  # auto-extracted interfaces by namespace+package, and a component only
+  # matches an entry whose interface set its world fully covers.
+  # demo:jobs/runner needs no entry — it is wired component-to-component by
+  # the workload linker.
   host_interfaces:
     - namespace: demo
       package: jobs
       interfaces: [control]
-      version: 0.1.0
-      config: {}
-      name: null
-    - namespace: demo
-      package: jobs
-      interfaces: [runner]
       version: 0.1.0
       config: {}
       name: null
