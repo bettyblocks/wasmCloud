@@ -12,6 +12,7 @@ use crate::sockets::{self, SocketAddrUse, loopback};
 use anyhow::{Context as _, bail, ensure};
 use tokio::{sync::RwLock, task::JoinHandle, time::timeout};
 use tracing::{Instrument, debug, error, info, instrument, trace, warn};
+use wasmtime::AsContextMut as _;
 use wasmtime::component::{
     Component, InstancePre, Linker, ResourceAny, ResourceType, Val, types::ComponentItem,
 };
@@ -869,13 +870,17 @@ impl ResolvedWorkload {
                                         continue;
                                     }
                                 };
-                                ensure!(
-                                    matches!(item, ComponentItem::ComponentFunc(..)),
-                                    "expected function export, found other"
-                                );
+                                let callee_is_async = match &item {
+                                    ComponentItem::ComponentFunc(func_ty) => func_ty.async_(),
+                                    _ => {
+                                        ensure!(false, "expected function export, found other");
+                                        unreachable!()
+                                    }
+                                };
                                 trace!(
                                     name = import_name,
                                     fn_name = export_name,
+                                    callee_is_async,
                                     "linking function import"
                                 );
                                 let import_name: Arc<str> = import_name.into();
@@ -884,6 +889,99 @@ impl ResolvedWorkload {
                                 let plugin_component_id = plugin_component.id.clone();
 
                                 linked_components.insert(plugin_component_id.clone());
+
+                                if callee_is_async {
+                                    // Async-lifted callee export: register a CONCURRENT
+                                    // trampoline. The call runs as a component-model task
+                                    // without holding the store, so the caller and sibling
+                                    // linked calls keep executing — a suspending callee no
+                                    // longer traps the caller with "cannot block a
+                                    // synchronous task". (A sync-lowered caller is blocked
+                                    // by wasmtime for the duration, which is safe.)
+                                    //
+                                    // No CALL_TIMEOUT here: timeouts inside the concurrent
+                                    // event loop are unreliable (wasmtime #11869/#11870);
+                                    // long calls remain cancellable store-wide via the
+                                    // cancellation handle + epoch interruption.
+                                    let exit_id = plugin_component_id.clone();
+                                    linker_instance
+                                        .func_new_concurrent(
+                                            &export_name.clone(),
+                                            move |accessor, _ty, params, results| {
+                                                let plugin_component_id = exit_id.clone();
+                                                Box::pin(async move {
+                                                    // Phase 1 (sync store access): switch
+                                                    // ctx, look up the instance, lower.
+                                                    let prepared = accessor.with(
+                                                        |mut access| -> wasmtime::Result<_> {
+                                                            access
+                                                                .as_context_mut()
+                                                                .data_mut()
+                                                                .enter_linked_call(
+                                                                    &plugin_component_id,
+                                                                )?;
+                                                            let prepared =
+                                                                prepare_concurrent_linked_call(
+                                                                    access.as_context_mut(),
+                                                                    &plugin_component_id,
+                                                                    func_idx,
+                                                                    params,
+                                                                );
+                                                            if prepared.is_err() {
+                                                                let _ = access
+                                                                    .as_context_mut()
+                                                                    .data_mut()
+                                                                    .exit_linked_call(
+                                                                        &plugin_component_id,
+                                                                    );
+                                                            }
+                                                            prepared
+                                                        },
+                                                    );
+                                                    let (func, params_buf) = prepared?;
+
+                                                    // Phase 2: the call itself — the store
+                                                    // is not held, everything interleaves.
+                                                    let mut results_buf =
+                                                        vec![Val::Bool(false); results.len()];
+                                                    let call_result = func
+                                                        .call_concurrent(
+                                                            accessor,
+                                                            &params_buf,
+                                                            &mut results_buf,
+                                                        )
+                                                        .await;
+
+                                                    // Phase 3 (sync): restore ctx, lift.
+                                                    accessor.with(|mut access| {
+                                                        let mut store = access.as_context_mut();
+                                                        store
+                                                            .data_mut()
+                                                            .exit_linked_call(
+                                                                &plugin_component_id,
+                                                            )?;
+                                                        call_result?;
+                                                        for (i, v) in
+                                                            results_buf.into_iter().enumerate()
+                                                        {
+                                                            *results.get_mut(i).ok_or_else(
+                                                                || {
+                                                                    wasmtime::format_err!(
+                                                                        "result index out of bounds"
+                                                                    )
+                                                                },
+                                                            )? = lift(&mut store, v)?;
+                                                        }
+                                                        Ok(())
+                                                    })
+                                                })
+                                            },
+                                        )
+                                        .map_err(|e| {
+                                            e.context("failed to create concurrent func")
+                                        })?;
+                                    continue;
+                                }
 
                                 linker_instance
                                     .func_new_async(
@@ -1418,6 +1516,37 @@ impl ResolvedWorkload {
 /// - Configure component linkers with plugin implementations
 /// - Validate that all dependencies can be satisfied
 /// - Create the final executable workload representation
+/// Sync preparation phase of a concurrent linked call: resolve the callee
+/// instance + function from the store-shared map and lower the parameters.
+/// The active context must already be switched to the callee
+/// (`SharedCtx::enter_linked_call`).
+fn prepare_concurrent_linked_call(
+    mut store: wasmtime::StoreContextMut<'_, SharedCtx>,
+    component_id: &Arc<str>,
+    func_idx: wasmtime::component::ComponentExportIndex,
+    params: &[Val],
+) -> wasmtime::Result<(wasmtime::component::Func, Vec<Val>)> {
+    let instance = store
+        .data()
+        .linked_instances
+        .get(component_id)
+        .copied()
+        .ok_or_else(|| {
+            wasmtime::format_err!(
+                "linked component '{component_id}' is not instantiated in this store; \
+                 concurrent linked calls require eager instantiation (instantiate_linked)"
+            )
+        })?;
+    let func = instance
+        .get_func(&mut store, func_idx)
+        .ok_or_else(|| wasmtime::format_err!("function not found"))?;
+    let mut params_buf = Vec::with_capacity(params.len());
+    for v in params {
+        params_buf.push(lower(&mut store, v)?);
+    }
+    Ok((func, params_buf))
+}
+
 pub struct UnresolvedWorkload {
     /// The unique identifier of the workload, created with [uuid::Uuid::new_v4]
     id: Arc<str>,

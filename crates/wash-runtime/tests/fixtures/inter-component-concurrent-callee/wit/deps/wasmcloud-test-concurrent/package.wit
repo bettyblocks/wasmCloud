@@ -1,0 +1,6 @@
+package wasmcloud:test-concurrent@0.1.0;
+
+interface worker {
+    /// Sleep for `ms` milliseconds, then return `ms`.
+    work: async func(ms: u64) -> u64;
+}

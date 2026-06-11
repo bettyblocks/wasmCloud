@@ -1,0 +1,10 @@
+package wasmcloud:concurrent-caller@0.1.0;
+
+world caller {
+    import wasi:http/types@0.3.0-rc-2026-03-15;
+    import wasi:clocks/types@0.3.0-rc-2026-03-15;
+    import wasi:clocks/monotonic-clock@0.3.0-rc-2026-03-15;
+    import wasmcloud:test-concurrent/worker@0.1.0;
+
+    export wasi:http/handler@0.3.0-rc-2026-03-15;
+}

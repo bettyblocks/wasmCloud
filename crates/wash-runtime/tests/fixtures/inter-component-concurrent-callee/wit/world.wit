@@ -1,0 +1,8 @@
+package wasmcloud:concurrent-callee@0.1.0;
+
+world callee {
+    import wasi:clocks/types@0.3.0-rc-2026-03-15;
+    import wasi:clocks/monotonic-clock@0.3.0-rc-2026-03-15;
+
+    export wasmcloud:test-concurrent/worker@0.1.0;
+}

@@ -1,13 +1,18 @@
 # Fixture WIT deps are populated at build time from the shared
-# p2-wit-deps/ and p3-wit-deps/ directories (see build.rs). The
-# shared dirs themselves are *not* matched by this pattern because
-# they don't contain a `wit/` subtree.
-*/wit/deps/
+# p2-wit-deps/ and p3-wit-deps/ directories (see build.rs). Only the
+# *contents* are ignored so that fixture-local custom packages can be
+# re-included below ("it is not possible to re-include a file if a
+# parent directory of that file is excluded").
+*/wit/deps/*
 
 # Fixtures with local-only WIT worlds manage their own deps
 # (not populated from shared). Un-ignore so they stay committed.
-!cron-service/wit/deps/
-!cron-component/wit/deps/
+!cron-service/wit/deps/*
+!cron-component/wit/deps/*
+
+# Custom cross-fixture package shared by the inter-component
+# concurrency fixtures (not part of the shared wasi deps).
+!*/wit/deps/wasmcloud-test-concurrent/
 
 *-p3/wkg.lock
 *-p3-*/wkg.lock

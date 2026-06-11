@@ -1,0 +1,11 @@
+[package]
+name = "inter-component-concurrent-caller"
+edition = "2021"
+version = "0.0.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+futures = { workspace = true }
+wit-bindgen = { workspace = true, features = ["async-spawn", "inter-task-wakeup"] }

@@ -737,6 +737,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "inter-component-concurrent-callee"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.54.0",
+]
+
+[[package]]
+name = "inter-component-concurrent-caller"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "wit-bindgen 0.54.0",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
