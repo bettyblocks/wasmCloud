@@ -59,7 +59,7 @@ curl ──POST /create[?mode=burn]─▶ frontend (P3) ── control.register 
                               (async-lifted runner.run, one shared store)
                                      │ "feed/count/done" over virtual loopback TCP
                                      ▼
-curl ──GET /events/<id>──▶ frontend ──"watch <id>" TCP──▶ sse-service (pinned, P2 wstd)
+curl ──GET /events/<id>──▶ frontend ──"watch <id>" TCP──▶ sse-service (pinned, P3)
         (streaming response body, live via the P3 HTTP driver)
 
 curl ──POST /cancel/<id>──▶ frontend ── control.cancel ──▶ JobsPlugin trips the handle
@@ -83,49 +83,48 @@ curl ──POST /cancel/<id>──▶ frontend ── control.cancel ──▶ J
 
 ## Measured load ceiling (see `loadtest.sh`)
 
-Ramp on a verified-fresh host per level, 10s windows, sleep mode, after
-the sse-service throughput fix (buffered line reads + per-watcher
-queues — before the fix, fan-out already degraded at 8 groups):
+Ramps on a verified-fresh host per level, 10s windows, sleep mode
+(healthy = ~10 events/s/conn, all 10 counters distinct).
 
-| groups (×10 counters) | watcher events | verdict |
-|---|---|---|
-| 1–12 | ~98/conn (~10/s) | perfect |
-| 13+ (tested 14/16/18/20/40/…) | ~1/conn, 12 total | hard collapse |
+The sse-service was originally a WASI 0.2 (wstd) component. After its
+throughput fix (buffered line reads + per-watcher queues) it was flawless
+to 12 groups, then **collapsed hard at exactly 13** (~1 event/conn,
+silent, CPU-count independent). That wall was root-caused (2026-06-11)
+to scheduling starvation in the guest executor, inherent to the WASI 0.2
+poll model — see "the 0.2 wall" below — and fixed (2026-06-12) by
+rewriting the service as a P3 component. Same protocol, same group/
+watcher logic; only the runtime stack changed. Measured after the
+rewrite:
 
-The wall at 13 groups was investigated (2026-06-11) and root-caused to
-**scheduling starvation in the sse-service's guest executor (wstd)**, not
-the wasm runtime. Evidence chain:
+| groups (×10 counters) | result |
+|---|---|
+| 13 / 20 / 32 / 50 | all conns healthy (~10/s each) |
+| 62 | admission stops: pooling allocator's default 1000 core-instance quota (loud `failed to instantiate` errors; the 61 admitted groups stay perfectly healthy) |
+| 80 / 150 (pool raised via `WASMTIME_POOLING_TOTAL_*` env) | all conns healthy — 150 groups = 1,500 concurrent counters, 16,350 events/10s |
+| ~220 | `/create` latency exceeds 10s as the box saturates (graceful, loud) |
 
-- Counters stay healthy through the wedge (1550 sustained feed writes
-  over 12s at n=13) — stores, concurrent linked calls, and the virtual
-  loopback all keep working.
-- All 16 tokio workers are *idle-parked* mid-wedge (gdb-as-parent stack
-  capture) — not thread exhaustion; CPU stays low. Epoch ruled out by a
-  kill-switch test; pool limits ruled out (no instantiation errors); the
-  loopback stream mutexes ruled out (instrumented, zero contention).
-- Flow instrumentation: the service keeps *receiving* counts, but each
-  watcher task delivers exactly one frame and never runs again while its
-  queue fills. Watcher tasks are woken by guest-internal channels — not
-  by pollables — and starve.
-- Heisenbug clincher: adding an eprintln per received message (= extra
-  host calls = extra reactor turns) partially restored delivery
-  (12 → 446 events).
+The failure modes after the rewrite are exactly what you want: a
+configurable resource quota at admission time and CPU saturation —
+linear, observable, tunable — instead of a silent scheduling cliff.
 
-Mechanism: wstd's reactor performs a **full-list nonblocking pollable
-check after nearly every task run** (`nonblock_check_pollables`), which
-constructs and polls a `ready()` future for every registered pollable
-(~11 per group: 10 feeds + 1 watcher, each doing host-side mutex/channel
-work). Per-turn cost is O(connections) and turns scale with message rate
-(10·N/s), so the single-threaded service's work grows ~O(N²) — at 13
-groups (~144 pollables) the one fiber's budget is exceeded and
-non-pollable wakes starve. A single-core budget is also why the wall is
-independent of total CPU count.
+### The 0.2 wall, for the record
 
-Remedies (not yet applied): upstream, wstd's per-turn full-list check
-wants throttling; demo-side, all 10 counters of a group share one store
-and one counter instance, so they could share **one feed connection**
-(instance-static writer) — cutting pollables ~6× and moving the wall to
-~70+ groups. A drain-all-frames-per-wake watcher loop helps too.
+Evidence chain (all on the wstd version): counters stayed healthy through
+the wedge; all 16 tokio workers idle-parked (not thread exhaustion; CPU
+low); epoch, pool limits, and loopback mutexes ruled out; the service
+kept *receiving* counts but each watcher task delivered exactly one frame
+and never ran again; adding an eprintln per received message (= extra
+reactor turns) partially restored delivery — a scheduling Heisenbug.
+
+Mechanism: the WASI 0.2 poll ABI is stateless — every wait hands the host
+the FULL pollable list, which rebuilds a readiness future per entry — and
+wstd's reactor additionally runs that full-list check after nearly every
+task turn. Per-turn cost is O(connections), turns scale with message rate
+(10·N/s), so the single-threaded service's work grows ~O(N²); at 13
+groups (~144 pollables) the one fiber's budget is exceeded and tasks
+woken by guest-internal channels (the watcher queues) starve. Under P3
+each task waits on its own waitable, host-side — there is no guest poll
+list, so this cost structure does not exist. The ramp above confirms it.
 
 ## Known demo limits
 

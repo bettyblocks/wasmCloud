@@ -3,10 +3,10 @@ build:
   component_path: components/target/demo/frontend.wasm
 
 dev:
-  # The frontend + counter are P3 (component-model async) components.
+  # All guests are P3 (component-model async) components.
   wasip3: true
   # Pinned service owning the client-facing SSE connections.
-  service_file: components/target/wasm32-wasip2/release/sse-service.wasm
+  service_file: components/target/demo/sse-service.wasm
   components:
     # Counter component; its async runner export is called CONCURRENTLY by
     # the frontend through the runtime's linked-call trampoline.

@@ -15,8 +15,8 @@ fn main() -> anyhow::Result<()> {
     let out_dir = target.join("demo");
     fs::create_dir_all(&out_dir)?;
 
-    for name in ["frontend", "counter"] {
-        let core = fs::read(core_dir.join(format!("{name}.wasm")))?;
+    for name in ["frontend", "counter", "sse-service"] {
+        let core = fs::read(core_dir.join(format!("{name}.wasm").replace('-', "_")))?;
         let component = wit_component::ComponentEncoder::default()
             .validate(true)
             .module(&core)?

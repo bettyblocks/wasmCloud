@@ -62,7 +62,7 @@ echo "creating $CONNS groups (mode=$MODE) against $URL ..."
 create_start_ns=$(date +%s%N)
 created=0
 for i in $(seq 1 "$CONNS"); do
-    id=$(curl -s -m 10 -X POST "$CREATE_URL" | tr -d '\n')
+    id=$(curl -s -m 10 -X POST "$CREATE_URL" | tr -d '\n' || true)
     if [[ -z $id ]]; then
         echo "  conn $i: CREATE FAILED (timeout or error)"
         continue
