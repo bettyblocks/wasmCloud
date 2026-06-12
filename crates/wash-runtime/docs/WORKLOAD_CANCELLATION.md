@@ -1,5 +1,9 @@
 # Cancelling a Running Workload
 
+> For a piece-by-piece inventory of everything this work added — each
+> piece's single role, its limitations, and architecture/cancellation
+> diagrams — see [CANCELLATION_INVENTORY.md](CANCELLATION_INVENTORY.md).
+
 > Status: **Layer 1 implemented (POC, committed `205ee9b30`) and demoed as a
 > product flow** (2026-06-11). `tests/integration_invocation_cancel.rs`
 > proves the mechanism through the real invocation path;
