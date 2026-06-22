@@ -327,9 +327,10 @@ async fn cancel_request_traps_spinning_invocation() -> Result<()> {
         Ok(response) => {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            assert!(
-                !status.is_success(),
-                "cancelled invocation must not succeed, got {status} with body: {body}"
+            assert_eq!(
+                status.as_u16(),
+                499,
+                "cancelled invocation must return a clean 499, got {status} with body: {body}"
             );
             assert!(
                 !body.starts_with("completed"),
@@ -422,9 +423,10 @@ async fn cancel_traps_cpu_bound_invocation() -> Result<()> {
         Ok(response) => {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            assert!(
-                !status.is_success(),
-                "cancelled CPU-bound invocation must not succeed, got {status}: {body}"
+            assert_eq!(
+                status.as_u16(),
+                499,
+                "cancelled CPU-bound invocation must return a clean 499, got {status}: {body}"
             );
             assert!(
                 !body.starts_with("completed"),
