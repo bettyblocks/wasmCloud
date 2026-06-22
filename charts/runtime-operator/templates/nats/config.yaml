@@ -10,7 +10,9 @@ metadata:
 data:
   nats-server.conf: |
     port: 4222
-    jetstream: enabled
+    jetstream {
+      store_dir: /data
+    }
 
     {{- if $.Values.global.tls.enabled }}
     tls {

@@ -25,9 +25,25 @@ global:
     # -- Name of the Kubernetes Secret holding the TLS client certificate host pods present to the data NATS connection
     dataCertSecretName: wasmcloud-data-tls
 
-# -- Values for installing a basic NATS Server with Ephemeral Storage. If you prefer to install NATS separately, set `enabled` to `false`.
+# -- Values for installing a basic NATS Server. If you prefer to install NATS separately, set `enabled` to `false`.
 nats:
   enabled: true
+  # -- Persist the JetStream store (which holds the precompiled .cwasm
+  # artifacts) on a PersistentVolume so it survives NATS pod restarts.
+  # When disabled, JetStream uses ephemeral storage and all precompiled
+  # artifacts are lost whenever the NATS pod restarts, forcing every
+  # Artifact-backed workload to recompile.
+  persistence:
+    enabled: false
+    # -- Size of the PersistentVolumeClaim requested for the JetStream store.
+    size: 100Gi
+    # -- StorageClass for the PersistentVolumeClaim. Empty uses the cluster default.
+    storageClass: ""
+    # -- Access modes for the PersistentVolumeClaim.
+    accessModes:
+      - ReadWriteOnce
+    # -- Annotations to add to the PersistentVolumeClaim.
+    annotations: {}
   # -- Labels to add to the NATS pod template
   podLabels: {}
   # -- Annotations to add to the NATS pod template

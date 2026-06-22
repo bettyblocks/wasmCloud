@@ -10,6 +10,13 @@ metadata:
     {{- include "runtime-operator.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  {{- if .Values.nats.persistence.enabled }}
+  strategy:
+    # A ReadWriteOnce PVC cannot be attached to the old and new pods at the
+    # same time, so a rolling update would deadlock. Recreate terminates the
+    # old pod before starting the new one.
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       wasmcloud.com/name: nats
@@ -27,6 +34,13 @@ spec:
         - name: nats-config
           configMap:
             name: nats
+        - name: nats-data
+          {{- if .Values.nats.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: nats-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
         {{- if $.Values.global.tls.enabled }}
         - name: nats-cert
           secret:
@@ -45,6 +59,8 @@ spec:
           volumeMounts:
             - name: nats-config
               mountPath: /nats-config
+            - name: nats-data
+              mountPath: /data
             {{- if $.Values.global.tls.enabled }}
             - name: nats-cert
               mountPath: /nats-cert
