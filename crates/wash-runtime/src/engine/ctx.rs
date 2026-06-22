@@ -204,8 +204,9 @@ pub struct Ctx {
     pub sockets: crate::sockets::WasiSocketsCtx,
     /// Per-invocation cancellation handle. One underlying flag per store: the
     /// active context and every linked context hold clones of the same `Arc`.
-    /// Detectors (e.g. a cancel plugin) set it; host-call boundaries read it
-    /// via [`Ctx::ensure_not_cancelled`] and trap the invocation if tripped.
+    /// Detectors (e.g. a cancel plugin) set it; the store's epoch-deadline
+    /// callback reads it on each tick and traps the invocation mid-wasm if
+    /// tripped (see `new_store_from_metadata`).
     pub cancel_handle: Arc<AtomicBool>,
     /// Per-invocation tracker of in-flight host-side work (outbound HTTP
     /// requests, concurrent linked-component calls, ...). One tracker per
@@ -229,18 +230,6 @@ impl Ctx {
     /// Get a plugin by its string ID and downcast to the expected type
     pub fn get_plugin<T: HostPlugin + 'static>(&self, plugin_id: &str) -> Option<Arc<T>> {
         self.plugins.get(plugin_id)?.clone().downcast().ok()
-    }
-
-    /// Returns an error if this invocation's cancellation handle has been
-    /// tripped. Host-call implementations call this on entry; the returned
-    /// error surfaces as a trap, so the guest unwinds and the store (with
-    /// every linked component) is torn down.
-    pub fn ensure_not_cancelled(&self) -> wasmtime::Result<()> {
-        if self.cancel_handle.load(Ordering::Relaxed) {
-            Err(wasmtime::format_err!("invocation cancelled"))
-        } else {
-            Ok(())
-        }
     }
 
     /// Create a new [`CtxBuilder`] to construct a [`Ctx`]

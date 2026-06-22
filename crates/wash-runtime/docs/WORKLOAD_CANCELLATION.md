@@ -4,6 +4,20 @@
 > piece's single role, its limitations, and architecture/cancellation
 > diagrams — see [CANCELLATION_INVENTORY.md](CANCELLATION_INVENTORY.md).
 
+> **Update (2026-06-22): Layer 1 was removed.** Everything below describes
+> the Layer 1 host-boundary gate as it was originally decided and built —
+> kept as the design history. The gate (`Ctx::ensure_not_cancelled()` plus
+> its keyvalue call sites) has since been deleted: epoch interruption
+> (Layer 2) strictly dominates it for stopping a runaway guest, and the gate
+> was only ever wired into two keyvalue functions, so it never delivered the
+> one property that could justify it — suppressing further host side effects
+> after cancel across the whole host surface. The per-invocation cancel
+> handle and the `on_invocation_start` plugin hook remain (the handle is now
+> read only by the epoch callback). If the side-effect-suppression property
+> is later needed, implement it as a single check in the host-call dispatch
+> path, not a per-function call. See
+> [CANCELLATION_INVENTORY.md](CANCELLATION_INVENTORY.md) for current state.
+>
 > Status: **Layer 1 implemented (POC, committed `205ee9b30`) and demoed as a
 > product flow** (2026-06-11). `tests/integration_invocation_cancel.rs`
 > proves the mechanism through the real invocation path;

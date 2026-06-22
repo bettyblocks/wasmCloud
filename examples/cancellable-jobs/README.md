@@ -16,8 +16,8 @@ built on the P3 (component-model async) platform features:
   channel); `GET /events/<id>` pipes that stream into a **live streaming
   response body**.
 - `POST /cancel/<id>` trips one cancellation handle — the `/create`
-  invocation's store — and the runtime's actuators (host-boundary checks +
-  the epoch callback) tear down the frontend's background task **and all
+  invocation's store — and the runtime's epoch callback reads it on the
+  next 10ms tick and tears down the frontend's background task **and all
   ten in-flight counter calls together**.
 - `POST /create?mode=burn` — the Layer 2 showcase: CPU-bound counters that
   are killed **mid-computation** by epoch interruption (the trap lands
@@ -64,9 +64,9 @@ curl ──GET /events/<id>──▶ frontend ──"watch <id>" TCP──▶ ss
 
 curl ──POST /cancel/<id>──▶ frontend ── control.cancel ──▶ JobsPlugin trips the handle
                                               │
-                       runtime actuators read it: host-boundary checks (L1)
-                       + epoch callback (L2) ──▶ the /create store traps —
-                       frontend bg task + all 10 counter calls die together
+                       epoch callback reads it on the next 10ms tick ──▶
+                       the /create store traps — frontend bg task + all 10
+                       counter calls die together
 ```
 
 - **JobsPlugin** (`crates/wash/src/jobs_plugin.rs`) is down to the one

@@ -9,27 +9,35 @@ for the measured load numbers and how to run the demo, see
 
 ## Runtime platform pieces (`crates/wash-runtime`)
 
-### 1. Layer 1 — per-invocation cancel handle (the identity + gate)
+### 1. The cancel handle (the shared identity)
 
 Every invocation's store gets an `Arc<AtomicBool>` (`Ctx.cancel_handle`,
-minted in `new_store_from_metadata`); host functions check it via
-`ensure_not_cancelled()` and return a *trap* (not an error), so the
-guest unwinds and the whole linked graph dies with the store. A
-`HostPlugin::on_invocation_start` hook hands
-(workload-id, token, handle) to plugins before guest code runs.
+minted in `new_store_from_metadata`) cloned into the active context and
+every linked context, so one flag governs the whole linked graph.
+Detectors (the plugin) set it; the epoch-deadline callback (Layer 2)
+reads it. By itself the flag is inert — it's the shared identity the
+actuator acts on, not an actuator.
 
-*Limitations:* only the keyvalue host functions actually enforce the
-check so far — the full host-call surface is a documented follow-up. An
-in-flight host effect can still land after cancel (it stops *new*
-effects). And a tripped flag alone can't stop a guest that never makes
-another host call — that's why Layer 2 exists.
+*Originally* this branch also carried a **Layer 1 host-boundary gate**:
+host functions called `ensure_not_cancelled()` on entry and returned a
+trap if tripped. It was **removed** — epoch interruption (Layer 2)
+strictly dominates it for stopping a runaway guest (it also catches the
+pure-CPU case the gate never could), and the gate was only ever wired
+into two keyvalue functions, so it never delivered the one property it
+could have justified: *suppressing further host side effects after
+cancel across the whole host surface*. If that safety property is later
+required, the right shape is a single check in the host-call dispatch
+path, not a per-function call — see the note in
+[WORKLOAD_CANCELLATION.md](WORKLOAD_CANCELLATION.md).
 
-### 2. Layer 2 — epoch interruption (the actuator for pure CPU)
+### 2. Layer 2 — epoch interruption (the sole actuator)
 
 On by default in `EngineBuilder`; a 10ms ticker thread bumps the engine
 epoch, and each store's callback reads its own cancel handle →
 `Interrupt` or `Continue`. A burning counter traps within ~10ms of
-cancel, mid-loop, no cooperation needed.
+cancel, mid-loop, no cooperation needed. Since the host-boundary gate
+was dropped (piece 1), this is the only thing that reads the handle to
+stop the guest — and it covers every case the gate did plus pure CPU.
 
 *Limitations:* it's a codegen flag, so precompiled `.cwasm` artifacts
 must be built with the same setting (wash-precompile is synced; stale
@@ -198,7 +206,7 @@ flowchart TB
     pool -.->|"admits stores"| workload
 ```
 
-### The cancellation chain (L1 + L2 acting on one handle)
+### The cancellation chain (epoch interruption acting on one handle)
 
 ```mermaid
 sequenceDiagram
@@ -217,9 +225,8 @@ sequenceDiagram
     P->>H: store(true)
     F-->>C: true (idempotent: false after)
 
-    Note over H,S: the flag alone is inert — two actuators read it
+    Note over H,S: the flag alone is inert — the epoch callback reads it
     E->>S: next 10ms tick → callback sees handle → trap: interrupt (running wasm, even mid burn-loop)
-    S->>S: next host call → ensure_not_cancelled → trap (L1)
     S->>S: store unwinds — bg task + all 10 in-flight counter calls die together
     S--xSVC: 10 feed connections drop abruptly (no "done")
     SVC->>SVC: last feed gone + 2s grace → group = cancelled
@@ -227,11 +234,10 @@ sequenceDiagram
     W-->>C: stream closes
 ```
 
-Reading the two together: the *only* shared state between "cancel
-arrives" and "everything stops" is that one `AtomicBool` per group —
-the plugin writes it, and the two actuators (epoch callback for running
-wasm, host-boundary checks for wasm about to do I/O) independently read
-it. Everything downstream (counters dying, feeds dropping, watchers
-getting `event: cancelled`) is consequence, not coordination: the
-service *infers* cancellation from the abrupt closes rather than being
-told.
+Reading it: the *only* shared state between "cancel arrives" and
+"everything stops" is that one `AtomicBool` per group — the plugin
+writes it, and the epoch callback reads it on the next 10ms tick,
+trapping the running wasm even mid burn-loop. Everything downstream
+(counters dying, feeds dropping, watchers getting `event: cancelled`)
+is consequence, not coordination: the service *infers* cancellation
+from the abrupt closes rather than being told.

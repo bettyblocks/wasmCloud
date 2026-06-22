@@ -9,8 +9,11 @@
 //!    `wasmcloud:cancel-spinner/canceller` import; the test-local
 //!    [`CancelPlugin`] looks the token up scoped to the *calling* workload
 //!    and trips the handle.
-//! 3. **Actuator** — the keyvalue host functions check the handle on entry
-//!    and trap, so the spinning invocation unwinds at its next host call.
+//! 3. **Actuator** — epoch interruption: the store's epoch-deadline callback
+//!    reads the handle on each 10ms tick and traps the running wasm, so the
+//!    spinning invocation unwinds mid-loop regardless of what it's doing
+//!    (host call or pure CPU). The earlier host-boundary keyvalue gate was
+//!    removed — epoch dominates it; see `docs/CANCELLATION_INVENTORY.md`.
 
 use anyhow::{Context, Result};
 use std::{
@@ -313,8 +316,9 @@ async fn cancel_request_traps_spinning_invocation() -> Result<()> {
         "cancel must trip the handle"
     );
 
-    // The spinning invocation traps at its next keyvalue call: the response
-    // arrives promptly and is not the loop's success message.
+    // The spinning invocation traps at the next epoch tick (mid keyvalue
+    // loop): the response arrives promptly and is not the loop's success
+    // message.
     let spin_response = spin_task.await.context("spin task panicked")?;
     let cancel_to_death = cancelled_at.elapsed();
     let total_spin = spin_started.elapsed();
@@ -341,7 +345,7 @@ async fn cancel_request_traps_spinning_invocation() -> Result<()> {
 
     assert!(
         cancel_to_death < Duration::from_secs(5),
-        "invocation should die at its next host call, took {cancel_to_death:?}"
+        "invocation should die at the next epoch tick, took {cancel_to_death:?}"
     );
     assert!(
         total_spin < Duration::from_secs(25),
@@ -362,10 +366,11 @@ async fn cancel_request_traps_spinning_invocation() -> Result<()> {
     Ok(())
 }
 
-/// Layer 2 proof through the real invocation path: a PURE CPU-bound guest
-/// (the `/spin-cpu` route makes zero host calls inside its loop) is
-/// invisible to the Layer 1 host-boundary gate — only epoch interruption
-/// can stop it. Cancelling must trap it mid-wasm, promptly.
+/// Epoch-interruption proof through the real invocation path: a PURE
+/// CPU-bound guest (the `/spin-cpu` route makes zero host calls inside its
+/// loop) can only be stopped by epoch interruption — a flag the guest never
+/// reads on its own is inert against it. Cancelling must trap it mid-wasm,
+/// promptly.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_traps_cpu_bound_invocation() -> Result<()> {
     let _ = tracing_subscriber::fmt()
