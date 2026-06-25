@@ -11,7 +11,9 @@ use std::{
     sync::Arc,
 };
 
-use wasmtime::component::ResourceTable;
+use tokio::sync::Notify;
+use wasmtime::StoreContextMut;
+use wasmtime::component::{Accessor, Instance, ResourceTable};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpHooks, WasiHttpView};
@@ -67,6 +69,14 @@ pub struct SharedCtx {
     pub table: wasmtime::component::ResourceTable,
     /// Contexts for linked components
     pub contexts: HashMap<Arc<str>, Ctx>,
+    /// Linked exporter instances, keyed by component id and owned by this store.
+    ///
+    /// Dynamic-linker call paths lazily instantiate into this map on first use.
+    /// Dropping the store reclaims both the component instances and this cache,
+    /// so there is no process-lived cache or completion hook to keep in sync.
+    pub exporter_instances: HashMap<Arc<str>, Instance>,
+    /// Per-exporter gates used to serialize lazy instantiation within this store.
+    pub exporter_instance_waiters: HashMap<Arc<str>, Arc<Notify>>,
 }
 
 impl SharedCtx {
@@ -75,6 +85,8 @@ impl SharedCtx {
             active_ctx: context,
             table: ResourceTable::new(),
             contexts: Default::default(),
+            exporter_instances: Default::default(),
+            exporter_instance_waiters: Default::default(),
         }
     }
 
@@ -92,6 +104,54 @@ impl SharedCtx {
                 "Context for component {id} not found"
             ))
         }
+    }
+}
+
+pub struct AccessorActiveCtxGuard<'a> {
+    accessor: &'a Accessor<SharedCtx>,
+    previous: Arc<str>,
+}
+
+impl<'a> AccessorActiveCtxGuard<'a> {
+    pub fn new(accessor: &'a Accessor<SharedCtx>, id: &Arc<str>) -> wasmtime::Result<Self> {
+        let previous = accessor.with(|mut access| -> wasmtime::Result<_> {
+            let previous = access.data_mut().active_ctx.component_id.clone();
+            access.data_mut().set_active_ctx(id)?;
+            Ok(previous)
+        })?;
+
+        Ok(Self { accessor, previous })
+    }
+}
+
+impl Drop for AccessorActiveCtxGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .accessor
+            .with(|mut access| access.data_mut().set_active_ctx(&self.previous));
+    }
+}
+
+pub struct StoreActiveCtxGuard<'a> {
+    store: StoreContextMut<'a, SharedCtx>,
+    previous: Arc<str>,
+}
+
+impl<'a> StoreActiveCtxGuard<'a> {
+    pub fn new(mut store: StoreContextMut<'a, SharedCtx>, id: &Arc<str>) -> wasmtime::Result<Self> {
+        let previous = store.data().active_ctx.component_id.clone();
+        store.data_mut().set_active_ctx(id)?;
+        Ok(Self { store, previous })
+    }
+
+    pub fn store_mut(&mut self) -> &mut StoreContextMut<'a, SharedCtx> {
+        &mut self.store
+    }
+}
+
+impl Drop for StoreActiveCtxGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.store.data_mut().set_active_ctx(&self.previous);
     }
 }
 
@@ -138,6 +198,8 @@ impl<'a> DerefMut for ActiveCtx<'a> {
 pub struct Ctx {
     /// Unique identifier for this component context. This is a [uuid::Uuid::new_v4] string.
     pub id: String,
+    /// Unique identifier shared by all component contexts in the same store.
+    pub store_id: String,
     /// The unique identifier for the workload component this instance belongs to
     pub component_id: Arc<str>,
     /// The unique identifier for the workload this component belongs to
@@ -334,6 +396,7 @@ impl wasmtime_wasi_http::p3::WasiHttpHooks for CtxHttpHooksP3 {
 /// Helper struct to build a [`Ctx`] with a builder pattern
 pub struct CtxBuilder {
     id: String,
+    store_id: String,
     workload_id: Arc<str>,
     component_id: Arc<str>,
     ctx: Option<WasiCtx>,
@@ -350,6 +413,7 @@ impl CtxBuilder {
     pub fn new(workload_id: impl Into<Arc<str>>, component_id: impl Into<Arc<str>>) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
+            store_id: uuid::Uuid::new_v4().to_string(),
             component_id: component_id.into(),
             workload_id: workload_id.into(),
             ctx: None,
@@ -427,6 +491,7 @@ impl CtxBuilder {
 
         Ctx {
             id: self.id,
+            store_id: self.store_id,
             ctx: self.ctx.unwrap_or_else(|| {
                 WasiCtxBuilder::new()
                     .args(&["main.wasm"])
@@ -459,6 +524,7 @@ impl CtxBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasmtime::AsContextMut;
 
     fn setup() {
         #[cfg(feature = "wasi-tls")]
@@ -538,5 +604,28 @@ mod tests {
         shared.set_active_ctx(&comp_a).unwrap();
         assert_eq!(shared.active_ctx.component_id.as_ref(), "comp-a");
         assert!(shared.contexts.is_empty());
+    }
+
+    #[test]
+    fn store_active_ctx_guard_restores_on_drop() {
+        setup();
+        let ctx_a = Ctx::builder("wk", "comp-a").build();
+        let ctx_b = Ctx::builder("wk", "comp-b").build();
+        let comp_b: Arc<str> = Arc::from("comp-b");
+
+        let mut shared = SharedCtx::new(ctx_a);
+        shared.contexts.insert(comp_b.clone(), ctx_b);
+        let engine = wasmtime::Engine::default();
+        let mut store = wasmtime::Store::new(&engine, shared);
+
+        {
+            let mut guard = StoreActiveCtxGuard::new(store.as_context_mut(), &comp_b).unwrap();
+            assert_eq!(
+                guard.store_mut().data().active_ctx.component_id.as_ref(),
+                "comp-b"
+            );
+        }
+
+        assert_eq!(store.data().active_ctx.component_id.as_ref(), "comp-a");
     }
 }

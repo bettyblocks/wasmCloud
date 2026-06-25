@@ -104,10 +104,8 @@ fn add_wasi_to_linker(
     )?;
 
     // CLI
-    let cli_options = cli::exit::LinkOptions::default();
     cli::exit::add_to_linker::<SharedCtx, wasmtime_wasi::cli::WasiCli>(
         linker,
-        &cli_options,
         <SharedCtx as wasmtime_wasi::cli::WasiCliView>::cli,
     )?;
     cli::environment::add_to_linker::<SharedCtx, wasmtime_wasi::cli::WasiCli>(
@@ -881,7 +879,7 @@ impl EngineBuilder {
             if use_pooling_allocator && let Ok(true) = is_pooling_allocator_supported() {
                 tracing::debug!("using pooling allocator by default");
                 cfg.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(
-                    new_pooling_config(self.max_instances.unwrap_or(1000)),
+                    new_pooling_config(self.max_instances.unwrap_or(10000)),
                 ));
             } else if use_pooling_allocator {
                 tracing::warn!("pooling allocator requested but not supported");

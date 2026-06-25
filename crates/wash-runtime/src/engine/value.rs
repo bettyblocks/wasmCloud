@@ -2,11 +2,53 @@
 //! instance to another in the context of a single [`wasmtime::Store`].
 
 use tracing::trace;
-use wasmtime::component::Val;
+use wasmtime::component::{ResourceAny, ResourceType, Val, types::Type};
 use wasmtime::error::Context as _;
 use wasmtime::{AsContextMut, StoreContextMut};
 
 use crate::engine::ctx::SharedCtx;
+
+pub(crate) fn carries_cross_store_handle(ty: &Type) -> bool {
+    match ty {
+        Type::Bool
+        | Type::S8
+        | Type::U8
+        | Type::S16
+        | Type::U16
+        | Type::S32
+        | Type::U32
+        | Type::S64
+        | Type::U64
+        | Type::Float32
+        | Type::Float64
+        | Type::Char
+        | Type::String
+        | Type::Enum(_)
+        | Type::Flags(_) => false,
+        Type::List(list) => carries_cross_store_handle(&list.ty()),
+        Type::Map(map) => {
+            carries_cross_store_handle(&map.key()) || carries_cross_store_handle(&map.value())
+        }
+        Type::Record(record) => record
+            .fields()
+            .any(|field| carries_cross_store_handle(&field.ty)),
+        Type::Tuple(tuple) => tuple.types().any(|ty| carries_cross_store_handle(&ty)),
+        Type::Variant(variant) => variant
+            .cases()
+            .any(|case| case.ty.as_ref().is_some_and(carries_cross_store_handle)),
+        Type::Option(option) => carries_cross_store_handle(&option.ty()),
+        Type::Result(result) => {
+            result.ok().as_ref().is_some_and(carries_cross_store_handle)
+                || result
+                    .err()
+                    .as_ref()
+                    .is_some_and(carries_cross_store_handle)
+        }
+        Type::Own(_) | Type::Borrow(_) | Type::Future(_) | Type::Stream(_) | Type::ErrorContext => {
+            true
+        }
+    }
+}
 
 pub(crate) fn lower(store: &mut StoreContextMut<SharedCtx>, v: &Val) -> wasmtime::Result<Val> {
     match v {
@@ -133,9 +175,30 @@ pub(crate) fn lower(store: &mut StoreContextMut<SharedCtx>, v: &Val) -> wasmtime
                 }
             }
         }
-        &Val::Future(_) | &Val::Stream(_) | &Val::ErrorContext(_) => {
-            wasmtime::bail!("async not supported")
+        Val::Future(v) => Ok(Val::Future(v.clone())),
+        Val::Stream(v) => Ok(Val::Stream(v.clone())),
+        Val::ErrorContext(v) => Ok(Val::ErrorContext(v.clone())),
+    }
+}
+
+pub(crate) fn lower_with_type(
+    store: &mut StoreContextMut<SharedCtx>,
+    v: &Val,
+    ty: &Type,
+) -> wasmtime::Result<Val> {
+    if !carries_cross_store_handle(ty) {
+        return lower(store, v);
+    }
+
+    match (ty, v) {
+        (Type::Own(resource_ty) | Type::Borrow(resource_ty), &Val::Resource(any))
+            if *resource_ty == ResourceType::host::<ResourceAny>()
+                && any.ty() == ResourceType::host::<ResourceAny>() =>
+        {
+            trace!(resource = ?any, "lowering host resource by identity");
+            Ok(Val::Resource(any))
         }
+        _ => lower(store, v),
     }
 }
 
@@ -258,9 +321,9 @@ pub(crate) fn lift(store: &mut StoreContextMut<SharedCtx>, v: Val) -> wasmtime::
                 ))
             }
         }
-        Val::Future(_) | Val::Stream(_) | Val::ErrorContext(_) => {
-            wasmtime::bail!("async not supported")
-        }
+        Val::Future(v) => Ok(Val::Future(v)),
+        Val::Stream(v) => Ok(Val::Stream(v)),
+        Val::ErrorContext(v) => Ok(Val::ErrorContext(v)),
     }
 }
 

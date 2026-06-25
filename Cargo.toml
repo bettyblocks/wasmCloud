@@ -100,7 +100,9 @@ semver = { version = "1.0.26", default-features = false }
 serde = { version = "1.0.219", default-features = false }
 serde_json = { version = "1.0.140", default-features = false }
 serde_yaml_ng = { version = "0.9", default-features = false }
+sha1 = { version = "0.10.6", default-features = false }
 sha2 = { version = "0.10.8", default-features = false }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 tar = { version = "0.4", default-features = false }
 toml = { version = "0.8", default-features = false, features = ["display"] }
@@ -121,11 +123,14 @@ wasm-pkg-client = { version = "0.10.0", default-features = false }
 wasm-pkg-core = { version = "0.10.0", default-features = false }
 wasm-metadata = { version = "0.248.0", default-features = false, features = ["oci"] }
 wasmcloud = { path = "crates/wasmcloud", default-features = false }
-wasmtime = { version = "45", default-features = false }
-wasmtime-wasi = { version = "45", default-features = false }
-wasmtime-wasi-io = { version = "45", default-features = false }
-wasmtime-wasi-http = { version = "45", default-features = false }
-wasmtime-wasi-tls = { version = "45", default-features = false }
+# wasmtime 46 is released to crates.io; but we pin to the release-46.0.0 because it needs https://github.com/bytecodealliance/wasmtime/pull/13706
+# Hoping on getting it on v 47.0.0
+# `[patch."https://github.com/bytecodealliance/wasmtime"]` section below.
+wasmtime = { git = "https://github.com/bytecodealliance/wasmtime", rev = "7535c0255b2b84f6ae4de6034649ba2eeda84173", default-features = false }
+wasmtime-wasi = { git = "https://github.com/bytecodealliance/wasmtime", rev = "7535c0255b2b84f6ae4de6034649ba2eeda84173", default-features = false }
+wasmtime-wasi-io = { git = "https://github.com/bytecodealliance/wasmtime", rev = "7535c0255b2b84f6ae4de6034649ba2eeda84173", default-features = false }
+wasmtime-wasi-http = { git = "https://github.com/bytecodealliance/wasmtime", rev = "7535c0255b2b84f6ae4de6034649ba2eeda84173", default-features = false }
+wasmtime-wasi-tls = { git = "https://github.com/bytecodealliance/wasmtime", rev = "7535c0255b2b84f6ae4de6034649ba2eeda84173", default-features = false }
 wit-component = { version = "0.248.0", default-features = false }
 wash-runtime = { path = "crates/wash-runtime", default-features = false }
 wat = { version = "1.248.0", default-features = false }
@@ -163,3 +168,22 @@ ignored = [
 [patch.crates-io]
 # Pinned for async component support (fixes #187). Remove after https://github.com/bytecodealliance/rust-oci-wasm/issues/28
 oci-wasm = { git = "https://github.com/bytecodealliance/rust-oci-wasm", rev = "5ee16fa1" }
+
+# Redirect upstream wasmtime to a 46 backport carrying the resource-implements
+# feature (bytecodealliance/wasmtime#13666). The feature merged to `main` (47.0.0)
+# but is not on the 46 release branch, and wasmtime does not backport features to
+# release branches — so to ship it on 46 we maintain `release-46.0.0-implements`
+# on the fork: `release-46.0.0` + the cherry-picked implements commits. Cargo
+# requires the patch source to be version-compatible with the upstream dep, so the
+# branch MUST stay based on release-46.0.0 (46.0.0) to match the rev pinned above
+# — a main-based (47.0.0) branch will fail to apply.
+#
+# Re-cherry-pick onto a newer release-46.0.x base when bumping the rev above.
+# Retire this whole block (and the fork branch) once the workspace moves to
+# wasmtime 47, where the feature ships in the stock release.
+[patch."https://github.com/bytecodealliance/wasmtime"]
+wasmtime = { git = "https://github.com/Aditya1404Sal/wasmtime", branch = "release-46.0.0-accessor-instantiate-async" }
+wasmtime-wasi = { git = "https://github.com/Aditya1404Sal/wasmtime", branch = "release-46.0.0-accessor-instantiate-async" }
+wasmtime-wasi-io = { git = "https://github.com/Aditya1404Sal/wasmtime", branch = "release-46.0.0-accessor-instantiate-async" }
+wasmtime-wasi-http = { git = "https://github.com/Aditya1404Sal/wasmtime", branch = "release-46.0.0-accessor-instantiate-async" }
+wasmtime-wasi-tls = { git = "https://github.com/Aditya1404Sal/wasmtime", branch = "release-46.0.0-accessor-instantiate-async" }
