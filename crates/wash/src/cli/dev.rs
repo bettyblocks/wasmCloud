@@ -149,7 +149,7 @@ impl CliCommand for DevCommand {
             host_builder.with_plugin(Arc::new(plugin::wasi_logging::TracingLogger::default()))?;
         debug!("Logging plugin registered");
 
-        // Add the demo job-group plugin (examples/cancellable-jobs).
+        // Add the cancellation control plugin (examples/cancellable-counter).
         // Inert unless a workload declares demo:jobs interfaces.
         host_builder = host_builder
             .with_plugin(Arc::new(crate::jobs_plugin::JobsPlugin::default()))?;

@@ -170,27 +170,6 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
         Ok(())
     }
 
-    /// Called when a new invocation store is created for a workload bound to
-    /// this plugin, before any guest code runs.
-    ///
-    /// `token` is the per-invocation identity (the active context's id) and
-    /// `cancel_handle` is that invocation's cancellation handle. A plugin that
-    /// offers cancellation records the mapping here so a later control call
-    /// (e.g. a guest-routed cancel request) can look the invocation up and
-    /// trip the handle. The default implementation does nothing.
-    ///
-    /// # Arguments
-    /// * `workload_id` - The workload the invocation belongs to
-    /// * `token` - The per-invocation token
-    /// * `cancel_handle` - The invocation's cancellation handle
-    fn on_invocation_start(
-        &self,
-        _workload_id: &str,
-        _token: &str,
-        _cancel_handle: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-    }
-
     /// Called when a workload has been fully resolved and is ready for use.
     ///
     /// This optional callback allows plugins to perform actions after a workload

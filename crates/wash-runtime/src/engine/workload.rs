@@ -1333,19 +1333,6 @@ impl ResolvedWorkload {
             .new_ctx_from_metadata(metadata, is_service, cancel_handle.clone(), host_work.clone())
             .await?;
 
-        // The active context's id doubles as the invocation token. Register
-        // it with the bound plugins before any guest code runs, so a cancel
-        // can never race ahead of registration.
-        if let Some(plugins) = &metadata.plugins {
-            for plugin in plugins.values() {
-                plugin.on_invocation_start(
-                    metadata.workload_id(),
-                    &active_ctx.id,
-                    cancel_handle.clone(),
-                );
-            }
-        }
-
         let mut shared_ctx = SharedCtx::new(active_ctx);
 
         for linked_component_id in metadata.linked_components.iter() {

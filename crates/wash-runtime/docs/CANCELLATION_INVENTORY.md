@@ -1,5 +1,17 @@
 # Cancellation & P3 platform work — piece inventory
 
+> **Superseded for current state by
+> [`decisions/001-mvp-cancelling-epochs.md`](decisions/001-mvp-cancelling-epochs.md)
+> (2026-06-26).** The branch was cut down to an MVP: the heavy job-group demo
+> (the SSE service, ten concurrent counters, the load test — pieces 6–10
+> below), the Layer-1-era `on_invocation_start` hook and its tests, and the
+> sync-path 499 answer were all **removed**. What remains: epoch interruption,
+> the per-store cancel handle + callback, the P3 async-submit driver (R1), the
+> concurrent linked-call trampolines (R2), and the `JobsPlugin`
+> (`register`/`progress`/`complete`/`cancel`/`status`) — demonstrated by
+> `examples/cancellable-counter` (one frontend + one counter). This inventory
+> is kept as the design history of how those pieces came to be.
+
 A component-by-component inventory of everything added on branch
 `poc/implement-cancel-host-plugin` (as of 2026-06-12): each piece's
 single role and its known limitations. For the design history and the

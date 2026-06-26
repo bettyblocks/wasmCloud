@@ -1,12 +1,13 @@
-//! Demo job-group plugin backing the `examples/cancellable-jobs` example.
+//! Cancellation control plugin backing the `examples/cancellable-counter`
+//! example.
 //!
-//! Reduced to the single thing a guest cannot do: reach the host-side
-//! cancellation handles. The frontend component spawns the counter work
-//! itself (concurrent linked calls + P3 async submit), reports flow over
-//! the workload's virtual loopback network, and cancellation is enforced
-//! by the runtime (host-boundary checks + epoch interruption) — this
-//! plugin only maps a request-id to the registering invocation's handle
-//! and trips it on cancel.
+//! It owns the one thing a guest cannot reach — the host-side per-invocation
+//! cancellation handles — plus a small per-id lifecycle record. A workload
+//! `register`s the calling invocation's own handle under a request-id and
+//! reports `progress`/`complete`; a separate request `cancel`s it (tripping
+//! the handle, which the runtime's epoch interruption turns into a trap that
+//! tears down the work's store) and `status` reads the outcome back. The
+//! frozen `count` under a `cancelled` status is the proof the work stopped.
 //!
 //! The plugin is inert unless a workload declares `demo:jobs/control`.
 
@@ -44,7 +45,10 @@ mod bindings {
 
             interface control {
                 register: func(request-id: string);
+                progress: func(request-id: string, count: u32);
+                complete: func(request-id: string);
                 cancel: func(request-id: string) -> bool;
+                status: func(request-id: string) -> string;
             }
 
             world plugin-host {
@@ -54,13 +58,39 @@ mod bindings {
     });
 }
 
-/// One registration: the unit /create returns and /cancel targets.
+/// Terminal-or-running state of a registration. `Started` is the only
+/// non-terminal state; the trapped work can never write `Cancelled` itself
+/// (it is interrupted mid-execution), so `cancel` writes it from the live
+/// canceller invocation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Started,
+    Finished,
+    Cancelled,
+}
+
+impl Status {
+    fn as_str(self) -> &'static str {
+        match self {
+            Status::Started => "started",
+            Status::Finished => "finished",
+            Status::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// One registration: the unit /do-work returns and /cancel targets.
 struct Registration {
-    /// Workload that registered the id; cancel is scoped to it.
+    /// Workload that registered the id; all operations are scoped to it.
     creator_workload_id: String,
-    cancelled: bool,
     /// The registering invocation's cancellation handle (one per store).
     handle: Arc<AtomicBool>,
+    /// Lifecycle state. The frozen `count` under a `Cancelled` status is the
+    /// proof the work actually stopped advancing.
+    status: Status,
+    /// Last progress tick the work reported (0 in cpu mode, which never
+    /// reports per-tick progress).
+    count: u32,
 }
 
 #[derive(Default)]
@@ -87,11 +117,46 @@ impl bindings::demo::jobs::control::Host for ActiveCtx<'_> {
             request_id.clone(),
             Registration {
                 creator_workload_id: self.workload_id.to_string(),
-                cancelled: false,
                 handle,
+                status: Status::Started,
+                count: 0,
             },
         );
-        info!(request_id, "job registered");
+        info!(request_id, "work registered");
+        Ok(())
+    }
+
+    /// Record the work's latest progress tick. Best-effort: ignored if the id
+    /// is gone, not the caller's, or already terminal (a late tick from work
+    /// that is unwinding must not overwrite `cancelled`).
+    async fn progress(&mut self, request_id: String, count: u32) -> wasmtime::Result<()> {
+        let Some(plugin) = self.get_plugin::<JobsPlugin>(JOBS_PLUGIN_ID) else {
+            return Ok(());
+        };
+        let mut registrations = plugin.registrations.write().await;
+        if let Some(reg) = registrations.get_mut(&request_id) {
+            if reg.creator_workload_id == self.workload_id.as_ref() && reg.status == Status::Started
+            {
+                reg.count = count;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark natural completion. Only moves `Started -> Finished`, so it can
+    /// never clobber a `Cancelled` outcome.
+    async fn complete(&mut self, request_id: String) -> wasmtime::Result<()> {
+        let Some(plugin) = self.get_plugin::<JobsPlugin>(JOBS_PLUGIN_ID) else {
+            return Ok(());
+        };
+        let mut registrations = plugin.registrations.write().await;
+        if let Some(reg) = registrations.get_mut(&request_id) {
+            if reg.creator_workload_id == self.workload_id.as_ref() && reg.status == Status::Started
+            {
+                reg.status = Status::Finished;
+                info!(request_id, count = reg.count, "work completed");
+            }
+        }
         Ok(())
     }
 
@@ -115,15 +180,37 @@ impl bindings::demo::jobs::control::Host for ActiveCtx<'_> {
             return Ok(false);
         }
 
-        if registration.cancelled {
+        // Idempotent and terminal-safe: only a running registration cancels.
+        if registration.status != Status::Started {
             return Ok(false);
         }
 
-        registration.cancelled = true;
+        // The trapped work can't record its own demise, so the live canceller
+        // writes the terminal status here while tripping the handle. `count`
+        // is left frozen wherever the last progress tick landed — that frozen
+        // value is the proof the work stopped advancing.
+        registration.status = Status::Cancelled;
         registration.handle.store(true, Ordering::Relaxed);
-        info!(request_id, "job cancelled");
+        info!(request_id, count = registration.count, "work cancelled");
 
         Ok(true)
+    }
+
+    /// Human-readable status line, e.g. `"cancelled count=3"`. Scoped to the
+    /// caller's workload so an id is not readable across tenants. Returns
+    /// `"unknown"` for an unregistered or foreign id.
+    async fn status(&mut self, request_id: String) -> wasmtime::Result<String> {
+        let Some(plugin) = self.get_plugin::<JobsPlugin>(JOBS_PLUGIN_ID) else {
+            return Ok("unknown".to_string());
+        };
+        let registrations = plugin.registrations.read().await;
+        let line = match registrations.get(&request_id) {
+            Some(reg) if reg.creator_workload_id == self.workload_id.as_ref() => {
+                format!("{} count={}", reg.status.as_str(), reg.count)
+            }
+            _ => "unknown".to_string(),
+        };
+        Ok(line)
     }
 }
 

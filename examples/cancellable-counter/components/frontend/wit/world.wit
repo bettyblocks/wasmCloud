@@ -1,0 +1,10 @@
+package demo:frontend@0.1.0;
+
+world frontend {
+    import wasi:http/types@0.3.0-rc-2026-03-15;
+    import wasi:random/random@0.3.0-rc-2026-03-15;
+    import demo:jobs/control@0.1.0;
+    import demo:jobs/runner@0.1.0;
+
+    export wasi:http/handler@0.3.0-rc-2026-03-15;
+}

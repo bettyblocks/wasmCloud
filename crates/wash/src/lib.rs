@@ -9,7 +9,7 @@ pub mod cli;
 pub mod config;
 /// Component inspection and analysis
 pub mod inspect;
-/// Demo job-group plugin backing examples/cancellable-jobs
+/// Cancellation control plugin backing examples/cancellable-counter
 pub mod jobs_plugin;
 /// Create new wash projects
 pub mod new;

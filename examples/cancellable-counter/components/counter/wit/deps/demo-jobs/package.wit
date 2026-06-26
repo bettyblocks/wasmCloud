@@ -1,0 +1,44 @@
+package demo:jobs@0.1.0;
+
+/// Cancellation control, backed by the JobsPlugin in the wash host. Its
+/// irreducible job is the per-invocation cancellation handle — host-side
+/// memory a guest cannot reach — plus a small lifecycle record per id.
+interface control {
+    /// Map the CALLING invocation's own cancellation handle into the
+    /// registry under `request-id`, status := started. The /do-work
+    /// invocation registers itself; cancelling the id traps that whole
+    /// store, including the linked counter call running inside it.
+    register: func(request-id: string);
+
+    /// Record the work's latest progress tick. Best-effort: a tick that
+    /// arrives after the registration is already terminal is ignored, so a
+    /// late tick from unwinding work can't overwrite `cancelled`.
+    progress: func(request-id: string, count: u32);
+
+    /// Mark natural completion (status := finished). Only moves
+    /// started -> finished, so it can never clobber a `cancelled` outcome.
+    complete: func(request-id: string);
+
+    /// Trip the cancellation handle registered under `request-id` and write
+    /// status := cancelled. Scoped to the calling workload: a workload can
+    /// only cancel registrations it created. Returns true if a live
+    /// registration was cancelled.
+    cancel: func(request-id: string) -> bool;
+
+    /// Human-readable status line for `request-id`, e.g. "cancelled count=3".
+    /// Scoped to the caller's workload; "unknown" for an unregistered id.
+    status: func(request-id: string) -> string;
+}
+
+/// Exported by the counter component, called by the frontend through the
+/// runtime's linked-call trampoline (async-lifted, so the call stays in
+/// flight inside the /do-work store and keeps it alive — the host-work
+/// guard the detached P3 driver drains on). `mode` is "tick" or "cpu".
+interface runner {
+    run: async func(request-id: string, mode: string);
+}
+
+/// World used by the host-side bindgen in the JobsPlugin.
+world plugin-host {
+    import control;
+}

@@ -1,5 +1,12 @@
 # Cancelling a Running Workload
 
+> **Current state lives in
+> [`decisions/001-mvp-cancelling-epochs.md`](decisions/001-mvp-cancelling-epochs.md)
+> (2026-06-26).** This document is the *design history* — the full options
+> analysis and the Layer-1 decision that the branch has since moved past (Layer
+> 1 was removed; the MVP rests on epoch interruption alone). Read the ADR for
+> what is actually shipped; read on for why.
+>
 > For a piece-by-piece inventory of everything this work added — each
 > piece's single role, its limitations, and architecture/cancellation
 > diagrams — see [CANCELLATION_INVENTORY.md](CANCELLATION_INVENTORY.md).

@@ -754,30 +754,12 @@ fn error_response(status: u16, trace_id: &str) -> hyper::Response<HyperOutgoingB
 
 #[derive(Debug)]
 enum ComponentErrorKind {
-    Cancelled,
     Trap,
     NoResponse,
     Other,
 }
 
-/// Marker attached to an invocation's failure when its cancel handle was
-/// tripped, so the HTTP layer can return a clean cancellation status instead of
-/// a generic 500. The underlying trap is kept as the error's source for logs.
-#[derive(Debug)]
-struct InvocationCancelled;
-
-impl std::fmt::Display for InvocationCancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invocation cancelled")
-    }
-}
-
-impl std::error::Error for InvocationCancelled {}
-
 fn classify_error(e: &anyhow::Error) -> ComponentErrorKind {
-    if e.downcast_ref::<InvocationCancelled>().is_some() {
-        return ComponentErrorKind::Cancelled;
-    }
     for cause in e.chain() {
         if cause.is::<wasmtime::Trap>() {
             return ComponentErrorKind::Trap;
@@ -878,36 +860,18 @@ async fn handle_http_request<T: Router>(
                 }
                 Err(e) => {
                     let kind = classify_error(&e);
-                    match kind {
-                        // Cancellation is an expected outcome, not a failure:
-                        // answer with 499 (Client Closed Request) and log at
-                        // info, not error.
-                        ComponentErrorKind::Cancelled => {
-                            info!(
-                                trace_id = %trace_id,
-                                workload.id = handle.id(),
-                                workload.name = handle.name(),
-                                workload.namespace = handle.namespace(),
-                                component.id = %component_id,
-                                "invocation cancelled",
-                            );
-                            error_response(499, &trace_id)
-                        }
-                        _ => {
-                            error!(
-                                trace_id = %trace_id,
-                                workload.id = handle.id(),
-                                workload.name = handle.name(),
-                                workload.namespace = handle.namespace(),
-                                component.id = %component_id,
-                                error.kind = ?kind,
-                                error.chain = ?e,
-                                error.display = %format!("{e:#}"),
-                                "component HTTP handler failed",
-                            );
-                            error_response(500, &trace_id)
-                        }
-                    }
+                    error!(
+                        trace_id = %trace_id,
+                        workload.id = handle.id(),
+                        workload.name = handle.name(),
+                        workload.namespace = handle.namespace(),
+                        component.id = %component_id,
+                        error.kind = ?kind,
+                        error.chain = ?e,
+                        error.display = %format!("{e:#}"),
+                        "component HTTP handler failed",
+                    );
+                    error_response(500, &trace_id)
                 }
             }
         }
@@ -993,11 +957,6 @@ pub async fn handle_component_request(
         .map_err(anyhow::Error::from)
         .context("failed to instantiate proxy pre")?;
 
-    // Capture the invocation's cancel handle before the store is moved into the
-    // worker task, so a trap can be distinguished as a cancellation (a clean
-    // 499) rather than a generic failure (500) once the task resolves.
-    let cancel_handle = store.data().active_ctx.cancel_handle.clone();
-
     // Run the component in a blocking thread so it does not starve the host's other
     // async task. The NATS heartbeat keeps going, so the host CRD will not be killed
     // Tokio's blocking pool defaults to 512 threads, so concurrency is bounded by
@@ -1042,14 +1001,7 @@ pub async fn handle_component_request(
         Ok(Err(e)) => Err(anyhow::Error::from(e).context("component returned HTTP error")),
         Err(recv_err) => match task.await {
             Ok(Err(task_err)) => {
-                // A tripped cancel handle means this trap is a cancellation, not
-                // a crash — tag it so the HTTP layer answers with a clean 499.
-                if cancel_handle.load(std::sync::atomic::Ordering::Relaxed) {
-                    Err(task_err.context(InvocationCancelled))
-                } else {
-                    Err(task_err
-                        .context("component task failed before calling response-outparam::set"))
-                }
+                Err(task_err.context("component task failed before calling response-outparam::set"))
             }
             Ok(Ok(())) => Err(anyhow::Error::from(recv_err)
                 .context("component returned without calling response-outparam::set")),
