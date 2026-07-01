@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use waki::Client;
+use wstd::http::{Body, Client, Request};
 
 mod bindings {
     wit_bindgen::generate!({
@@ -240,6 +240,10 @@ fn read_request_body(request: IncomingRequest) -> Result<String> {
 }
 
 fn download_from_url(url: &str) -> Result<Vec<u8>> {
+    wstd::runtime::block_on(download_from_url_async(url))
+}
+
+async fn download_from_url_async(url: &str) -> Result<Vec<u8>> {
     log(
         Level::Info,
         "",
@@ -247,16 +251,20 @@ fn download_from_url(url: &str) -> Result<Vec<u8>> {
     );
 
     let client = Client::new();
+    let request = Request::get(url)
+        .body(Body::empty())
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP request: {e:?}"))?;
+
     let response = client
-        .get(url)
-        .send()
+        .send(request)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to send HTTP request: {e:?}"))?;
 
-    let status = response.status_code();
-    if status < 200 || status >= 300 {
+    let status = response.status();
+    if !status.is_success() {
         return Err(anyhow::anyhow!(
             "HTTP request failed with status code: {}",
-            status
+            status.as_u16()
         ));
     }
 
@@ -266,8 +274,10 @@ fn download_from_url(url: &str) -> Result<Vec<u8>> {
         &format!("Received response with status: {}", status),
     );
 
-    let data = response
-        .body()
+    let mut body = response.into_body();
+    let data = body
+        .contents()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to read response body: {e:?}"))?;
 
     log(
@@ -276,7 +286,7 @@ fn download_from_url(url: &str) -> Result<Vec<u8>> {
         &format!("Downloaded {} bytes from URL", data.len()),
     );
 
-    Ok(data)
+    Ok(data.to_vec())
 }
 
 fn extract_filename_from_url(url: &str) -> String {
