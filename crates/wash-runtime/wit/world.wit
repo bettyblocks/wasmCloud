@@ -62,3 +62,7 @@ world otel {
 world smtp {
     import betty-blocks:smtp/client;
 }
+
+world cancellable-jobs {
+    import wasmcloud:cancellable-jobs/control@0.1.0;
+}

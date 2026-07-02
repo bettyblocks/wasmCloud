@@ -46,6 +46,7 @@ wasi-config = []
 wasi-logging = []
 wasi-blobstore = []
 wasi-keyvalue = []
+
 # Component-model `(implements ..)` / `named_imports` multiplexing
 wasm_component_model_implements = []
 wasi-webgpu = ["dep:wasi-webgpu-wasmtime", "dep:wasi-graphics-context-wasmtime"]
@@ -59,6 +60,8 @@ wasmcloud-postgres = [
 # BettyBlocks: SMTP host-plugin feature (retained in upstream merge).
 wasmcloud-smtp = ["dep:html2text", "dep:lettre"]
 wasi-tls = ["dep:wasmtime-wasi-tls"]
+
+epoch-interruption = []
 
 [dependencies]
 anyhow = { workspace = true }
