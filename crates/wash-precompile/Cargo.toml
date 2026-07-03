@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+epoch-interruption = []
+
 [dependencies]
 anyhow.workspace = true
 async-nats = {workspace = true, features = ["aws-lc-rs"]}

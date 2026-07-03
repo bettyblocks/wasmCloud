@@ -9,6 +9,8 @@ pub fn compile(wasm_bytes: &[u8]) -> Result<Vec<u8>> {
     let cwasm = engine
         .precompile_component(wasm_bytes)
         .map_err(|e| anyhow::anyhow!("Error precompiling wasm component: {e}"))?;
+    #[cfg(feature = "epoch-interruption")]
+    config.epoch_interruption(true);
     Ok(cwasm)
 }
 
