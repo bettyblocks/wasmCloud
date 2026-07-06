@@ -60,6 +60,8 @@ wasmcloud-postgres = [
 wasmcloud-smtp = ["dep:html2text", "dep:lettre"]
 wasi-tls = ["dep:wasmtime-wasi-tls"]
 
+epoch-interruption = []
+
 [dependencies]
 anyhow = { workspace = true }
 async-nats = { workspace = true, features = ["aws-lc-rs"] }

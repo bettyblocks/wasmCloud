@@ -35,6 +35,8 @@ members = [
     "res-caller-p3",
     "ephemeral-callee-p3",
     "ephemeral-caller-p3",
+    "cancellable-producer",
+    "cancellable-component",
 ]
 
 [workspace.dependencies]
