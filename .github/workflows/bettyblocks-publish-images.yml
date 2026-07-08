@@ -2,10 +2,9 @@ name: BettyBlocks - Publish images
 
 # Fork-specific pipeline: builds all four Docker images and publishes them to
 # ghcr.io/bettyblocks/*. Manual trigger only. Image tag format:
-#   <wash-version>-<release-version>-<short-sha>   e.g. 2.5.0-2.3.0-da5d3605f
-#     wash-version    = Cargo [workspace.package].version
-#     release-version = latest reachable v* git tag (leading "v" stripped)
-#     short-sha       = git rev-parse --short HEAD
+#   <wash-version>-<short-sha>   e.g. 2.5.0-da5d3605f
+#     wash-version = Cargo [workspace.package].version
+#     short-sha    = git rev-parse --short HEAD
 on:
   # manual only, I dont think we want to create a new image for every new merge into main
   workflow_dispatch:
@@ -26,22 +25,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          fetch-depth: 0 # full history needed so tagged commits are reachable by git describe
           persist-credentials: false
-      - name: Fetch release tags from upstream
-        # The v* release tags live only on wasmCloud/wasmCloud, not on this fork,
-        # so pull them in explicitly. --no-tags + an explicit refspec fetches only
-        # the v* tags (which point at commits already in our history) without
-        # writing them back to origin, so the fork's tag-triggered workflows stay quiet.
-        run: git fetch --no-tags https://github.com/wasmCloud/wasmCloud.git 'refs/tags/v*:refs/tags/v*'
       - name: Compute image tag
         id: tag
         run: |
           set -euo pipefail
           wash_version="$(awk -F'"' '/^\[workspace\.package\]/{f=1} f && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
-          release_version="$(git describe --tags --abbrev=0 --match 'v*' | sed 's/^v//')"
           short_sha="$(git rev-parse --short HEAD)"
-          tag="${wash_version}-${release_version}-${short_sha}"
+          tag="${wash_version}-${short_sha}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "Image tag: \`${tag}\`" >> "$GITHUB_STEP_SUMMARY"
 
