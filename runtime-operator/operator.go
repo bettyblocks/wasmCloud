@@ -40,6 +40,9 @@ type EmbeddedOperatorConfig struct {
 	PrecompileTarget string
 	// Wasmtime version the worker image links against.
 	PrecompileWasmtimeVersion string
+	// Comma-separated registries the precompile Worker may pull from over
+	// plain HTTP. Mirrors the host's INSECURE_REGISTRIES allowlist.
+	PrecompileInsecureRegistries string
 	// Namespace is the namespace the operator itself runs in. Every Host
 	// CRD is created here regardless of where the underlying host pod
 	// runs; tenant attribution is carried on the Host's Environment
@@ -105,8 +108,9 @@ func NewEmbeddedOperator(
 					{Name: "NATS_URL", Value: cfg.NatsURL},
 				},
 			},
-			Target:          cfg.PrecompileTarget,
-			WasmtimeVersion: cfg.PrecompileWasmtimeVersion,
+			Target:             cfg.PrecompileTarget,
+			WasmtimeVersion:    cfg.PrecompileWasmtimeVersion,
+			InsecureRegistries: cfg.PrecompileInsecureRegistries,
 		}).SetupWithManager(mgr); err != nil {
 			return nil, err
 		}

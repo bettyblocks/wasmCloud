@@ -1,8 +1,10 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, anyhow};
 use docker_credential::{DockerCredential, get_credential};
 use oci_client::{
     Reference,
-    client::{Client, ClientConfig},
+    client::{Client, ClientConfig, ClientProtocol},
     secrets::RegistryAuth,
 };
 use oci_wasm::WASM_LAYER_MEDIA_TYPE;
@@ -15,7 +17,22 @@ pub async fn fetch(reference: &str) -> Result<Vec<u8>> {
     let parsed = Reference::try_from(reference)
         .with_context(|| format!("invalid OCI reference: {reference}"))?;
 
-    let client = Client::new(ClientConfig::default());
+    let insecure_registries: HashSet<String> = std::env::var("INSECURE_REGISTRIES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let client = Client::new(ClientConfig {
+        protocol: if insecure_registries.contains(parsed.registry()) {
+            ClientProtocol::Http
+        } else {
+            ClientProtocol::Https
+        },
+        ..Default::default()
+    });
     let auth = resolve_auth(parsed.registry());
 
     let image = client

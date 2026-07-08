@@ -223,6 +223,10 @@ operator:
     # -- Scheme-qualified URL prefix where precompiled .cwasm bytes are
     # stored.
     artifactBaseURL: "nats://precompiled-artifacts"
+    # -- Comma-separated registries the precompile Worker may pull from over
+    # plain HTTP (e.g. a local dev registry). Mirrors the host's
+    # INSECURE_REGISTRIES allowlist. Empty (default) means HTTPS-only.
+    insecureRegistries: ""
 
 gateway:
   # -- DEPRECATED: runtime-gateway is being removed. HTTP routing is now handled

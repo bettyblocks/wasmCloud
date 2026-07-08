@@ -58,6 +58,9 @@ spec:
             - "-precompile-artifact-base-url={{ .Values.operator.precompile.artifactBaseURL }}"
             - "-precompile-target={{ .Values.operator.precompile.target }}"
             - "-precompile-wasmtime-version={{ required "operator.precompile.wasmtimeVersion is required when operator.precompile.enabled is true" .Values.operator.precompile.wasmtimeVersion }}"
+            {{- with .Values.operator.precompile.insecureRegistries }}
+            - "-precompile-insecure-registries={{ . }}"
+            {{- end }}
             {{- else }}
             - "-disable-precompile-controller"
             {{- end }}
