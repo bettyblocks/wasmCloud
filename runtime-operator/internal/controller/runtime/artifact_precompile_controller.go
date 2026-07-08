@@ -218,6 +218,7 @@ func (r *PrecompileReconciler) handleSuccessfulJob(
 	if variantRecorded(a.Status.Precompiled, variant) {
 		return ctrl.Result{}, nil
 	}
+	base := a.DeepCopy()
 	a.Status.Precompiled = append(a.Status.Precompiled, variant)
 	a.Status.SetConditions(
 		condition.ReadyCondition(runtimev1alpha1.ArtifactConditionPrecompiled),
@@ -228,7 +229,7 @@ func (r *PrecompileReconciler) handleSuccessfulJob(
 			LastTransitionTime: metav1.Now(),
 		},
 	)
-	return ctrl.Result{}, r.Status().Update(ctx, a)
+	return ctrl.Result{}, r.Status().Patch(ctx, a, client.MergeFrom(base))
 }
 
 func (r *PrecompileReconciler) handleInFlightJob(
@@ -238,6 +239,7 @@ func (r *PrecompileReconciler) handleInFlightJob(
 		condition.ConditionTrue {
 		return ctrl.Result{}, nil
 	}
+	base := a.DeepCopy()
 	a.Status.SetConditions(
 		condition.Condition{
 			Type:               runtimev1alpha1.ArtifactConditionPrecompileProgressing,
@@ -246,7 +248,7 @@ func (r *PrecompileReconciler) handleInFlightJob(
 			LastTransitionTime: metav1.Now(),
 		},
 	)
-	return ctrl.Result{}, r.Status().Update(ctx, a)
+	return ctrl.Result{}, r.Status().Patch(ctx, a, client.MergeFrom(base))
 }
 
 func (r *PrecompileReconciler) handleFailedJob(
@@ -256,6 +258,7 @@ func (r *PrecompileReconciler) handleFailedJob(
 	if existing.Status == condition.ConditionTrue && existing.Message == msg {
 		return ctrl.Result{}, nil
 	}
+	base := a.DeepCopy()
 	a.Status.SetConditions(
 		condition.Condition{
 			Type:               runtimev1alpha1.ArtifactConditionPrecompileFailed,
@@ -271,7 +274,7 @@ func (r *PrecompileReconciler) handleFailedJob(
 			LastTransitionTime: metav1.Now(),
 		},
 	)
-	return ctrl.Result{}, r.Status().Update(ctx, a)
+	return ctrl.Result{}, r.Status().Patch(ctx, a, client.MergeFrom(base))
 }
 
 func (r *PrecompileReconciler) handleImageChange(
@@ -293,8 +296,9 @@ func (r *PrecompileReconciler) handleImageChange(
 			); delErr != nil && !apierrors.IsNotFound(delErr) {
 				return ctrl.Result{}, delErr, true
 			}
+			base := a.DeepCopy()
 			a.Status.Precompiled = nil
-			return ctrl.Result{}, r.Status().Update(ctx, a), true
+			return ctrl.Result{}, r.Status().Patch(ctx, a, client.MergeFrom(base)), true
 		}
 		return ctrl.Result{}, nil, false
 	case !apierrors.IsNotFound(err):
