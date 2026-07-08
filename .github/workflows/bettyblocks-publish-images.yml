@@ -1,0 +1,91 @@
+name: BettyBlocks - Publish images
+
+# Fork-specific pipeline: builds all four Docker images and publishes them to
+# ghcr.io/bettyblocks/*. Manual trigger only. Image tag format:
+#   <wash-version>-<release-version>-<short-sha>   e.g. 2.5.0-2.3.0-da5d3605f
+#     wash-version    = Cargo [workspace.package].version
+#     release-version = latest reachable v* git tag (leading "v" stripped)
+#     short-sha       = git rev-parse --short HEAD
+on:
+  # manual only, I dont think we want to create a new image for every new merge into main
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  compute-tag:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # full history + tags, needed for git describe
+          persist-credentials: false
+      - name: Compute image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          wash_version="$(awk -F'"' '/^\[workspace\.package\]/{f=1} f && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
+          release_version="$(git describe --tags --abbrev=0 --match 'v*' | sed 's/^v//')"
+          short_sha="$(git rev-parse --short HEAD)"
+          tag="${wash_version}-${release_version}-${short_sha}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: \`${tag}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: compute-tag
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # wash-host + wash-precompile build from the repo root (Cargo workspace).
+          - image: wash-host
+            context: .
+            file: ./Dockerfile
+          - image: wash-precompile
+            context: .
+            file: ./crates/wash-precompile/Dockerfile
+          # The Go images build from their own module subdir.
+          - image: runtime-operator
+            context: ./runtime-operator
+            file: ./runtime-operator/Dockerfile
+          - image: runtime-gateway
+            context: ./runtime-gateway
+            file: ./runtime-gateway/Dockerfile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: Login to ghcr.io
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push ${{ matrix.image }}
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64
+          push: true
+          # Plain single-arch image (no attestation manifest) so it imports
+          # cleanly into containerd, e.g. for local k3s.
+          provenance: false
+          tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.compute-tag.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
