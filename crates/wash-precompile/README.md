@@ -51,6 +51,18 @@ cargo run -p wash-precompile -- \
 
 For `nats://`, set `NATS_URL`. For pulling from a private registry, set `DOCKER_CONFIG` pointing at a directory containing a `config.json` (the same format `kubectl create secret docker-registry` produces).
 
+## Insecure registries
+
+By default images are pulled over HTTPS. To pull from a registry that only speaks plain HTTP (e.g. a local dev registry), list its host in `INSECURE_REGISTRIES` (comma-separated):
+
+```bash
+INSECURE_REGISTRIES=localhost:5000 cargo run -p wash-precompile -- \
+    --image localhost:5000/http-hello-world:0.1.0 \
+    --output file:///tmp/out.cwasm
+```
+
+Registries are matched by host exactly as they appear in the OCI reference; anything not listed is pulled over HTTPS.
+
 ## Tests
 
 ```bash

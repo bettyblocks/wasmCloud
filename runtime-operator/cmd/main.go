@@ -64,29 +64,30 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr                 string
-		natsUrl                     string
-		natsCreds                   string
-		natsCa                      string
-		natsClientCert              string
-		natsClientKey               string
-		natsTLSFirst                bool
-		enableLeaderElection        bool
-		probeAddr                   string
-		secureMetrics               bool
-		enableHTTP2                 bool
-		jsonLog                     bool
-		cpuBackpressureThreshold    float64
-		memoryBackpressureThreshold float64
-		disableArtifactController   bool
-		watchNamespaces             string
-		hostNamespaces              string
-		allowSharedHosts            bool
-		disablePrecompileController bool
-		precompileWorkerImage       string
-		precompileArtifactBaseURL   string
-		precompileTarget            string
-		precompileWasmtimeVersion   string
+		metricsAddr                  string
+		natsUrl                      string
+		natsCreds                    string
+		natsCa                       string
+		natsClientCert               string
+		natsClientKey                string
+		natsTLSFirst                 bool
+		enableLeaderElection         bool
+		probeAddr                    string
+		secureMetrics                bool
+		enableHTTP2                  bool
+		jsonLog                      bool
+		cpuBackpressureThreshold     float64
+		memoryBackpressureThreshold  float64
+		disableArtifactController    bool
+		watchNamespaces              string
+		hostNamespaces               string
+		allowSharedHosts             bool
+		disablePrecompileController  bool
+		precompileWorkerImage        string
+		precompileArtifactBaseURL    string
+		precompileTarget             string
+		precompileWasmtimeVersion    string
+		precompileInsecureRegistries string
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
@@ -150,6 +151,12 @@ func main() {
 		"Wasmtime version the worker image links against. Required when precompile controller is enabled.",
 	)
 	flag.StringVar(
+		&precompileInsecureRegistries,
+		"precompile-insecure-registries",
+		"",
+		"Comma-separated registries the precompile Worker may pull from over plain HTTP.",
+	)
+	flag.StringVar(
 		&watchNamespaces,
 		"watch-namespaces",
 		"",
@@ -203,19 +210,20 @@ func main() {
 	}
 
 	operatorCfg := runtime_operator.EmbeddedOperatorConfig{
-		DisableArtifactController:   disableArtifactController,
-		NatsURL:                     natsUrl,
-		HeartbeatTTL:                60 * time.Second,
-		HostCPUThreshold:            cpuBackpressureThreshold,
-		HostMemoryThreshold:         memoryBackpressureThreshold,
-		Namespace:                   operatorNamespace,
-		HostNamespaces:              splitCSVList(hostNamespaces),
-		AllowSharedHosts:            allowSharedHosts,
-		DisablePrecompileController: disablePrecompileController,
-		PrecompileWorkerImage:       precompileWorkerImage,
-		PrecompileArtifactBaseURL:   precompileArtifactBaseURL,
-		PrecompileTarget:            precompileTarget,
-		PrecompileWasmtimeVersion:   precompileWasmtimeVersion,
+		DisableArtifactController:    disableArtifactController,
+		NatsURL:                      natsUrl,
+		HeartbeatTTL:                 60 * time.Second,
+		HostCPUThreshold:             cpuBackpressureThreshold,
+		HostMemoryThreshold:          memoryBackpressureThreshold,
+		Namespace:                    operatorNamespace,
+		HostNamespaces:               splitCSVList(hostNamespaces),
+		AllowSharedHosts:             allowSharedHosts,
+		DisablePrecompileController:  disablePrecompileController,
+		PrecompileWorkerImage:        precompileWorkerImage,
+		PrecompileArtifactBaseURL:    precompileArtifactBaseURL,
+		PrecompileTarget:             precompileTarget,
+		PrecompileWasmtimeVersion:    precompileWasmtimeVersion,
+		PrecompileInsecureRegistries: precompileInsecureRegistries,
 	}
 
 	if natsCreds != "" {

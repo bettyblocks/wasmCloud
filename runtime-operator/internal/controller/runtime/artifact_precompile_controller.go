@@ -38,6 +38,10 @@ type PrecompileReconciler struct {
 	ArtifactStore   ArtifactStoreConfig
 	Target          string
 	WasmtimeVersion string
+	// InsecureRegistries is the comma-separated allowlist of registries the
+	// Worker may pull from over plain HTTP, passed through as the Worker's
+	// INSECURE_REGISTRIES env var.
+	InsecureRegistries string
 }
 
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=artifacts,verbs=get;list;watch
@@ -158,6 +162,13 @@ func (r *PrecompileReconciler) buildDesiredJob(a *runtimev1alpha1.Artifact) (*ba
 			"--output", r.outputURLOf(a),
 		},
 		Env: r.ArtifactStore.Env,
+	}
+
+	if r.InsecureRegistries != "" {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name:  "INSECURE_REGISTRIES",
+			Value: r.InsecureRegistries,
+		})
 	}
 
 	var volumes []corev1.Volume
