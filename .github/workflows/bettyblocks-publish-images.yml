@@ -8,6 +8,17 @@ name: BettyBlocks - Publish images
 on:
   # manual only, I dont think we want to create a new image for every new merge into main
   workflow_dispatch:
+    inputs:
+      image:
+        description: Which image to build
+        type: choice
+        default: all
+        options:
+          - all
+          - wash-host
+          - wash-precompile
+          - runtime-operator
+          - runtime-gateway
 
 permissions: {}
 
@@ -21,6 +32,7 @@ jobs:
       contents: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -35,6 +47,30 @@ jobs:
           tag="${wash_version}-${short_sha}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "Image tag: \`${tag}\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Compute build matrix
+        id: matrix
+        env:
+          # 'all' (the default) builds every image; otherwise just the chosen one.
+          SELECTED: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          # Full set of buildable images. wash-host + wash-precompile build from
+          # the repo root (Cargo workspace); the Go images from their own subdir.
+          # runtime-gateway is also published for arm64 (pure-Go, CGO disabled,
+          # so it cross-compiles cheaply) as a multi-arch manifest under one tag.
+          all='[
+            {"image":"wash-host","context":".","file":"./Dockerfile","platforms":"linux/amd64"},
+            {"image":"wash-precompile","context":".","file":"./crates/wash-precompile/Dockerfile","platforms":"linux/amd64"},
+            {"image":"runtime-operator","context":"./runtime-operator","file":"./runtime-operator/Dockerfile","platforms":"linux/amd64"},
+            {"image":"runtime-gateway","context":"./runtime-gateway","file":"./runtime-gateway/Dockerfile","platforms":"linux/amd64,linux/arm64"}
+          ]'
+          if [ "${SELECTED}" = "all" ]; then
+            include="$(echo "${all}" | jq -c .)"
+          else
+            include="$(echo "${all}" | jq -c --arg img "${SELECTED}" '[.[] | select(.image == $img)]')"
+          fi
+          echo "matrix={\"include\":${include}}" >> "$GITHUB_OUTPUT"
+          echo "Building: \`${SELECTED}\`" >> "$GITHUB_STEP_SUMMARY"
 
   build:
     needs: compute-tag
@@ -44,22 +80,7 @@ jobs:
       packages: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # wash-host + wash-precompile build from the repo root (Cargo workspace).
-          - image: wash-host
-            context: .
-            file: ./Dockerfile
-          - image: wash-precompile
-            context: .
-            file: ./crates/wash-precompile/Dockerfile
-          # The Go images build from their own module subdir.
-          - image: runtime-operator
-            context: ./runtime-operator
-            file: ./runtime-operator/Dockerfile
-          - image: runtime-gateway
-            context: ./runtime-gateway
-            file: ./runtime-gateway/Dockerfile
+      matrix: ${{ fromJSON(needs.compute-tag.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -78,10 +99,11 @@ jobs:
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
-          platforms: linux/amd64
+          platforms: ${{ matrix.platforms }}
           push: true
-          # Plain single-arch image (no attestation manifest) so it imports
-          # cleanly into containerd, e.g. for local k3s.
+          # No attestation manifest, so single-arch images import cleanly into
+          # containerd (e.g. for local k3s). Multi-arch images (runtime-gateway)
+          # publish as a plain manifest list with no provenance attestation.
           provenance: false
           tags: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.compute-tag.outputs.tag }}
           cache-from: type=gha,scope=${{ matrix.image }}
