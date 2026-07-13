@@ -124,8 +124,8 @@ spec:
             {{- if and (.webgpu) (.webgpu.enabled) }}
             - "--wasi-webgpu"
             {{- end }}
-            {{- if and (.wasip3) (.wasip3.enabled) }}
-            - "--wasip3"
+            {{- if and (.wasiOtel) (.wasiOtel.enabled) }}
+            - "--wasi-otel"
             {{- end }}
             {{- range .wasmProposals }}
             - "--wasm-proposal={{ . }}"

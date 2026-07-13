@@ -24,7 +24,7 @@ global:
 operator:
   precompile:
     enabled: true
-    wasmtimeVersion: "43"
+    wasmtimeVersion: "46"
     target: "x86_64-unknown-linux-gnu"
 
 gateway:
@@ -38,6 +38,8 @@ runtime:
         type: ClusterIP
       webgpu:
         enabled: true
+      wasiOtel:
+        enabled: false
       http:
         enabled: true
         port: 80
