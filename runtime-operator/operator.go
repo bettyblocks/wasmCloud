@@ -43,6 +43,17 @@ type EmbeddedOperatorConfig struct {
 	// Comma-separated registries the precompile Worker may pull from over
 	// plain HTTP. Mirrors the host's INSECURE_REGISTRIES allowlist.
 	PrecompileInsecureRegistries string
+	// PrecompileGCEnabled turns on periodic garbage collection of orphaned
+	// precompiled .cwasm objects in the artifact store (objects referenced by
+	// no live Artifact). Off by default.
+	PrecompileGCEnabled bool
+	// PrecompileGCInterval is the GC sweep cadence.
+	PrecompileGCInterval time.Duration
+	// PrecompileGCGracePeriod is the minimum age (by object ModTime) an
+	// unreachable object must reach before GC may collect it, guarding the
+	// window between a precompile Job writing an object and the operator
+	// recording it in Artifact status.
+	PrecompileGCGracePeriod time.Duration
 	// Namespace is the namespace the operator itself runs in. Every Host
 	// CRD is created here regardless of where the underlying host pod
 	// runs; tenant attribution is carried on the Host's Environment
@@ -112,6 +123,23 @@ func NewEmbeddedOperator(
 			WasmtimeVersion:    cfg.PrecompileWasmtimeVersion,
 			InsecureRegistries: cfg.PrecompileInsecureRegistries,
 		}).SetupWithManager(mgr); err != nil {
+			return nil, err
+		}
+	}
+
+	// Periodic mark-and-sweep GC of orphaned precompiled .cwasm objects. Runs
+	// only on the elected leader (PrecompileGC.NeedLeaderElection). Uses the
+	// cached client so its Artifact/Job scope and RBAC match the precompile
+	// controller (all namespaces, or the watched set), and reuses the operator's
+	// NATS connection.
+	if cfg.PrecompileGCEnabled {
+		if err = mgr.Add(&runtime_controllers.PrecompileGC{
+			Reader:      mgr.GetClient(),
+			NatsConn:    nc,
+			BaseURL:     cfg.PrecompileArtifactBaseURL,
+			Interval:    cfg.PrecompileGCInterval,
+			GracePeriod: cfg.PrecompileGCGracePeriod,
+		}); err != nil {
 			return nil, err
 		}
 	}

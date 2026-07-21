@@ -88,6 +88,9 @@ func main() {
 		precompileTarget             string
 		precompileWasmtimeVersion    string
 		precompileInsecureRegistries string
+		precompileGCEnabled          bool
+		precompileGCInterval         time.Duration
+		precompileGCGracePeriod      time.Duration
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
@@ -155,6 +158,27 @@ func main() {
 		"precompile-insecure-registries",
 		"",
 		"Comma-separated registries the precompile Worker may pull from over plain HTTP.",
+	)
+	flag.BoolVar(
+		&precompileGCEnabled,
+		"precompile-gc-enabled",
+		false,
+		"Enable periodic garbage collection of orphaned precompiled .cwasm objects "+
+			"(objects in the artifact store referenced by no live Artifact).",
+	)
+	flag.DurationVar(
+		&precompileGCInterval,
+		"precompile-gc-interval",
+		15*time.Minute,
+		"How often the precompile GC sweeps the artifact store.",
+	)
+	flag.DurationVar(
+		&precompileGCGracePeriod,
+		"precompile-gc-grace-period",
+		60*time.Minute,
+		"Minimum age an unreferenced object must reach before precompile GC may "+
+			"delete it (guards the window between a Job writing an object and the "+
+			"operator recording it in Artifact status).",
 	)
 	flag.StringVar(
 		&watchNamespaces,
@@ -224,6 +248,9 @@ func main() {
 		PrecompileTarget:             precompileTarget,
 		PrecompileWasmtimeVersion:    precompileWasmtimeVersion,
 		PrecompileInsecureRegistries: precompileInsecureRegistries,
+		PrecompileGCEnabled:          precompileGCEnabled,
+		PrecompileGCInterval:         precompileGCInterval,
+		PrecompileGCGracePeriod:      precompileGCGracePeriod,
 	}
 
 	if natsCreds != "" {
