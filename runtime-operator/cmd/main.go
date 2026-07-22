@@ -88,7 +88,6 @@ func main() {
 		precompileTarget             string
 		precompileWasmtimeVersion    string
 		precompileInsecureRegistries string
-		precompileGCEnabled          bool
 		precompileGCInterval         time.Duration
 		precompileGCGracePeriod      time.Duration
 	)
@@ -158,13 +157,6 @@ func main() {
 		"precompile-insecure-registries",
 		"",
 		"Comma-separated registries the precompile Worker may pull from over plain HTTP.",
-	)
-	flag.BoolVar(
-		&precompileGCEnabled,
-		"precompile-gc-enabled",
-		false,
-		"Enable periodic garbage collection of orphaned precompiled .cwasm objects "+
-			"(objects in the artifact store referenced by no live Artifact).",
 	)
 	flag.DurationVar(
 		&precompileGCInterval,
@@ -248,7 +240,6 @@ func main() {
 		PrecompileTarget:             precompileTarget,
 		PrecompileWasmtimeVersion:    precompileWasmtimeVersion,
 		PrecompileInsecureRegistries: precompileInsecureRegistries,
-		PrecompileGCEnabled:          precompileGCEnabled,
 		PrecompileGCInterval:         precompileGCInterval,
 		PrecompileGCGracePeriod:      precompileGCGracePeriod,
 	}

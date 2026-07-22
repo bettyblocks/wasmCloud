@@ -6,12 +6,9 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
@@ -44,7 +41,7 @@ func TestBucketFromBaseURL(t *testing.T) {
 	}
 }
 
-func TestReachableKeys(t *testing.T) {
+func TestInUseKeysFromArtifacts(t *testing.T) {
 	artifact := func(name string, urls ...string) runtimev1alpha1.Artifact {
 		a := runtimev1alpha1.Artifact{ObjectMeta: metav1.ObjectMeta{Name: name}}
 		for _, u := range urls {
@@ -90,13 +87,13 @@ func TestReachableKeys(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := reachableKeys(gcTestBaseURL, tc.artifacts)
+			got := inUseKeysFromArtifacts(gcTestBaseURL, tc.artifacts)
 			if len(got) != len(tc.want) {
-				t.Fatalf("reachableKeys = %v, want %v", got, tc.want)
+				t.Fatalf("inUseKeysFromArtifacts = %v, want %v", got, tc.want)
 			}
 			for k := range tc.want {
 				if _, ok := got[k]; !ok {
-					t.Fatalf("reachableKeys missing key %q; got %v", k, got)
+					t.Fatalf("inUseKeysFromArtifacts missing key %q; got %v", k, got)
 				}
 			}
 		})
@@ -106,15 +103,15 @@ func TestReachableKeys(t *testing.T) {
 func TestRemovableKeys(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	grace := time.Hour
-	reachable := map[string]struct{}{"live.cwasm": {}}
+	inUse := map[string]struct{}{"live.cwasm": {}}
 
 	cwasm := []cwasmObject{
-		{Key: "live.cwasm", ModTime: now.Add(-2 * time.Hour)},           // reachable -> keep
+		{Key: "live.cwasm", ModTime: now.Add(-2 * time.Hour)},           // in use -> keep
 		{Key: "old-orphan.cwasm", ModTime: now.Add(-2 * time.Hour)},     // orphan, past grace -> removable
 		{Key: "fresh-orphan.cwasm", ModTime: now.Add(-1 * time.Minute)}, // orphan, within grace -> skip
 	}
 
-	removable, withinGrace := removableKeys(cwasm, reachable, now, grace)
+	removable, withinGrace := removableKeys(cwasm, inUse, now, grace)
 
 	if len(removable) != 1 || removable[0] != "old-orphan.cwasm" {
 		t.Fatalf("removable = %v, want [old-orphan.cwasm]", removable)
@@ -147,43 +144,6 @@ func gcScheme(t *testing.T) *runtime.Scheme {
 		t.Fatalf("adding runtime scheme: %v", err)
 	}
 	return s
-}
-
-func job(name string, conds ...batchv1.JobCondition) *batchv1.Job {
-	return &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
-		Status:     batchv1.JobStatus{Conditions: conds},
-	}
-}
-
-func TestPrecompileJobInFlight(t *testing.T) {
-	complete := batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}
-	failed := batchv1.JobCondition{Type: batchv1.JobFailed, Status: corev1.ConditionTrue}
-
-	cases := []struct {
-		name string
-		jobs []client.Object
-		want bool
-	}{
-		{"running precompile job", []client.Object{job("precompile-a")}, true},
-		{"completed precompile job", []client.Object{job("precompile-a", complete)}, false},
-		{"failed precompile job", []client.Object{job("precompile-a", failed)}, false},
-		{"non-precompile job ignored", []client.Object{job("build-a")}, false},
-		{"mixed: one in flight", []client.Object{job("precompile-a", complete), job("precompile-b")}, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := fake.NewClientBuilder().WithScheme(gcScheme(t)).WithObjects(tc.jobs...).Build()
-			g := &PrecompileGC{Reader: c}
-			got, err := g.precompileJobInFlight(context.Background())
-			if err != nil {
-				t.Fatalf("precompileJobInFlight: %v", err)
-			}
-			if got != tc.want {
-				t.Fatalf("precompileJobInFlight = %v, want %v", got, tc.want)
-			}
-		})
-	}
 }
 
 // startEmbeddedNats boots an in-process JetStream-enabled NATS server for the
@@ -238,15 +198,22 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 	}
 
 	const liveKey = "live/img/x86_64-27.0.0.cwasm"
+	const runningKey = "running/img/x86_64-27.0.0.cwasm"
 	const orphanKey = "orphan/img/x86_64-27.0.0.cwasm"
-	if _, err := store.PutBytes(liveKey, []byte("live")); err != nil {
-		t.Fatalf("put live: %v", err)
-	}
-	if _, err := store.PutBytes(orphanKey, []byte("orphan")); err != nil {
-		t.Fatalf("put orphan: %v", err)
+	for key, bytes := range map[string][]byte{
+		liveKey:    []byte("live"),
+		runningKey: []byte("running"),
+		orphanKey:  []byte("orphan"),
+	} {
+		if _, err := store.PutBytes(key, bytes); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
 	}
 
-	// One live Artifact references liveKey; nothing references orphanKey.
+	// liveKey is claimed by an Artifact's status; runningKey is resolved onto a
+	// WorkloadReplicaSet's component but absent from any Artifact status (e.g.
+	// the Artifact was later deleted while the replica set is still running).
+	// Neither may ever be collected. Nothing references orphanKey.
 	liveArtifact := &runtimev1alpha1.Artifact{
 		ObjectMeta: metav1.ObjectMeta{Name: "live", Namespace: "default"},
 		Status: runtimev1alpha1.ArtifactStatus{
@@ -255,7 +222,14 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 			},
 		},
 	}
-	c := fake.NewClientBuilder().WithScheme(gcScheme(t)).WithObjects(liveArtifact).Build()
+	runningReplicaSet := &runtimev1alpha1.WorkloadReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: "default"},
+	}
+	runningReplicaSet.Spec.Template.Spec.Components = []runtimev1alpha1.WorkloadComponent{
+		{PrecompiledURL: gcTestBaseURL + "/" + runningKey},
+	}
+	c := fake.NewClientBuilder().WithScheme(gcScheme(t)).
+		WithObjects(liveArtifact, runningReplicaSet).Build()
 
 	newGC := func(grace time.Duration) *PrecompileGC {
 		return &PrecompileGC{
@@ -271,7 +245,7 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 	if err := newGC(time.Hour).sweep(ctx); err != nil {
 		t.Fatalf("grace sweep: %v", err)
 	}
-	if keys := objectStoreKeys(t, store); len(keys) != 2 {
+	if keys := objectStoreKeys(t, store); len(keys) != 3 {
 		t.Fatalf("within-grace orphan must be kept; store has %v", keys)
 	}
 
@@ -281,20 +255,25 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 	}
 	keys := objectStoreKeys(t, store)
 	if _, ok := keys[liveKey]; !ok {
-		t.Fatalf("live object was wrongly deleted; store has %v", keys)
+		t.Fatalf("Artifact-referenced object was wrongly deleted; store has %v", keys)
+	}
+	if _, ok := keys[runningKey]; !ok {
+		t.Fatalf("replica-set-referenced object was wrongly deleted; store has %v", keys)
 	}
 	if _, ok := keys[orphanKey]; ok {
 		t.Fatalf("orphan object should have been deleted; store has %v", keys)
 	}
 }
 
-// Missing bucket is a clean no-op (no successful precompile has run yet).
-func TestSweep_MissingBucketIsNoOp(t *testing.T) {
+// A missing bucket (no successful precompile has run yet) is a real error —
+// there is no special no-op case, so the caller sees it and retries on the
+// next tick like any other transient failure.
+func TestSweep_MissingBucketErrors(t *testing.T) {
 	nc := startEmbeddedNats(t)
 	c := fake.NewClientBuilder().WithScheme(gcScheme(t)).Build()
 	g := &PrecompileGC{Reader: c, NatsConn: nc, BaseURL: gcTestBaseURL, GracePeriod: 0}
-	if err := g.sweep(context.Background()); err != nil {
-		t.Fatalf("sweep against missing bucket should be a no-op, got: %v", err)
+	if err := g.sweep(context.Background()); err == nil {
+		t.Fatal("sweep against a missing bucket should return an error")
 	}
 }
 
@@ -304,5 +283,50 @@ func TestSweep_NonNatsSchemeSkipped(t *testing.T) {
 	g := &PrecompileGC{Reader: c, BaseURL: "file:///var/lib/cwasm", GracePeriod: 0}
 	if err := g.sweep(context.Background()); err != nil {
 		t.Fatalf("non-nats sweep should be a no-op, got: %v", err)
+	}
+}
+
+func TestInUseKeysFromReplicaSets(t *testing.T) {
+	replicaSet := func(name string, urls ...string) runtimev1alpha1.WorkloadReplicaSet {
+		rs := runtimev1alpha1.WorkloadReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: name}}
+		for _, u := range urls {
+			rs.Spec.Template.Spec.Components = append(rs.Spec.Template.Spec.Components,
+				runtimev1alpha1.WorkloadComponent{PrecompiledURL: u})
+		}
+		return rs
+	}
+
+	cases := []struct {
+		name        string
+		replicaSets []runtimev1alpha1.WorkloadReplicaSet
+		want        map[string]struct{}
+	}{
+		{
+			name: "extracts key from resolved component",
+			replicaSets: []runtimev1alpha1.WorkloadReplicaSet{
+				replicaSet("a", gcTestBaseURL+"/a/img/x86_64-27.0.0.cwasm"),
+			},
+			want: map[string]struct{}{"a/img/x86_64-27.0.0.cwasm": {}},
+		},
+		{
+			name: "skips unresolved component (empty PrecompiledURL)",
+			replicaSets: []runtimev1alpha1.WorkloadReplicaSet{
+				replicaSet("a", ""),
+			},
+			want: map[string]struct{}{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := inUseKeysFromReplicaSets(gcTestBaseURL, tc.replicaSets)
+			if len(got) != len(tc.want) {
+				t.Fatalf("inUseKeysFromReplicaSets = %v, want %v", got, tc.want)
+			}
+			for k := range tc.want {
+				if _, ok := got[k]; !ok {
+					t.Fatalf("inUseKeysFromReplicaSets missing key %q; got %v", k, got)
+				}
+			}
+		})
 	}
 }

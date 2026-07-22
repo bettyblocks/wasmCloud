@@ -228,12 +228,12 @@ operator:
     # INSECURE_REGISTRIES allowlist. Empty (default) means HTTPS-only.
     insecureRegistries: ""
     # Garbage collection of orphaned precompiled .cwasm objects — objects in the
-    # artifact store that no live Artifact references (stranded by Artifact
-    # deletes, image re-tags, or wasmtime-version bumps). Deterministic
-    # mark-and-sweep against Artifact status, not a usage-based TTL.
+    # artifact store that are neither claimed by a live Artifact's status nor
+    # actively resolved onto a running WorkloadReplicaSet's components
+    # (stranded by Artifact deletes, image re-tags, or wasmtime-version
+    # bumps). Deterministic mark-and-sweep, not a usage-based TTL. Runs
+    # automatically whenever precompile.enabled is true
     gc:
-      # -- Enable periodic GC. Off by default.
-      enabled: false
       # -- Sweep cadence (Go duration string).
       interval: "15m"
       # -- Minimum age an unreferenced object must reach before GC deletes it,
