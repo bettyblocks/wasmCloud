@@ -15,7 +15,10 @@ import (
 	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus"
 )
 
-const gcTestBaseURL = "nats://precompiled-artifacts"
+const (
+	gcTestBaseURL = "nats://precompiled-artifacts"
+	gcTestBucket  = "precompiled-artifacts"
+)
 
 func TestBucketFromBaseURL(t *testing.T) {
 	cases := []struct {
@@ -192,7 +195,7 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("jetstream: %v", err)
 	}
-	store, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "precompiled-artifacts"})
+	store, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: gcTestBucket})
 	if err != nil {
 		t.Fatalf("create object store: %v", err)
 	}
@@ -242,7 +245,7 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 	ctx := context.Background()
 
 	// Long grace period protects the fresh orphan.
-	if err := newGC(time.Hour).sweep(ctx); err != nil {
+	if err := newGC(time.Hour).sweep(ctx, gcTestBucket); err != nil {
 		t.Fatalf("grace sweep: %v", err)
 	}
 	if keys := objectStoreKeys(t, store); len(keys) != 3 {
@@ -250,7 +253,7 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 	}
 
 	// Active deletion past grace removes only the orphan.
-	if err := newGC(0).sweep(ctx); err != nil {
+	if err := newGC(0).sweep(ctx, gcTestBucket); err != nil {
 		t.Fatalf("delete sweep: %v", err)
 	}
 	keys := objectStoreKeys(t, store)
@@ -272,17 +275,19 @@ func TestSweep_MissingBucketErrors(t *testing.T) {
 	nc := startEmbeddedNats(t)
 	c := fake.NewClientBuilder().WithScheme(gcScheme(t)).Build()
 	g := &PrecompileGC{Reader: c, NatsConn: nc, BaseURL: gcTestBaseURL, GracePeriod: 0}
-	if err := g.sweep(context.Background()); err == nil {
+	if err := g.sweep(context.Background(), gcTestBucket); err == nil {
 		t.Fatal("sweep against a missing bucket should return an error")
 	}
 }
 
-// Non-nats base URL (e.g. file:// dev store) is skipped without touching NATS.
-func TestSweep_NonNatsSchemeSkipped(t *testing.T) {
+// A non-nats base URL (e.g. file:// dev store) disables GC entirely: Start
+// returns immediately without launching the sweep loop and never touches NATS
+// (note NatsConn is nil here — a sweep attempt would panic).
+func TestStart_NonNatsSchemeDisablesGC(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(gcScheme(t)).Build()
-	g := &PrecompileGC{Reader: c, BaseURL: "file:///var/lib/cwasm", GracePeriod: 0}
-	if err := g.sweep(context.Background()); err != nil {
-		t.Fatalf("non-nats sweep should be a no-op, got: %v", err)
+	g := &PrecompileGC{Reader: c, BaseURL: "file:///var/lib/cwasm", Interval: time.Hour}
+	if err := g.Start(context.Background()); err != nil {
+		t.Fatalf("Start with a non-nats store should return nil, got: %v", err)
 	}
 }
 

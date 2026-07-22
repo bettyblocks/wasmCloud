@@ -63,14 +63,21 @@ func (g *PrecompileGC) NeedLeaderElection() bool { return true }
 // Start implements manager.Runnable.
 func (g *PrecompileGC) Start(ctx context.Context) error {
 	log := ctrl.LoggerFrom(ctx).WithName("precompile-gc")
+
+	bucket, ok := bucketFromBaseURL(g.BaseURL)
+	if !ok {
+		log.Info("precompile artifact store is not nats://, GC disabled", "baseURL", g.BaseURL)
+		return nil
+	}
+
 	log.Info("starting precompile GC",
 		"interval", g.Interval,
 		"gracePeriod", g.GracePeriod,
-		"baseURL", g.BaseURL,
+		"bucket", bucket,
 	)
 
 	wait.UntilWithContext(ctx, func(ctx context.Context) {
-		if err := g.sweep(ctx); err != nil {
+		if err := g.sweep(ctx, bucket); err != nil {
 			log.Error(err, "precompile GC sweep failed")
 		}
 	}, g.Interval)
@@ -78,15 +85,8 @@ func (g *PrecompileGC) Start(ctx context.Context) error {
 }
 
 // sweep performs one mark-and-sweep pass over the object store.
-func (g *PrecompileGC) sweep(ctx context.Context) error {
+func (g *PrecompileGC) sweep(ctx context.Context, bucket string) error {
 	log := ctrl.LoggerFrom(ctx).WithName("precompile-gc")
-
-	bucket, ok := bucketFromBaseURL(g.BaseURL)
-	if !ok {
-		// file:// (dev) and any non-nats scheme have no object store to sweep.
-		log.V(1).Info("precompile artifact store is not nats://, skipping GC", "baseURL", g.BaseURL)
-		return nil
-	}
 
 	// Mark: in-use keys = union of every Artifact's recorded variants and
 	// every WorkloadReplicaSet's actively-resolved component URLs.
