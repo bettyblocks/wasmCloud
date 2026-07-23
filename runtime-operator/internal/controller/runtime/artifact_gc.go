@@ -66,11 +66,11 @@ func (g *PrecompileGC) Start(ctx context.Context) error {
 
 	bucket, ok := bucketFromBaseURL(g.BaseURL)
 	if !ok {
-		log.Info("precompile artifact store is not nats://, GC disabled", "baseURL", g.BaseURL)
+		log.V(1).Info("precompile artifact store is not nats://, GC disabled", "baseURL", g.BaseURL)
 		return nil
 	}
 
-	log.Info("starting precompile GC",
+	log.V(1).Info("starting precompile GC",
 		"interval", g.Interval,
 		"gracePeriod", g.GracePeriod,
 		"bucket", bucket,
@@ -143,10 +143,12 @@ func (g *PrecompileGC) sweep(ctx context.Context, bucket string) error {
 			continue
 		}
 		deleted++
+		// Deletions stay at Info: they are irreversible, so the audit trail of
+		// what GC removed must be visible at default verbosity.
 		log.Info("deleted orphaned cwasm object", "bucket", bucket, "key", key)
 	}
 
-	log.Info("precompile GC sweep complete",
+	log.V(1).Info("precompile GC sweep complete",
 		"bucket", bucket,
 		"scanned", len(liveCwasm),
 		"inUse", len(inUseCwasm),
