@@ -227,6 +227,19 @@ operator:
     # plain HTTP (e.g. a local dev registry). Mirrors the host's
     # INSECURE_REGISTRIES allowlist. Empty (default) means HTTPS-only.
     insecureRegistries: ""
+    # Garbage collection of orphaned precompiled .cwasm objects — objects in the
+    # artifact store that are neither claimed by a live Artifact's status nor
+    # actively resolved onto a running WorkloadReplicaSet's components
+    # (stranded by Artifact deletes, image re-tags, or wasmtime-version
+    # bumps). Deterministic mark-and-sweep, not a usage-based TTL. Runs
+    # automatically whenever precompile.enabled is true
+    gc:
+      # -- Sweep cadence (Go duration string).
+      interval: "15m"
+      # -- Minimum age an unreferenced object must reach before GC deletes it,
+      # guarding the window between a precompile Job writing an object and the
+      # operator recording it in Artifact status (Go duration string).
+      gracePeriod: "60m"
 
 gateway:
   # -- DEPRECATED: runtime-gateway is being removed. HTTP routing is now handled

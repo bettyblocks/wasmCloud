@@ -61,6 +61,8 @@ spec:
             {{- with .Values.operator.precompile.insecureRegistries }}
             - "-precompile-insecure-registries={{ . }}"
             {{- end }}
+            - "-precompile-gc-interval={{ .Values.operator.precompile.gc.interval }}"
+            - "-precompile-gc-grace-period={{ .Values.operator.precompile.gc.gracePeriod }}"
             {{- else }}
             - "-disable-precompile-controller"
             {{- end }}

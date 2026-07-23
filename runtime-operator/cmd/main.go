@@ -88,6 +88,8 @@ func main() {
 		precompileTarget             string
 		precompileWasmtimeVersion    string
 		precompileInsecureRegistries string
+		precompileGCInterval         time.Duration
+		precompileGCGracePeriod      time.Duration
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
@@ -155,6 +157,20 @@ func main() {
 		"precompile-insecure-registries",
 		"",
 		"Comma-separated registries the precompile Worker may pull from over plain HTTP.",
+	)
+	flag.DurationVar(
+		&precompileGCInterval,
+		"precompile-gc-interval",
+		15*time.Minute,
+		"How often the precompile GC sweeps the artifact store.",
+	)
+	flag.DurationVar(
+		&precompileGCGracePeriod,
+		"precompile-gc-grace-period",
+		60*time.Minute,
+		"Minimum age an unreferenced object must reach before precompile GC may "+
+			"delete it (guards the window between a Job writing an object and the "+
+			"operator recording it in Artifact status).",
 	)
 	flag.StringVar(
 		&watchNamespaces,
@@ -224,6 +240,8 @@ func main() {
 		PrecompileTarget:             precompileTarget,
 		PrecompileWasmtimeVersion:    precompileWasmtimeVersion,
 		PrecompileInsecureRegistries: precompileInsecureRegistries,
+		PrecompileGCInterval:         precompileGCInterval,
+		PrecompileGCGracePeriod:      precompileGCGracePeriod,
 	}
 
 	if natsCreds != "" {

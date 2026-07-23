@@ -43,6 +43,13 @@ type EmbeddedOperatorConfig struct {
 	// Comma-separated registries the precompile Worker may pull from over
 	// plain HTTP. Mirrors the host's INSECURE_REGISTRIES allowlist.
 	PrecompileInsecureRegistries string
+	// PrecompileGCInterval is the GC sweep cadence.
+	PrecompileGCInterval time.Duration
+	// PrecompileGCGracePeriod is the minimum age (by object ModTime) an
+	// unreachable object must reach before GC may collect it, guarding the
+	// window between a precompile Job writing an object and the operator
+	// recording it in Artifact status.
+	PrecompileGCGracePeriod time.Duration
 	// Namespace is the namespace the operator itself runs in. Every Host
 	// CRD is created here regardless of where the underlying host pod
 	// runs; tenant attribution is carried on the Host's Environment
@@ -112,6 +119,16 @@ func NewEmbeddedOperator(
 			WasmtimeVersion:    cfg.PrecompileWasmtimeVersion,
 			InsecureRegistries: cfg.PrecompileInsecureRegistries,
 		}).SetupWithManager(mgr); err != nil {
+			return nil, err
+		}
+
+		if err = mgr.Add(&runtime_controllers.PrecompileGC{
+			Reader:      mgr.GetClient(),
+			NatsConn:    nc,
+			BaseURL:     cfg.PrecompileArtifactBaseURL,
+			Interval:    cfg.PrecompileGCInterval,
+			GracePeriod: cfg.PrecompileGCGracePeriod,
+		}); err != nil {
 			return nil, err
 		}
 	}
