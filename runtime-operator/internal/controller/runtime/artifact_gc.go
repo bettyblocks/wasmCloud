@@ -16,6 +16,14 @@ import (
 	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
 )
 
+// natsListTimeout bounds each JetStream API request the sweep makes (notably
+// building the object-store list consumer). nats.go defaults to 5s, which a
+// bucket with a large orphan backlog can exceed while the server computes
+// DeliverLastPerSubject across every object's metadata subject — exactly the
+// backlog this GC exists to clear. A sweep runs at most once per interval on
+// the leader, so a generous bound here is cheap.
+const natsListTimeout = 3 * time.Minute
+
 // PrecompileGC garbage-collects precompiled .cwasm objects that are not
 // currently in use. The precompile pipeline writes AOT-compiled bytes to a
 // NATS object store keyed by (artifact, image, target, wasmtime version) but
@@ -105,7 +113,10 @@ func (g *PrecompileGC) sweep(ctx context.Context, bucket string) error {
 		inUseKeysFromReplicaSets(g.BaseURL, replicaSets.Items),
 	)
 
-	js, err := g.NatsConn.JetStream()
+	// MaxWait raises the per-request timeout above nats.go's 5s default so
+	// listing a large bucket doesn't fail with "context deadline exceeded"
+	// while the list consumer is being built.
+	js, err := g.NatsConn.JetStream(nats.MaxWait(natsListTimeout))
 	if err != nil {
 		return fmt.Errorf("acquiring JetStream context: %w", err)
 	}
