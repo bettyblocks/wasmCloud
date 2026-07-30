@@ -203,6 +203,7 @@ pub async fn run_cluster_host(
     let cleanup_interval = cluster_host.cleanup_interval;
     let compiled_cleanup_interval = cluster_host.compiled_cleanup_interval;
     let compiled_cleanup_grace = cluster_host.compiled_cleanup_grace;
+    let cleanup_age = cluster_host.cleanup_age;
     let host_id = host.id().to_string();
     let host = host.clone();
 
@@ -218,59 +219,100 @@ pub async fn run_cluster_host(
 
     let task = tokio::task::spawn(async move {
         let host_subject = host_subject(host_id.as_ref());
-
         let heartbeat_subject = heartbeat_subject(host_id.as_ref());
 
         let mut api_subscription = nats_client
             .subscribe(host_subject)
             .await
             .context("failed to subscribe for API requests")?;
-        let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
 
-        let mut oci_cleanup_timer = tokio::time::interval(cleanup_interval);
+        // Heartbeat runs in its own task so command handling is never delayed, a slow
+        // command only stalls the command loop below but not heartbeat.
+        let heartbeat_task = tokio::spawn({
+            let host = host.clone();
+            let nats_client = nats_client.clone();
+            async move {
+                let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
+                loop {
+                    // Send a heartbeat
+                    heartbeat_timer.tick().await;
+                    let heartbeat = match host_heartbeat(&host).await {
+                        Ok(heartbeat) => heartbeat,
+                        Err(e) => {
+                            error!("failed to build heartbeat: {e}");
+                            continue;
+                        }
+                    };
+                    match serde_json::to_vec(&heartbeat) {
+                        Ok(bytes) => {
+                            if let Err(e) = nats_client
+                                .publish(heartbeat_subject.clone(), bytes.into())
+                                .await
+                            {
+                                error!("failed to publish heartbeat: {e}");
+                            }
+                        }
+                        Err(e) => error!("failed to serialize heartbeat: {e}"),
+                    }
+                }
+            }
+        });
 
-        // Delay the first sweep a full interval. `interval` fires its first tick
-        // immediately, but at startup no workloads have registered yet, so the in-use
-        // set is empty therefore an eager sweep would treat live cache files (and files for
-        // workloads about to restart) as orphans and delete them. Waiting one interval
-        // lets restarted workloads claim their `.cwasm` files first.
-        let mut compiled_cleanup_timer = tokio::time::interval_at(
-            tokio::time::Instant::now() + compiled_cleanup_interval,
-            compiled_cleanup_interval,
-        );
+        // Cleanup task runs seperate from the heartbeat task above so a slow
+        // sweep cannot delay the heartbeat.
+        let cleanup_task = tokio::spawn({
+            let host = host.clone();
+            async move {
+                let mut oci_cleanup_timer = tokio::time::interval(cleanup_interval);
 
+                // Delay the first sweep a full interval. `interval` fires its first tick
+                // immediately, but at startup no workloads have registered yet, so the
+                // in-use set is empty therefore an eager sweep would treat live cache
+                // files (and files for workloads about to restart) as orphans and delete
+                // them. Waiting one interval lets restarted workloads claim their
+                // `.cwasm` files first.
+                let mut compiled_cleanup_timer = tokio::time::interval_at(
+                    tokio::time::Instant::now() + compiled_cleanup_interval,
+                    compiled_cleanup_interval,
+                );
+
+                loop {
+                    tokio::select! {
+                        // OCI cache cleanup
+                        _ = oci_cleanup_timer.tick() => {
+                            if let Some(cache_dir) = host.config().oci_cache_dir.as_ref() &&
+                            let Err(e) = oci::cleanup_cache(cache_dir, cleanup_age).await {
+                                error!("error during OCI cache cleanup: {e}");
+                            }
+                        }
+                        // cwasm cache cleanup
+                        _ = compiled_cleanup_timer.tick() => {
+                            host.sweep_unused_cwasm(compiled_cleanup_grace).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Command loop
         loop {
             tokio::select! {
                 // Shutdown signal
                 _ = &mut one_shot_rx => {
-                    api_subscription.unsubscribe().await.context("failed to unsubscribe from API requests")?;
-                    return host.stop().await.context("failed to stop host");
-                }
-                // OCI cache cleanup
-                _ = oci_cleanup_timer.tick() => {
-                    if let Some(cache_dir) = host.config().oci_cache_dir.as_ref() &&
-                    let Err(e) = oci::cleanup_cache(cache_dir, cluster_host.cleanup_age).await {
-                        error!("error during OCI cache cleanup: {e}");
+                    if let Err(e) = api_subscription.unsubscribe().await {
+                        error!("failed to unsubscribe from API requests: {e}");
                     }
-                }
-                // cwasm cache cleanup
-                _ = compiled_cleanup_timer.tick() => {
-                    host.sweep_unused_cwasm(compiled_cleanup_grace).await;
-                }
-                // Send heartbeat
-                _ = heartbeat_timer.tick() => {
-                    let heartbeat = host_heartbeat(&host).await?;
-                    let heartbeat_bytes = serde_json::to_vec(&heartbeat)
-                        .context("failed to serialize heartbeat")?;
-                    nats_client.publish(heartbeat_subject.clone(), heartbeat_bytes.into()).await.context("failed to publish heartbeat")?;
+                    break;
                 }
                 // Handle API requests
                 Some(msg) = api_subscription.next() => {
                     let response = handle_command(host.as_ref(), &msg, host.config()).await;
                     match response {
                         Ok(resp_bytes) => {
-                            if let Some(reply_to) = msg.reply {
-                                nats_client.publish(reply_to, resp_bytes.into()).await.context("failed to publish API response")?;
+                            if let Some(reply_to) = msg.reply
+                                && let Err(e) = nats_client.publish(reply_to, resp_bytes.into()).await
+                            {
+                                error!("failed to publish API response: {e}");
                             }
                         }
                         Err(e) => {
@@ -280,6 +322,13 @@ pub async fn run_cluster_host(
                 }
             }
         }
+
+        // Shutting down: stop the background tasks. Aborting a periodic sender mid-tick
+        // is safe, neither holds state that must be flushed.
+        heartbeat_task.abort();
+        cleanup_task.abort();
+
+        host.stop().await.context("failed to stop host")
     });
 
     Ok(async move {
