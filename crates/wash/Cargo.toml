@@ -23,8 +23,8 @@ wasm_component_model_implements = ["wash-runtime/wasm_component_model_implements
 # disable with `--no-default-features` for a build without the git sources.
 wasi-webgpu = ["wash-runtime/wasi-webgpu"]
 # Precompiled-artifact fetch backends for the s3:// / azblob:// schemes.
-s3 = ["wash-runtime/s3"]
-azblob = ["wash-runtime/azblob"]
+precompile-s3 = ["wash-runtime/precompile-s3"]
+precompile-azblob = ["wash-runtime/precompile-azblob"]
 
 [lints]
 workspace = true

@@ -8,9 +8,9 @@ pub async fn fetch(output: &str) -> Result<Vec<u8>> {
     match url.scheme() {
         "nats" => fetch_nats(&url).await,
         "file" => fetch_file(&url),
-        #[cfg(feature = "s3")]
+        #[cfg(feature = "precompile-s3")]
         "s3" => fetch_s3(&url).await,
-        #[cfg(feature = "azblob")]
+        #[cfg(feature = "precompile-azblob")]
         "azblob" => fetch_azblob(&url).await,
         other => bail!("unsupported precompiled scheme: {other}"),
     }
@@ -70,7 +70,7 @@ fn parse_bucket_and_key(url: &Url) -> Result<(String, String)> {
 /// Get the bytes at `key` in `container` from any `object_store` backend. Shared
 /// by `fetch_s3` and `fetch_azblob`, which differ only in how the store itself
 /// is built (bucket vs. container name, AWS vs. Azure credentials).
-#[cfg(any(feature = "s3", feature = "azblob"))]
+#[cfg(any(feature = "precompile-s3", feature = "precompile-azblob"))]
 async fn fetch_via_object_store(
     store: impl object_store::ObjectStore,
     container: &str,
@@ -90,7 +90,7 @@ async fn fetch_via_object_store(
     Ok(bytes.to_vec())
 }
 
-#[cfg(feature = "s3")]
+#[cfg(feature = "precompile-s3")]
 async fn fetch_s3(url: &Url) -> Result<Vec<u8>> {
     use object_store::aws::AmazonS3Builder;
 
@@ -104,7 +104,7 @@ async fn fetch_s3(url: &Url) -> Result<Vec<u8>> {
     fetch_via_object_store(store, &bucket, &key).await
 }
 
-#[cfg(feature = "azblob")]
+#[cfg(feature = "precompile-azblob")]
 async fn fetch_azblob(url: &Url) -> Result<Vec<u8>> {
     use object_store::azure::MicrosoftAzureBuilder;
 
@@ -285,7 +285,7 @@ mod tests {
         assert!(err.to_string().contains("unsupported precompiled scheme"));
     }
 
-    #[cfg(any(feature = "s3", feature = "azblob"))]
+    #[cfg(any(feature = "precompile-s3", feature = "precompile-azblob"))]
     #[tokio::test]
     async fn fetch_via_object_store_gets_bytes_at_key() {
         use object_store::ObjectStoreExt;

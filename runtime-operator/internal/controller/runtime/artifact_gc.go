@@ -136,11 +136,6 @@ func (g *PrecompileGC) sweep(ctx context.Context, scheme, bucket string) error {
 	if err != nil {
 		return fmt.Errorf("opening %s object store %q: %w", scheme, bucket, err)
 	}
-	defer func() {
-		if err := store.Close(); err != nil {
-			log.Error(err, "failed to close object store", "scheme", scheme, "bucket", bucket)
-		}
-	}()
 
 	// Every entry the store currently has for this bucket/container.
 	liveCwasm, err := store.List(ctx)
@@ -213,8 +208,6 @@ type cwasmStore interface {
 	List(ctx context.Context) ([]cwasmObject, error)
 	// Delete removes the object with the given key.
 	Delete(ctx context.Context, key string) error
-	// Close releases any resources (connections, clients) the store holds.
-	Close() error
 }
 
 // natsCwasmStore adapts a NATS JetStream object store to cwasmStore.
@@ -226,6 +219,7 @@ func (s *natsCwasmStore) List(_ context.Context) ([]cwasmObject, error) {
 	infos, err := s.store.List()
 	if err != nil {
 		if errors.Is(err, nats.ErrNoObjectsFound) {
+			// An empty bucket isn't an error — there's just nothing to sweep yet.
 			return nil, nil
 		}
 		return nil, err
@@ -243,8 +237,6 @@ func (s *natsCwasmStore) List(_ context.Context) ([]cwasmObject, error) {
 func (s *natsCwasmStore) Delete(_ context.Context, key string) error {
 	return s.store.Delete(key)
 }
-
-func (s *natsCwasmStore) Close() error { return nil }
 
 // s3CwasmStore adapts an AWS S3 bucket to cwasmStore.
 type s3CwasmStore struct {
@@ -289,8 +281,6 @@ func (s *s3CwasmStore) Delete(ctx context.Context, key string) error {
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &s.bucket, Key: &key})
 	return err
 }
-
-func (s *s3CwasmStore) Close() error { return nil }
 
 // azureCwasmStore adapts an Azure Blob Storage container to cwasmStore.
 type azureCwasmStore struct {
@@ -365,8 +355,6 @@ func (s *azureCwasmStore) Delete(ctx context.Context, key string) error {
 	_, err := s.client.DeleteBlob(ctx, s.container, key, nil)
 	return err
 }
-
-func (s *azureCwasmStore) Close() error { return nil }
 
 // cwasmObject is the minimal object-store metadata the sweep reasons about
 // for one precompiled .cwasm blob.

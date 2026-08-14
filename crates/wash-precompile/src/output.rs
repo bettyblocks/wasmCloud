@@ -8,9 +8,9 @@ pub async fn write(output: &Url, bytes: &[u8]) -> Result<()> {
     match output.scheme() {
         "file" => write_file(output, bytes),
         "nats" => write_nats(output, bytes).await,
-        #[cfg(feature = "s3")]
+        #[cfg(feature = "precompile-s3")]
         "s3" => write_s3(output, bytes).await,
-        #[cfg(feature = "azblob")]
+        #[cfg(feature = "precompile-azblob")]
         "azblob" => write_azblob(output, bytes).await,
         other => anyhow::bail!("unsupported output scheme: {other}"),
     }
@@ -73,7 +73,7 @@ fn parse_bucket_and_key(url: &Url) -> Result<(String, String)> {
 /// Put `bytes` at `key` in `container` on any `object_store` backend. Shared by
 /// `write_s3` and `write_azblob`, which differ only in how the store itself is
 /// built (bucket vs. container name, AWS vs. Azure credentials).
-#[cfg(any(feature = "s3", feature = "azblob"))]
+#[cfg(any(feature = "precompile-s3", feature = "precompile-azblob"))]
 async fn write_via_object_store(
     store: impl ::object_store::ObjectStore,
     container: &str,
@@ -90,7 +90,7 @@ async fn write_via_object_store(
     Ok(())
 }
 
-#[cfg(feature = "s3")]
+#[cfg(feature = "precompile-s3")]
 async fn write_s3(output: &Url, bytes: &[u8]) -> Result<()> {
     use ::object_store::aws::AmazonS3Builder;
 
@@ -104,7 +104,7 @@ async fn write_s3(output: &Url, bytes: &[u8]) -> Result<()> {
     write_via_object_store(store, &bucket, &key, bytes).await
 }
 
-#[cfg(feature = "azblob")]
+#[cfg(feature = "precompile-azblob")]
 async fn write_azblob(output: &Url, bytes: &[u8]) -> Result<()> {
     use ::object_store::azure::MicrosoftAzureBuilder;
 
@@ -155,7 +155,7 @@ mod tests {
         assert!(err.to_string().contains("missing object key"));
     }
 
-    #[cfg(any(feature = "s3", feature = "azblob"))]
+    #[cfg(any(feature = "precompile-s3", feature = "precompile-azblob"))]
     #[tokio::test]
     async fn write_via_object_store_puts_bytes_at_key() {
         use ::object_store::ObjectStoreExt;

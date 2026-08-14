@@ -41,10 +41,10 @@ workspace = true
 default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel", "wasi-webgpu", "wasmcloud-smtp"]
 oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:sha2", "dep:wit-component"]
 # Precompiled-artifact fetch backends (object_store-based), selected via the
-# s3:// / azblob:// schemes in fetch_precompiled. Independent flags: enabling
-# one does not pull in the other's cloud SDK.
-s3 = ["dep:object_store", "object_store/aws"]
-azblob = ["dep:object_store", "object_store/azure"]
+# s3:// / azblob:// schemes in fetch_precompiled. Each flag pulls in only its
+# own cloud SDK.
+precompile-s3 = ["dep:object_store", "object_store/aws"]
+precompile-azblob = ["dep:object_store", "object_store/azure"]
 wasi-otel = []
 washlet = ["oci"]
 wasi-config = []

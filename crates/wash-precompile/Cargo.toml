@@ -8,10 +8,10 @@ version.workspace = true
 [features]
 epoch-interruption = []
 # Precompiled-artifact output backends (object_store-based), selected via the
-# s3:// / azblob:// schemes in `output::write`. Independent flags: enabling
-# one does not pull in the other's cloud SDK.
-s3 = ["dep:object_store", "object_store/aws"]
-azblob = ["dep:object_store", "object_store/azure"]
+# s3:// / azblob:// schemes in `output::write`. Each flag pulls in only its
+# own cloud SDK.
+precompile-s3 = ["dep:object_store", "object_store/aws"]
+precompile-azblob = ["dep:object_store", "object_store/azure"]
 
 [dependencies]
 anyhow.workspace = true
