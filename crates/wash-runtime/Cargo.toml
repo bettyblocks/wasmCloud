@@ -40,6 +40,11 @@ workspace = true
 # BettyBlocks: `wasmcloud-smtp` kept in defaults across the upstream merge (`wasi-webgpu` is upstream's addition).
 default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel", "wasi-webgpu", "wasmcloud-smtp"]
 oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:sha2", "dep:wit-component"]
+# Precompiled-artifact fetch backends (object_store-based), selected via the
+# s3:// / azblob:// schemes in fetch_precompiled. Independent flags: enabling
+# one does not pull in the other's cloud SDK.
+s3 = ["dep:object_store", "object_store/aws"]
+azblob = ["dep:object_store", "object_store/azure"]
 wasi-otel = []
 washlet = ["oci"]
 wasi-config = []
@@ -128,6 +133,9 @@ oci-client = { workspace = true, optional = true, features = ["rustls-tls"] }
 oci-wasm = { workspace = true, optional = true, features = ["rustls-tls"] }
 sha2 = { workspace = true, optional = true }
 wit-component = { workspace = true, optional = true }
+
+# object_store dependency (optional, behind 's3' / 'azblob' features)
+object_store = { workspace = true, optional = true }
 
 # PostgreSQL dependencies (optional, behind 'wasmcloud-postgres' feature)
 bigdecimal = { optional = true, workspace = true }

@@ -29,6 +29,8 @@ func TestBucketFromBaseURL(t *testing.T) {
 	}{
 		{"nats scheme", "nats://precompiled-artifacts", "precompiled-artifacts", true},
 		{"nats with trailing slash", "nats://bucket/", "bucket", true},
+		{"s3 scheme", "s3://my-bucket", "my-bucket", true},
+		{"azblob scheme", "azblob://my-container", "my-container", true},
 		{"file scheme is skipped", "file:///var/lib/cwasm", "", false},
 		{"empty is skipped", "", "", false},
 		{"missing host", "nats://", "", false},
@@ -39,6 +41,30 @@ func TestBucketFromBaseURL(t *testing.T) {
 			if ok != tc.wantOK || bucket != tc.wantBucket {
 				t.Fatalf("bucketFromBaseURL(%q) = (%q, %v), want (%q, %v)",
 					tc.baseURL, bucket, ok, tc.wantBucket, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestSchemeAndBucketFromBaseURL(t *testing.T) {
+	cases := []struct {
+		name       string
+		baseURL    string
+		wantScheme string
+		wantBucket string
+		wantOK     bool
+	}{
+		{"nats scheme", "nats://precompiled-artifacts", "nats", "precompiled-artifacts", true},
+		{"s3 scheme", "s3://my-bucket", "s3", "my-bucket", true},
+		{"azblob scheme", "azblob://my-container", "azblob", "my-container", true},
+		{"file scheme is skipped", "file:///var/lib/cwasm", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme, bucket, ok := schemeAndBucketFromBaseURL(tc.baseURL)
+			if ok != tc.wantOK || scheme != tc.wantScheme || bucket != tc.wantBucket {
+				t.Fatalf("schemeAndBucketFromBaseURL(%q) = (%q, %q, %v), want (%q, %q, %v)",
+					tc.baseURL, scheme, bucket, ok, tc.wantScheme, tc.wantBucket, tc.wantOK)
 			}
 		})
 	}
@@ -245,7 +271,7 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 	ctx := context.Background()
 
 	// Long grace period protects the fresh orphan.
-	if err := newGC(time.Hour).sweep(ctx, gcTestBucket); err != nil {
+	if err := newGC(time.Hour).sweep(ctx, "nats", gcTestBucket); err != nil {
 		t.Fatalf("grace sweep: %v", err)
 	}
 	if keys := objectStoreKeys(t, store); len(keys) != 3 {
@@ -253,7 +279,7 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 	}
 
 	// Active deletion past grace removes only the orphan.
-	if err := newGC(0).sweep(ctx, gcTestBucket); err != nil {
+	if err := newGC(0).sweep(ctx, "nats", gcTestBucket); err != nil {
 		t.Fatalf("delete sweep: %v", err)
 	}
 	keys := objectStoreKeys(t, store)
@@ -275,15 +301,16 @@ func TestSweep_MissingBucketErrors(t *testing.T) {
 	nc := startEmbeddedNats(t)
 	c := fake.NewClientBuilder().WithScheme(gcScheme(t)).Build()
 	g := &PrecompileGC{Reader: c, NatsConn: nc, BaseURL: gcTestBaseURL, GracePeriod: 0}
-	if err := g.sweep(context.Background(), gcTestBucket); err == nil {
+	if err := g.sweep(context.Background(), "nats", gcTestBucket); err == nil {
 		t.Fatal("sweep against a missing bucket should return an error")
 	}
 }
 
-// A non-nats base URL (e.g. file:// dev store) disables GC entirely: Start
-// returns immediately without launching the sweep loop and never touches NATS
-// (note NatsConn is nil here — a sweep attempt would panic).
-func TestStart_NonNatsSchemeDisablesGC(t *testing.T) {
+// An unsupported base URL scheme (e.g. file:// dev store) disables GC
+// entirely: Start returns immediately without launching the sweep loop and
+// never touches NATS (note NatsConn is nil here — a sweep attempt would
+// panic). nats://, s3:// and azblob:// are all supported schemes today.
+func TestStart_UnsupportedSchemeDisablesGC(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(gcScheme(t)).Build()
 	g := &PrecompileGC{Reader: c, BaseURL: "file:///var/lib/cwasm", Interval: time.Hour}
 	if err := g.Start(context.Background()); err != nil {

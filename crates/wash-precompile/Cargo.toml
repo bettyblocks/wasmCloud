@@ -7,6 +7,11 @@ version.workspace = true
 
 [features]
 epoch-interruption = []
+# Precompiled-artifact output backends (object_store-based), selected via the
+# s3:// / azblob:// schemes in `output::write`. Independent flags: enabling
+# one does not pull in the other's cloud SDK.
+s3 = ["dep:object_store", "object_store/aws"]
+azblob = ["dep:object_store", "object_store/azure"]
 
 [dependencies]
 anyhow.workspace = true
@@ -18,6 +23,7 @@ oci-wasm.workspace = true
 tokio = {workspace = true, features = ["rt-multi-thread", "macros"]}
 wasmtime = {workspace = true,  features = ["component-model", "cranelift", "component-model-async"]}
 docker_credential.workspace = true
+object_store = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

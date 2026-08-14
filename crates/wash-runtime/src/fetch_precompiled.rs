@@ -8,6 +8,10 @@ pub async fn fetch(output: &str) -> Result<Vec<u8>> {
     match url.scheme() {
         "nats" => fetch_nats(&url).await,
         "file" => fetch_file(&url),
+        #[cfg(feature = "s3")]
+        "s3" => fetch_s3(&url).await,
+        #[cfg(feature = "azblob")]
+        "azblob" => fetch_azblob(&url).await,
         other => bail!("unsupported precompiled scheme: {other}"),
     }
 }
@@ -22,7 +26,7 @@ fn fetch_file(url: &Url) -> Result<Vec<u8>> {
 }
 
 async fn fetch_nats(url: &Url) -> Result<Vec<u8>> {
-    let (bucket, key) = parse_nats_url(url)?;
+    let (bucket, key) = parse_bucket_and_key(url)?;
 
     let nats_url = env::var("NATS_URL").context("NATS_URL env var not set")?;
     let client = async_nats::connect(&nats_url)
@@ -48,16 +52,70 @@ async fn fetch_nats(url: &Url) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn parse_nats_url(url: &Url) -> Result<(String, String)> {
+/// Split a `scheme://<bucket-or-container>/<key>` URL into its bucket/container
+/// (host) and object key (path). Shared by the NATS, S3 and Azure Blob fetchers,
+/// which differ only in how the resulting store is built and authenticated.
+fn parse_bucket_and_key(url: &Url) -> Result<(String, String)> {
     let bucket = url
         .host_str()
-        .ok_or_else(|| anyhow::anyhow!("nats:// URL missing bucket: {url}"))?
+        .ok_or_else(|| anyhow::anyhow!("{url} missing bucket/container"))?
         .to_string();
     let key = url.path().trim_start_matches('/').to_string();
     if key.is_empty() {
-        bail!("nats:// URL missing object key: {url}");
+        bail!("{url} missing object key");
     }
     Ok((bucket, key))
+}
+
+/// Get the bytes at `key` in `container` from any `object_store` backend. Shared
+/// by `fetch_s3` and `fetch_azblob`, which differ only in how the store itself
+/// is built (bucket vs. container name, AWS vs. Azure credentials).
+#[cfg(any(feature = "s3", feature = "azblob"))]
+async fn fetch_via_object_store(
+    store: impl object_store::ObjectStore,
+    container: &str,
+    key: &str,
+) -> Result<Vec<u8>> {
+    use object_store::ObjectStoreExt;
+    use object_store::path::Path as ObjectPath;
+
+    let object = store
+        .get(&ObjectPath::from(key))
+        .await
+        .with_context(|| format!("object '{key}' not found in '{container}'"))?;
+    let bytes = object
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read object '{key}' from '{container}'"))?;
+    Ok(bytes.to_vec())
+}
+
+#[cfg(feature = "s3")]
+async fn fetch_s3(url: &Url) -> Result<Vec<u8>> {
+    use object_store::aws::AmazonS3Builder;
+
+    let (bucket, key) = parse_bucket_and_key(url)?;
+
+    let store = AmazonS3Builder::from_env()
+        .with_bucket_name(&bucket)
+        .build()
+        .with_context(|| format!("failed to configure S3 client for bucket '{bucket}'"))?;
+
+    fetch_via_object_store(store, &bucket, &key).await
+}
+
+#[cfg(feature = "azblob")]
+async fn fetch_azblob(url: &Url) -> Result<Vec<u8>> {
+    use object_store::azure::MicrosoftAzureBuilder;
+
+    let (container, key) = parse_bucket_and_key(url)?;
+
+    let store = MicrosoftAzureBuilder::from_env()
+        .with_container_name(&container)
+        .build()
+        .with_context(|| format!("failed to configure Azure Blob client for container '{container}'"))?;
+
+    fetch_via_object_store(store, &container, &key).await
 }
 
 /// Download a precompiled component's `.cwasm` into the host's local cache dir and
@@ -196,17 +254,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_nats_url_into_bucket_and_key() {
+    fn parses_url_into_bucket_and_key() {
         let url = Url::parse("nats://precompiled-artifacts/myapp/x86_64.cwasm").unwrap();
-        let (bucket, key) = parse_nats_url(&url).unwrap();
+        let (bucket, key) = parse_bucket_and_key(&url).unwrap();
         assert_eq!(bucket, "precompiled-artifacts");
         assert_eq!(key, "myapp/x86_64.cwasm");
     }
 
     #[test]
-    fn nats_url_without_key_errors() {
+    fn url_without_key_errors() {
         let url = Url::parse("nats://bucket/").unwrap();
-        let err = parse_nats_url(&url).unwrap_err();
+        let err = parse_bucket_and_key(&url).unwrap_err();
         assert!(err.to_string().contains("missing object key"));
     }
 
@@ -223,7 +281,26 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_scheme_errors() {
-        let err = fetch("s3://bucket/key").await.unwrap_err();
+        let err = fetch("ftp://bucket/key").await.unwrap_err();
         assert!(err.to_string().contains("unsupported precompiled scheme"));
+    }
+
+    #[cfg(any(feature = "s3", feature = "azblob"))]
+    #[tokio::test]
+    async fn fetch_via_object_store_gets_bytes_at_key() {
+        use object_store::ObjectStoreExt;
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjectPath;
+
+        let store = InMemory::new();
+        store
+            .put(&ObjectPath::from("some/key.cwasm"), b"hello".as_ref().into())
+            .await
+            .unwrap();
+
+        let bytes = fetch_via_object_store(store, "test-container", "some/key.cwasm")
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"hello");
     }
 }
