@@ -1,5 +1,6 @@
 use core::future::Future;
 use core::ops::Deref;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -42,6 +43,16 @@ pub(crate) const DEFAULT_TCP_BACKLOG: u32 = 128;
 /// In practice, datagrams are typically less than 1500 bytes.
 pub(crate) const MAX_UDP_DATAGRAM_SIZE: usize = u16::MAX as usize;
 
+/// [`crate::types::LocalResources`] `config` key opting a workload into DNS
+/// resolution through `wasi:sockets/ip-name-lookup`.
+///
+/// Lookups are denied unless this is set (see [`AllowedNetworkUses::default`]),
+/// so a component can only address a service by name when its workload asks for
+/// it. Without the opt-in `resolve-addresses` answers
+/// `permanent-resolver-failure`, and a component configured with a hostname
+/// rather than a literal IP cannot reach its target at all.
+pub const IP_NAME_LOOKUP_CONFIG_KEY: &str = "ip-name-lookup";
+
 #[derive(Default)]
 pub struct WasiSocketsCtx {
     pub(crate) socket_addr_check: SocketAddrCheck,
@@ -76,6 +87,27 @@ impl Default for AllowedNetworkUses {
 }
 
 impl AllowedNetworkUses {
+    /// Network capabilities for a workload carrying this `LocalResources.config`.
+    ///
+    /// Only [`IP_NAME_LOOKUP_CONFIG_KEY`] is configurable. TCP and UDP keep their
+    /// [`Default`] values because reachability is governed elsewhere — by the
+    /// workload's [`SocketAddrCheck`] and its `allowed_hosts` allowlist — and
+    /// resolving a name says nothing about being permitted to dial the result.
+    ///
+    /// The value is compared case-insensitively and trimmed. It reaches the
+    /// runtime from hand-written YAML (a `wash dev` config, or a Kubernetes
+    /// ConfigMap by way of the operator), where silently ignoring `True` or
+    /// `"true "` costs more debugging than accepting either spelling. Anything
+    /// that isn't `true` leaves lookups denied.
+    pub(crate) fn from_component_config(config: &HashMap<String, String>) -> Self {
+        Self {
+            ip_name_lookup: config
+                .get(IP_NAME_LOOKUP_CONFIG_KEY)
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("true")),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn check_allowed_udp(self) -> std::io::Result<()> {
         if !self.udp {
             return Err(std::io::Error::new(
@@ -221,6 +253,85 @@ impl From<SocketAddressFamily> for wasmtime_wasi::p3::bindings::sockets::types::
             SocketAddressFamily::Ipv4 => Self::Ipv4,
             SocketAddressFamily::Ipv6 => Self::Ipv6,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_allowed_network_uses {
+    use super::*;
+
+    /// `AllowedNetworkUses` is `pub(crate)`, so these exercise it in place rather
+    /// than through an integration test.
+    fn config(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// Absent key keeps the deny-by-default posture: a workload that never asked
+    /// for name resolution must not receive it.
+    #[test]
+    fn absent_key_denies_name_lookup() {
+        assert!(!AllowedNetworkUses::from_component_config(&config(&[])).ip_name_lookup);
+        assert!(
+            !AllowedNetworkUses::from_component_config(&config(&[("tracing", "disable")]))
+                .ip_name_lookup
+        );
+    }
+
+    #[test]
+    fn true_allows_name_lookup() {
+        assert!(
+            AllowedNetworkUses::from_component_config(&config(&[(
+                IP_NAME_LOOKUP_CONFIG_KEY,
+                "true"
+            )]))
+            .ip_name_lookup
+        );
+    }
+
+    /// The value comes from hand-written YAML, so casing and stray whitespace are
+    /// accepted rather than silently turning the capability off.
+    #[test]
+    fn true_is_matched_leniently() {
+        for value in ["True", "TRUE", " true", "true "] {
+            assert!(
+                AllowedNetworkUses::from_component_config(&config(&[(
+                    IP_NAME_LOOKUP_CONFIG_KEY,
+                    value
+                )]))
+                .ip_name_lookup,
+                "{value:?} should enable name lookup"
+            );
+        }
+    }
+
+    /// Anything that isn't `true` denies, so a typo fails closed.
+    #[test]
+    fn other_values_deny_name_lookup() {
+        for value in ["false", "", "1", "yes", "enable", "ture"] {
+            assert!(
+                !AllowedNetworkUses::from_component_config(&config(&[(
+                    IP_NAME_LOOKUP_CONFIG_KEY,
+                    value
+                )]))
+                .ip_name_lookup,
+                "{value:?} should not enable name lookup"
+            );
+        }
+    }
+
+    /// TCP and UDP are not configurable here — reachability stays with the
+    /// socket-address check and `allowed_hosts`.
+    #[test]
+    fn tcp_and_udp_keep_their_defaults() {
+        let uses = AllowedNetworkUses::from_component_config(&config(&[(
+            IP_NAME_LOOKUP_CONFIG_KEY,
+            "true",
+        )]));
+        assert!(uses.check_allowed_tcp().is_ok());
+        assert!(uses.check_allowed_udp().is_ok());
     }
 }
 

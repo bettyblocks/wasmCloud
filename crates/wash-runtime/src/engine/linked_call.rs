@@ -186,8 +186,13 @@ async fn build_ctx_from_template(
                 }
             })
         }),
+        // Opt-in per workload, off by default: a component that only ever dials
+        // literal IPs should not gain the capability implicitly. See
+        // `sockets::IP_NAME_LOOKUP_CONFIG_KEY`.
+        allowed_network_uses: sockets::AllowedNetworkUses::from_component_config(
+            &template.local_resources.config,
+        ),
         loopback: Arc::clone(&template.loopback),
-        ..Default::default()
     };
 
     for mount in all_volume_mounts {
