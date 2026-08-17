@@ -75,6 +75,7 @@ kube = { version = "1", default-features = false }
 kube-derive = { version = "1", default-features = false }
 notify = { version = "8.0.0", default-features = false, features = ["macos_fsevent"] }
 moka = { version = "0.12", default-features = false }
+object_store = { version = "0.14.1", default-features = false }
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
 oci-wasm = { version = "0.4.0", default-features = false, features = ["rustls-tls"] }
 opentelemetry = { version = "0.31", default-features = false }
