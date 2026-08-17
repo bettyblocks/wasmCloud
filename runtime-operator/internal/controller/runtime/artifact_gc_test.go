@@ -2,10 +2,18 @@ package runtime
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/nats-io/nats.go"
+	testcontainers "github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/azure/azurite"
+	"github.com/testcontainers/testcontainers-go/modules/minio"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -291,6 +299,255 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 	}
 	if _, ok := keys[orphanKey]; ok {
 		t.Fatalf("orphan object should have been deleted; store has %v", keys)
+	}
+}
+
+// startMinIO boots a MinIO container and returns an S3 client pointed at it
+// plus the name of a freshly created bucket. Sets the env vars newS3CwasmStore
+// reads (AWS_ENDPOINT_URL_S3, AWS_S3_FORCE_PATH_STYLE, credentials) so that
+// g.sweep's own internally-built client resolves to the same container.
+func startMinIO(t *testing.T) (*s3.Client, string) {
+	t.Helper()
+	ctx := context.Background()
+
+	ctr, err := minio.Run(ctx, "minio/minio:RELEASE.2024-01-16T16-07-38Z")
+	if err != nil {
+		t.Skipf("minio container unavailable: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := ctr.Terminate(context.Background()); err != nil {
+			t.Logf("terminating minio container: %v", err)
+		}
+	})
+
+	endpoint, err := ctr.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("minio connection string: %v", err)
+	}
+
+	t.Setenv("AWS_ACCESS_KEY_ID", ctr.Username)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", ctr.Password)
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_ENDPOINT_URL_S3", "http://"+endpoint)
+	t.Setenv("AWS_S3_FORCE_PATH_STYLE", "true")
+
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		t.Fatalf("loading AWS config: %v", err)
+	}
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) { o.UsePathStyle = true })
+
+	bucket := "precompiled-artifacts"
+	if _, err := client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: &bucket}); err != nil {
+		t.Fatalf("creating bucket: %v", err)
+	}
+	return client, bucket
+}
+
+// startAzurite boots an Azurite container and returns an Azure Blob client
+// pointed at it plus the name of a freshly created container. Sets
+// AZURE_STORAGE_CONNECTION_STRING so g.sweep's own internally-built client
+// resolves to the same container.
+func startAzurite(t *testing.T) (*azblob.Client, string) {
+	t.Helper()
+	ctx := context.Background()
+
+	// --skipApiVersionCheck: the SDK sends whatever x-ms-version it was built
+	// with, which can be newer than what this Azurite image recognizes;
+	// Azurite's own error message for that mismatch names this flag as the fix.
+	ctr, err := azurite.Run(ctx, "mcr.microsoft.com/azure-storage/azurite:latest",
+		testcontainers.WithCmdArgs("--skipApiVersionCheck"))
+	if err != nil {
+		t.Skipf("azurite container unavailable: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := ctr.Terminate(context.Background()); err != nil {
+			t.Logf("terminating azurite container: %v", err)
+		}
+	})
+
+	blobURL, err := ctr.BlobServiceURL(ctx)
+	if err != nil {
+		t.Fatalf("azurite blob service URL: %v", err)
+	}
+	connStr := fmt.Sprintf(
+		"DefaultEndpointsProtocol=http;AccountName=%s;AccountKey=%s;BlobEndpoint=%s/%s;",
+		azurite.AccountName, azurite.AccountKey, blobURL, azurite.AccountName,
+	)
+	t.Setenv("AZURE_STORAGE_CONNECTION_STRING", connStr)
+
+	client, err := azblob.NewClientFromConnectionString(connStr, nil)
+	if err != nil {
+		t.Fatalf("azure blob client: %v", err)
+	}
+
+	container := "precompiled-artifacts"
+	if _, err := client.CreateContainer(ctx, container, nil); err != nil {
+		t.Fatalf("creating container: %v", err)
+	}
+	return client, container
+}
+
+// s3ObjectKeys lists every key currently in bucket.
+func s3ObjectKeys(t *testing.T, client *s3.Client, bucket string) map[string]struct{} {
+	t.Helper()
+	ctx := context.Background()
+	keys := make(map[string]struct{})
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{Bucket: &bucket})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			t.Fatalf("listing objects: %v", err)
+		}
+		for _, obj := range page.Contents {
+			if obj.Key != nil {
+				keys[*obj.Key] = struct{}{}
+			}
+		}
+	}
+	return keys
+}
+
+// azureBlobKeys lists every non-deleted blob name currently in container.
+func azureBlobKeys(t *testing.T, client *azblob.Client, container string) map[string]struct{} {
+	t.Helper()
+	ctx := context.Background()
+	keys := make(map[string]struct{})
+	pager := client.NewListBlobsFlatPager(container, nil)
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			t.Fatalf("listing blobs: %v", err)
+		}
+		for _, item := range page.Segment.BlobItems {
+			if item.Name != nil && (item.Deleted == nil || !*item.Deleted) {
+				keys[*item.Name] = struct{}{}
+			}
+		}
+	}
+	return keys
+}
+
+func TestSweep_DeletesOrphansPastGrace_S3(t *testing.T) {
+	client, bucket := startMinIO(t)
+	ctx := context.Background()
+
+	const liveKey = "live/img/x86_64-27.0.0.cwasm"
+	const runningKey = "running/img/x86_64-27.0.0.cwasm"
+	const orphanKey = "orphan/img/x86_64-27.0.0.cwasm"
+	for _, key := range []string{liveKey, runningKey, orphanKey} {
+		key := key
+		if _, err := client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: &bucket,
+			Key:    &key,
+			Body:   strings.NewReader(key),
+		}); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	baseURL := "s3://" + bucket
+	liveArtifact := &runtimev1alpha1.Artifact{
+		ObjectMeta: metav1.ObjectMeta{Name: "live", Namespace: "default"},
+		Status: runtimev1alpha1.ArtifactStatus{
+			Precompiled: []runtimev1alpha1.PrecompiledVariant{
+				{ArtifactURL: baseURL + "/" + liveKey},
+			},
+		},
+	}
+	runningReplicaSet := &runtimev1alpha1.WorkloadReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: "default"},
+	}
+	runningReplicaSet.Spec.Template.Spec.Components = []runtimev1alpha1.WorkloadComponent{
+		{PrecompiledURL: baseURL + "/" + runningKey},
+	}
+	c := fake.NewClientBuilder().WithScheme(gcScheme(t)).
+		WithObjects(liveArtifact, runningReplicaSet).Build()
+
+	newGC := func(grace time.Duration) *PrecompileGC {
+		return &PrecompileGC{Reader: c, BaseURL: baseURL, GracePeriod: grace}
+	}
+
+	// Long grace period protects the fresh orphan.
+	if err := newGC(time.Hour).sweep(ctx, "s3", bucket); err != nil {
+		t.Fatalf("grace sweep: %v", err)
+	}
+	if keys := s3ObjectKeys(t, client, bucket); len(keys) != 3 {
+		t.Fatalf("within-grace orphan must be kept; bucket has %v", keys)
+	}
+
+	// Active deletion past grace removes only the orphan.
+	if err := newGC(0).sweep(ctx, "s3", bucket); err != nil {
+		t.Fatalf("delete sweep: %v", err)
+	}
+	keys := s3ObjectKeys(t, client, bucket)
+	if _, ok := keys[liveKey]; !ok {
+		t.Fatalf("Artifact-referenced object was wrongly deleted; bucket has %v", keys)
+	}
+	if _, ok := keys[runningKey]; !ok {
+		t.Fatalf("replica-set-referenced object was wrongly deleted; bucket has %v", keys)
+	}
+	if _, ok := keys[orphanKey]; ok {
+		t.Fatalf("orphan object should have been deleted; bucket has %v", keys)
+	}
+}
+
+func TestSweep_DeletesOrphansPastGrace_Azure(t *testing.T) {
+	client, container := startAzurite(t)
+	ctx := context.Background()
+
+	const liveKey = "live/img/x86_64-27.0.0.cwasm"
+	const runningKey = "running/img/x86_64-27.0.0.cwasm"
+	const orphanKey = "orphan/img/x86_64-27.0.0.cwasm"
+	for _, key := range []string{liveKey, runningKey, orphanKey} {
+		if _, err := client.UploadBuffer(ctx, container, key, []byte(key), nil); err != nil {
+			t.Fatalf("upload %s: %v", key, err)
+		}
+	}
+
+	baseURL := "azblob://" + container
+	liveArtifact := &runtimev1alpha1.Artifact{
+		ObjectMeta: metav1.ObjectMeta{Name: "live", Namespace: "default"},
+		Status: runtimev1alpha1.ArtifactStatus{
+			Precompiled: []runtimev1alpha1.PrecompiledVariant{
+				{ArtifactURL: baseURL + "/" + liveKey},
+			},
+		},
+	}
+	runningReplicaSet := &runtimev1alpha1.WorkloadReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: "default"},
+	}
+	runningReplicaSet.Spec.Template.Spec.Components = []runtimev1alpha1.WorkloadComponent{
+		{PrecompiledURL: baseURL + "/" + runningKey},
+	}
+	c := fake.NewClientBuilder().WithScheme(gcScheme(t)).
+		WithObjects(liveArtifact, runningReplicaSet).Build()
+
+	newGC := func(grace time.Duration) *PrecompileGC {
+		return &PrecompileGC{Reader: c, BaseURL: baseURL, GracePeriod: grace}
+	}
+
+	// Long grace period protects the fresh orphan.
+	if err := newGC(time.Hour).sweep(ctx, "azblob", container); err != nil {
+		t.Fatalf("grace sweep: %v", err)
+	}
+	if keys := azureBlobKeys(t, client, container); len(keys) != 3 {
+		t.Fatalf("within-grace orphan must be kept; container has %v", keys)
+	}
+
+	// Active deletion past grace removes only the orphan.
+	if err := newGC(0).sweep(ctx, "azblob", container); err != nil {
+		t.Fatalf("delete sweep: %v", err)
+	}
+	keys := azureBlobKeys(t, client, container)
+	if _, ok := keys[liveKey]; !ok {
+		t.Fatalf("Artifact-referenced object was wrongly deleted; container has %v", keys)
+	}
+	if _, ok := keys[runningKey]; !ok {
+		t.Fatalf("replica-set-referenced object was wrongly deleted; container has %v", keys)
+	}
+	if _, ok := keys[orphanKey]; ok {
+		t.Fatalf("orphan object should have been deleted; container has %v", keys)
 	}
 }
 

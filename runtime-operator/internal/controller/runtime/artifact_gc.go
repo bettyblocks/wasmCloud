@@ -202,7 +202,10 @@ func (g *PrecompileGC) openStore(ctx context.Context, scheme, bucket string) (cw
 
 // cwasmStore abstracts the backend holding precompiled .cwasm objects, so the
 // mark-and-sweep logic in sweep is agnostic to whether the artifacts live in
-// a NATS JetStream object store, S3, or Azure Blob Storage.
+// a NATS JetStream object store, S3, or Azure Blob Storage. None of the three
+// backends hold a resource that needs an explicit close: the NATS connection
+// is owned by PrecompileGC, not the store, and the AWS/Azure SDK clients
+// manage their own HTTP transport internally.
 type cwasmStore interface {
 	// List returns every live (non-deleted) object currently in the store.
 	List(ctx context.Context) ([]cwasmObject, error)
@@ -246,13 +249,22 @@ type s3CwasmStore struct {
 
 // newS3CwasmStore builds an S3-backed cwasmStore. Credentials, region and
 // endpoint come from the AWS SDK's default chain (env vars, shared config
-// file, container/instance role), same as any other AWS SDK v2 client.
+// file, container/instance role), same as any other AWS SDK v2 client — this
+// includes AWS_ENDPOINT_URL / AWS_ENDPOINT_URL_S3 for pointing at a
+// self-hosted S3-compatible store (e.g. MinIO). AWS_S3_FORCE_PATH_STYLE
+// enables path-style addressing, which such stores generally require since
+// virtual-hosted-style relies on the bucket resolving as a DNS subdomain of
+// the endpoint.
 func newS3CwasmStore(ctx context.Context, bucket string) (*s3CwasmStore, error) {
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("loading AWS config: %w", err)
 	}
-	return &s3CwasmStore{client: s3.NewFromConfig(cfg), bucket: bucket}, nil
+	usePathStyle := os.Getenv("AWS_S3_FORCE_PATH_STYLE") == "true"
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.UsePathStyle = usePathStyle
+	})
+	return &s3CwasmStore{client: client, bucket: bucket}, nil
 }
 
 func (s *s3CwasmStore) List(ctx context.Context) ([]cwasmObject, error) {
@@ -288,13 +300,23 @@ type azureCwasmStore struct {
 	container string
 }
 
-// newAzureCwasmStore builds an Azure Blob Storage-backed cwasmStore.
+// newAzureCwasmStore builds an Azure Blob Storage-backed cwasmStore. If
+// AZURE_STORAGE_CONNECTION_STRING is set, it's used as-is — the standard way
+// to point at Azurite or another self-hosted emulator/service. Otherwise
 // AZURE_STORAGE_ACCOUNT_NAME selects the storage account; if
 // AZURE_STORAGE_ACCOUNT_KEY (or its alias AZURE_STORAGE_ACCESS_KEY) is set,
 // auth uses that shared key, otherwise it falls back to
 // azidentity.DefaultAzureCredential (managed identity, Azure CLI,
 // AZURE_CLIENT_ID/AZURE_CLIENT_SECRET/AZURE_TENANT_ID env vars, ...).
 func newAzureCwasmStore(container string) (*azureCwasmStore, error) {
+	if connStr := os.Getenv("AZURE_STORAGE_CONNECTION_STRING"); connStr != "" {
+		client, err := azblob.NewClientFromConnectionString(connStr, nil)
+		if err != nil {
+			return nil, fmt.Errorf("building Azure Blob client from connection string: %w", err)
+		}
+		return &azureCwasmStore{client: client, container: container}, nil
+	}
+
 	account := os.Getenv("AZURE_STORAGE_ACCOUNT_NAME")
 	if account == "" {
 		return nil, errors.New("AZURE_STORAGE_ACCOUNT_NAME not set")
