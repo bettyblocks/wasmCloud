@@ -97,6 +97,10 @@ pub struct LocalResources {
     /// Allows passing arbitrary configuration values to influence implementation behavior for all component interfaces.
     /// Example: tracing=disable
     ///
+    /// Keys the runtime itself reads:
+    /// [`crate::sockets::IP_NAME_LOOKUP_CONFIG_KEY`] (`ip-name-lookup`) — opt in
+    /// to DNS resolution via `wasi:sockets/ip-name-lookup`, denied otherwise.
+    ///
     /// Also surfaced per component via `wasi:config/store`, layered over
     /// the interface config (see
     /// [`crate::plugin::wasi_config::DynamicConfig`]).
