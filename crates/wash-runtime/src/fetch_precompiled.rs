@@ -1,12 +1,16 @@
 use anyhow::{Context, Result, bail};
-use std::env;
 use tokio::io::AsyncReadExt;
 use url::Url;
 
-pub async fn fetch(output: &str) -> Result<Vec<u8>> {
+pub async fn fetch(output: &str, nats_client: Option<&async_nats::Client>) -> Result<Vec<u8>> {
     let url = Url::parse(output).with_context(|| format!("invalid precompiled URL: {output}"))?;
     match url.scheme() {
-        "nats" => fetch_nats(&url).await,
+        "nats" => {
+            let client = nats_client.ok_or_else(|| {
+                anyhow::anyhow!("nats client required to fetch nats:// precompiled URLs")
+            })?;
+            fetch_nats(&url, client).await
+        }
         "file" => fetch_file(&url),
         other => bail!("unsupported precompiled scheme: {other}"),
     }
@@ -21,14 +25,10 @@ fn fetch_file(url: &Url) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn fetch_nats(url: &Url) -> Result<Vec<u8>> {
+async fn fetch_nats(url: &Url, client: &async_nats::Client) -> Result<Vec<u8>> {
     let (bucket, key) = parse_nats_url(url)?;
 
-    let nats_url = env::var("NATS_URL").context("NATS_URL env var not set")?;
-    let client = async_nats::connect(&nats_url)
-        .await
-        .with_context(|| format!("failed to connect to NATS at {nats_url}"))?;
-    let jetstream = async_nats::jetstream::new(client);
+    let jetstream = async_nats::jetstream::new(client.clone());
     let store = jetstream
         .get_object_store(&bucket)
         .await
@@ -72,7 +72,11 @@ fn parse_nats_url(url: &Url) -> Result<(String, String)> {
 /// from a half-written file — and because the host owns the file, nothing else can
 /// change it while it's in use.
 #[cfg(feature = "oci")]
-pub async fn download_cwasm(url: &str, cache_dir: &std::path::Path) -> Result<std::path::PathBuf> {
+pub async fn download_cwasm(
+    url: &str,
+    cache_dir: &std::path::Path,
+    nats_client: Option<&async_nats::Client>,
+) -> Result<std::path::PathBuf> {
     let key = cache_key_for_url(url);
     let path = cache_dir.join(format!("{key}.cwasm"));
 
@@ -87,7 +91,7 @@ pub async fn download_cwasm(url: &str, cache_dir: &std::path::Path) -> Result<st
         return Ok(path);
     }
 
-    let bytes = fetch(url).await?;
+    let bytes = fetch(url, nats_client).await?;
 
     tokio::fs::create_dir_all(cache_dir)
         .await
@@ -170,7 +174,7 @@ mod tests {
         let url = format!("file://{}", source.display());
 
         // Miss: fetch the source and write a host-owned copy into the cache dir.
-        let path = download_cwasm(&url, cache_dir.path()).await.unwrap();
+        let path = download_cwasm(&url, cache_dir.path(), None).await.unwrap();
         assert_eq!(path.parent(), Some(cache_dir.path()));
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("cwasm"));
         assert_eq!(std::fs::read(&path).unwrap(), b"precompiled-bytes");
@@ -178,7 +182,7 @@ mod tests {
         // Delete the source so any re-fetch would fail — proving the second call is a
         // pure cache hit (stat, no download) that returns the same host-owned file.
         std::fs::remove_file(&source).unwrap();
-        let hit = download_cwasm(&url, cache_dir.path()).await.unwrap();
+        let hit = download_cwasm(&url, cache_dir.path(), None).await.unwrap();
         assert_eq!(hit, path);
         assert_eq!(std::fs::read(&hit).unwrap(), b"precompiled-bytes");
     }
@@ -217,13 +221,21 @@ mod tests {
         std::fs::write(&path, b"hello").unwrap();
         let url = format!("file://{}", path.display());
 
-        let bytes = fetch(&url).await.unwrap();
+        let bytes = fetch(&url, None).await.unwrap();
         assert_eq!(bytes, b"hello");
     }
 
     #[tokio::test]
     async fn unknown_scheme_errors() {
-        let err = fetch("s3://bucket/key").await.unwrap_err();
+        let err = fetch("s3://bucket/key", None).await.unwrap_err();
         assert!(err.to_string().contains("unsupported precompiled scheme"));
+    }
+
+    #[tokio::test]
+    async fn nats_url_without_client_errors() {
+        let err = fetch("nats://precompiled-artifacts/myapp/x86_64.cwasm", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nats client required"));
     }
 }

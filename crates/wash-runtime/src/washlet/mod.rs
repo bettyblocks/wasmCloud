@@ -306,7 +306,7 @@ pub async fn run_cluster_host(
                 }
                 // Handle API requests
                 Some(msg) = api_subscription.next() => {
-                    let response = handle_command(host.as_ref(), &msg, host.config()).await;
+                    let response = handle_command(host.as_ref(), &msg, host.config(), &nats_client).await;
                     match response {
                         Ok(resp_bytes) => {
                             if let Some(reply_to) = msg.reply
@@ -407,6 +407,7 @@ async fn handle_command(
     host: &impl HostApi,
     msg: &async_nats::Message,
     config: &HostConfig,
+    nats_client: &async_nats::Client,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let command = msg.subject.split('.').skip(3).collect::<Vec<_>>().join(".");
 
@@ -419,7 +420,7 @@ async fn handle_command(
         }
         "workload.start" => {
             let req: types::v2::WorkloadStartRequest = from_api(payload)?;
-            let res = workload_start(host, req, config).await?;
+            let res = workload_start(host, req, config, nats_client).await?;
             to_api(&res)
         }
         "workload.stop" => {
@@ -469,6 +470,7 @@ async fn workload_start(
     host: &impl HostApi,
     req: types::v2::WorkloadStartRequest,
     config: &HostConfig,
+    nats_client: &async_nats::Client,
 ) -> anyhow::Result<types::v2::WorkloadStartResponse> {
     let Some(types::v2::Workload {
         namespace,
@@ -509,27 +511,31 @@ async fn workload_start(
                     "using precompiled component"
                 );
                 let source = match config.compiled_cache_dir.as_deref() {
-                    Some(dir) => match download_cwasm(&component.precompiled_url, dir).await {
-                        Ok(path) => crate::types::Source::PrecompiledFile(path),
-                        Err(e) => {
-                            tracing::error!(
-                                component = %component.name,
-                                url = %component.precompiled_url,
-                                error = %e,
-                                "failed to resolve precompiled component"
-                            );
-                            return Ok(types::v2::WorkloadStartResponse {
-                                workload_status: Some(types::v2::WorkloadStatus {
-                                    workload_id: workload_id.clone(),
-                                    workload_state: types::v2::WorkloadState::Error.into(),
-                                    message: format!(
-                                        "failed to fetch precompiled component from {}: {}",
-                                        component.precompiled_url, e
-                                    ),
-                                }),
-                            });
+                    Some(dir) => {
+                        match download_cwasm(&component.precompiled_url, dir, Some(nats_client))
+                            .await
+                        {
+                            Ok(path) => crate::types::Source::PrecompiledFile(path),
+                            Err(e) => {
+                                tracing::error!(
+                                    component = %component.name,
+                                    url = %component.precompiled_url,
+                                    error = %e,
+                                    "failed to resolve precompiled component"
+                                );
+                                return Ok(types::v2::WorkloadStartResponse {
+                                    workload_status: Some(types::v2::WorkloadStatus {
+                                        workload_id: workload_id.clone(),
+                                        workload_state: types::v2::WorkloadState::Error.into(),
+                                        message: format!(
+                                            "failed to fetch precompiled component from {}: {}",
+                                            component.precompiled_url, e
+                                        ),
+                                    }),
+                                });
+                            }
                         }
-                    },
+                    }
                     None => {
                         tracing::error!(
                             component = %component.name,
