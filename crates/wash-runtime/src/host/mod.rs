@@ -938,6 +938,8 @@ pub struct HostConfig {
     /// Directory for caching compiled components as `.cwasm` files, loaded file-backed.
     /// See `FILE_BACKED_MMAP_COMPILED_CACHE.md` for details.
     pub compiled_cache_dir: Option<PathBuf>,
+    /// Bound on fetching a single precompiled component.
+    pub precompiled_fetch_timeout: Option<Duration>,
 }
 
 impl Default for HostConfig {
@@ -947,6 +949,7 @@ impl Default for HostConfig {
             oci_pull_timeout: Duration::from_secs(30).into(),
             oci_cache_dir: None,
             compiled_cache_dir: None,
+            precompiled_fetch_timeout: Duration::from_secs(30).into(),
         }
     }
 }
