@@ -15,6 +15,12 @@ use tracing::{debug, error, info, instrument};
 pub const HOST_API_PREFIX: &str = "runtime.host";
 pub const OPERATOR_API_PREFIX: &str = "runtime.operator";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// Default cap on commands (workload start/stop/status) processed concurrently by a
+/// single host. Commands are spawned onto their own tasks so one slow command can't
+/// block the rest, but spawning is otherwise unbounded — a burst of restarts can queue
+/// up far more `workload.start` calls than the host pod's CPU/memory budget can run at
+/// once. This bounds that burst instead of letting every request run simultaneously.
+const DEFAULT_MAX_CONCURRENT_COMMANDS: usize = 16;
 
 pub mod types {
     pub mod v2 {
@@ -41,6 +47,7 @@ pub struct ClusterHostBuilder {
     compiled_cleanup_interval: Option<Duration>,
     compiled_cleanup_grace: Option<Duration>,
     host_config: Option<HostConfig>,
+    max_concurrent_commands: Option<usize>,
 }
 
 impl ClusterHostBuilder {
@@ -112,6 +119,15 @@ impl ClusterHostBuilder {
         self
     }
 
+    /// Caps how many commands (workload start/stop/status) this host runs concurrently.
+    /// Tune this to the host pod's actual CPU/memory budget: too high and a burst of
+    /// restarts can run more workload starts at once than the pod can afford; too low
+    /// and starts queue up behind each other longer than necessary.
+    pub fn with_max_concurrent_commands(mut self, max: usize) -> Self {
+        self.max_concurrent_commands = Some(max);
+        self
+    }
+
     pub fn with_engine(mut self, engine: crate::engine::Engine) -> Self {
         self.host_builder = self.host_builder.with_engine(engine);
         self
@@ -168,6 +184,9 @@ impl ClusterHostBuilder {
             compiled_cleanup_grace: self
                 .compiled_cleanup_grace
                 .unwrap_or(Duration::from_secs(3600)),
+            max_concurrent_commands: self
+                .max_concurrent_commands
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_COMMANDS),
         })
     }
 }
@@ -180,6 +199,7 @@ pub struct ClusterHost {
     cleanup_age: Duration,
     compiled_cleanup_interval: Duration,
     compiled_cleanup_grace: Duration,
+    max_concurrent_commands: usize,
 }
 
 impl ClusterHost {
@@ -204,6 +224,9 @@ pub async fn run_cluster_host(
     let compiled_cleanup_interval = cluster_host.compiled_cleanup_interval;
     let compiled_cleanup_grace = cluster_host.compiled_cleanup_grace;
     let cleanup_age = cluster_host.cleanup_age;
+    let command_semaphore = Arc::new(tokio::sync::Semaphore::new(
+        cluster_host.max_concurrent_commands,
+    ));
     let host_id = host.id().to_string();
     let host = host.clone();
 
@@ -304,21 +327,42 @@ pub async fn run_cluster_host(
                     }
                     break;
                 }
-                // Handle API requests
+                // Handle API requests. Each command is spawned onto its own task so a
+                // slow or stuck one (e.g. a component fetch waiting on a degraded NATS)
+                // can't head-of-line-block every other command queued behind it on this
+                // host — previously a single hung workload.start left workload.stop and
+                // workload.status requests for every other workload stuck too, since this
+                // loop only pulls the next message after the current one finishes.
+                //
+                // Spawning is otherwise unbounded, so a burst of restarts queuing up
+                // far more `workload.start` calls than this pod's CPU/memory budget can
+                // run at once would just trade head-of-line blocking for resource
+                // exhaustion. The semaphore permit is acquired inside the spawned task,
+                // not here, so a full semaphore only makes that task wait — it never
+                // blocks this loop from staying responsive to new messages or shutdown.
                 Some(msg) = api_subscription.next() => {
-                    let response = handle_command(host.as_ref(), &msg, host.config()).await;
-                    match response {
-                        Ok(resp_bytes) => {
-                            if let Some(reply_to) = msg.reply
-                                && let Err(e) = nats_client.publish(reply_to, resp_bytes.into()).await
-                            {
-                                error!("failed to publish API response: {e}");
+                    let host = host.clone();
+                    let nats_client = nats_client.clone();
+                    let command_semaphore = command_semaphore.clone();
+                    tokio::spawn(async move {
+                        let _permit = command_semaphore
+                            .acquire_owned()
+                            .await
+                            .expect("command semaphore should never be closed");
+                        let response = handle_command(host.as_ref(), &msg, host.config(), &nats_client).await;
+                        match response {
+                            Ok(resp_bytes) => {
+                                if let Some(reply_to) = msg.reply
+                                    && let Err(e) = nats_client.publish(reply_to, resp_bytes.into()).await
+                                {
+                                    error!("failed to publish API response: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                error!("error handling command: {e}");
                             }
                         }
-                        Err(e) => {
-                            error!("error handling command: {e}");
-                        }
-                    }
+                    });
                 }
             }
         }
@@ -407,6 +451,7 @@ async fn handle_command(
     host: &impl HostApi,
     msg: &async_nats::Message,
     config: &HostConfig,
+    nats_client: &async_nats::Client,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let command = msg.subject.split('.').skip(3).collect::<Vec<_>>().join(".");
 
@@ -419,7 +464,7 @@ async fn handle_command(
         }
         "workload.start" => {
             let req: types::v2::WorkloadStartRequest = from_api(payload)?;
-            let res = workload_start(host, req, config).await?;
+            let res = workload_start(host, req, config, nats_client).await?;
             to_api(&res)
         }
         "workload.stop" => {
@@ -469,6 +514,7 @@ async fn workload_start(
     host: &impl HostApi,
     req: types::v2::WorkloadStartRequest,
     config: &HostConfig,
+    nats_client: &async_nats::Client,
 ) -> anyhow::Result<types::v2::WorkloadStartResponse> {
     let Some(types::v2::Workload {
         namespace,
@@ -509,27 +555,36 @@ async fn workload_start(
                     "using precompiled component"
                 );
                 let source = match config.compiled_cache_dir.as_deref() {
-                    Some(dir) => match download_cwasm(&component.precompiled_url, dir).await {
-                        Ok(path) => crate::types::Source::PrecompiledFile(path),
-                        Err(e) => {
-                            tracing::error!(
-                                component = %component.name,
-                                url = %component.precompiled_url,
-                                error = %e,
-                                "failed to resolve precompiled component"
-                            );
-                            return Ok(types::v2::WorkloadStartResponse {
-                                workload_status: Some(types::v2::WorkloadStatus {
-                                    workload_id: workload_id.clone(),
-                                    workload_state: types::v2::WorkloadState::Error.into(),
-                                    message: format!(
-                                        "failed to fetch precompiled component from {}: {}",
-                                        component.precompiled_url, e
-                                    ),
-                                }),
-                            });
+                    Some(dir) => {
+                        match download_cwasm(
+                            &component.precompiled_url,
+                            dir,
+                            Some(nats_client),
+                            config.precompiled_fetch_timeout,
+                        )
+                        .await
+                        {
+                            Ok(path) => crate::types::Source::PrecompiledFile(path),
+                            Err(e) => {
+                                tracing::error!(
+                                    component = %component.name,
+                                    url = %component.precompiled_url,
+                                    error = %e,
+                                    "failed to resolve precompiled component"
+                                );
+                                return Ok(types::v2::WorkloadStartResponse {
+                                    workload_status: Some(types::v2::WorkloadStatus {
+                                        workload_id: workload_id.clone(),
+                                        workload_state: types::v2::WorkloadState::Error.into(),
+                                        message: format!(
+                                            "failed to fetch precompiled component from {}: {}",
+                                            component.precompiled_url, e
+                                        ),
+                                    }),
+                                });
+                            }
                         }
-                    },
+                    }
                     None => {
                         tracing::error!(
                             component = %component.name,

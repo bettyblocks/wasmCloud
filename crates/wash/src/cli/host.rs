@@ -198,6 +198,7 @@ impl CliCommand for HostCommand {
             oci_pull_timeout: Some(self.registry_pull_timeout),
             oci_cache_dir: self.oci_cache_dir.clone(),
             compiled_cache_dir: Some(compiled_cache_dir.clone()),
+            ..Default::default()
         };
 
         let mut engine_builder = Engine::builder()
