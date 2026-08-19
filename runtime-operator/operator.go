@@ -5,6 +5,7 @@ package runtime_operator
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -50,6 +51,11 @@ type EmbeddedOperatorConfig struct {
 	// window between a precompile Job writing an object and the operator
 	// recording it in Artifact status.
 	PrecompileGCGracePeriod time.Duration
+	// PrecompileArtifactReplicas is the JetStream replica count for the
+	// precompiled-artifacts object store bucket. Only takes effect when the
+	// bucket doesn't already exist — the precompile Worker attaches to
+	// (rather than reconfigures) an existing bucket's replica count.
+	PrecompileArtifactReplicas uint
 	// Namespace is the namespace the operator itself runs in. Every Host
 	// CRD is created here regardless of where the underlying host pod
 	// runs; tenant attribution is carried on the Host's Environment
@@ -113,6 +119,7 @@ func NewEmbeddedOperator(
 				BaseURL: cfg.PrecompileArtifactBaseURL,
 				Env: []corev1.EnvVar{
 					{Name: "NATS_URL", Value: cfg.NatsURL},
+					{Name: "OBJECT_STORE_REPLICAS", Value: strconv.FormatUint(uint64(cfg.PrecompileArtifactReplicas), 10)},
 				},
 			},
 			Target:             cfg.PrecompileTarget,

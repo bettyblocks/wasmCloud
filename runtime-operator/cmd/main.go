@@ -90,6 +90,7 @@ func main() {
 		precompileInsecureRegistries string
 		precompileGCInterval         time.Duration
 		precompileGCGracePeriod      time.Duration
+		precompileArtifactReplicas   uint
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
@@ -157,6 +158,13 @@ func main() {
 		"precompile-insecure-registries",
 		"",
 		"Comma-separated registries the precompile Worker may pull from over plain HTTP.",
+	)
+	flag.UintVar(
+		&precompileArtifactReplicas,
+		"precompile-artifact-replicas",
+		1,
+		"JetStream replica count for the precompiled-artifacts object store bucket. "+
+			"Only takes effect when the bucket doesn't already exist.",
 	)
 	flag.DurationVar(
 		&precompileGCInterval,
@@ -242,6 +250,7 @@ func main() {
 		PrecompileInsecureRegistries: precompileInsecureRegistries,
 		PrecompileGCInterval:         precompileGCInterval,
 		PrecompileGCGracePeriod:      precompileGCGracePeriod,
+		PrecompileArtifactReplicas:   precompileArtifactReplicas,
 	}
 
 	if natsCreds != "" {
