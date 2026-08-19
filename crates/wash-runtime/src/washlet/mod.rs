@@ -361,10 +361,25 @@ pub async fn run_cluster_host(
                         let response = handle_command(host.as_ref(), &msg, host.config(), &nats_client).await;
                         match response {
                             Ok(resp_bytes) => {
-                                if let Some(reply_to) = msg.reply
-                                    && let Err(e) = nats_client.publish(reply_to, resp_bytes.into()).await
-                                {
-                                    error!("failed to publish API response: {e}");
+                                if let Some(reply_to) = msg.reply {
+                                    // Bounded: publish() can block indefinitely on a
+                                    // degraded NATS server (internal channel/socket
+                                    // backpressure) — a hang here leaks this command's
+                                    // semaphore permit forever even though its actual
+                                    // work already finished successfully.
+                                    let publish_future = nats_client.publish(reply_to, resp_bytes.into());
+                                    match host.config().command_reply_timeout {
+                                        Some(timeout) => match tokio::time::timeout(timeout, publish_future).await {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(e)) => error!("failed to publish API response: {e}"),
+                                            Err(_) => error!("timed out publishing API response after {timeout:?}"),
+                                        },
+                                        None => {
+                                            if let Err(e) = publish_future.await {
+                                                error!("failed to publish API response: {e}");
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {

@@ -963,6 +963,13 @@ pub struct HostConfig {
     /// Bound on a workload's plugin bind/unbind calls (e.g. cancellation-broker's
     /// JetStream KV setup), which can hang on a degraded JetStream API.
     pub plugin_lifecycle_timeout: Option<Duration>,
+    /// Bound on publishing a command's reply back to NATS. A degraded NATS server can
+    /// leave this pending indefinitely (internal channel/socket backpressure), which —
+    /// unlike a hang inside command handling itself — sits after everything else this
+    /// command does, so no other timeout in the handling path catches it. Without a
+    /// bound here the command's semaphore permit leaks forever even though the work it
+    /// gated already finished.
+    pub command_reply_timeout: Option<Duration>,
 }
 
 impl Default for HostConfig {
@@ -974,6 +981,7 @@ impl Default for HostConfig {
             compiled_cache_dir: None,
             precompiled_fetch_timeout: Duration::from_secs(30).into(),
             plugin_lifecycle_timeout: Duration::from_secs(30).into(),
+            command_reply_timeout: Duration::from_secs(30).into(),
         }
     }
 }
