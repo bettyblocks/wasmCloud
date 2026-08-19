@@ -344,11 +344,20 @@ pub async fn run_cluster_host(
                     let host = host.clone();
                     let nats_client = nats_client.clone();
                     let command_semaphore = command_semaphore.clone();
+                    // Heartbeat skips semaphore: gating it same as start/stop lets a burst
+                    // of slow workload cmds starve it, operator sees host as dead.
+                    let is_heartbeat = msg.subject.split('.').nth(3) == Some("heartbeat");
                     tokio::spawn(async move {
-                        let _permit = command_semaphore
-                            .acquire_owned()
-                            .await
-                            .expect("command semaphore should never be closed");
+                        let _permit = if is_heartbeat {
+                            None
+                        } else {
+                            Some(
+                                command_semaphore
+                                    .acquire_owned()
+                                    .await
+                                    .expect("command semaphore should never be closed"),
+                            )
+                        };
                         let response = handle_command(host.as_ref(), &msg, host.config(), &nats_client).await;
                         match response {
                             Ok(resp_bytes) => {
