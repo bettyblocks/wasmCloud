@@ -344,9 +344,11 @@ pub async fn run_cluster_host(
                     let host = host.clone();
                     let nats_client = nats_client.clone();
                     let command_semaphore = command_semaphore.clone();
+                    let command = msg.subject.split('.').skip(3).collect::<Vec<_>>().join(".");
+
                     // Heartbeat skips semaphore: gating it same as start/stop lets a burst
                     // of slow workload cmds starve it, operator sees host as dead.
-                    let is_heartbeat = msg.subject.split('.').nth(3) == Some("heartbeat");
+                    let is_heartbeat = command == "heartbeat";
                     tokio::spawn(async move {
                         let _permit = if is_heartbeat {
                             None
@@ -358,7 +360,8 @@ pub async fn run_cluster_host(
                                     .expect("command semaphore should never be closed"),
                             )
                         };
-                        let response = handle_command(host.as_ref(), &msg, host.config(), &nats_client).await;
+
+                        let response = handle_command(host.as_ref(), &msg, &command, host.config(), &nats_client).await;
                         match response {
                             Ok(resp_bytes) => {
                                 if let Some(reply_to) = msg.reply {
@@ -474,14 +477,13 @@ fn from_api<'de, T: serde::Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, anyh
 async fn handle_command(
     host: &impl HostApi,
     msg: &async_nats::Message,
+    command: &str,
     config: &HostConfig,
     nats_client: &async_nats::Client,
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let command = msg.subject.split('.').skip(3).collect::<Vec<_>>().join(".");
-
     let payload = &msg.payload;
 
-    match command.as_str() {
+    match command {
         "heartbeat" => {
             let res = host_heartbeat(host).await?;
             to_api(&res)
