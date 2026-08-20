@@ -22,7 +22,6 @@ import (
 	"flag"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -91,6 +90,7 @@ func main() {
 		precompileInsecureRegistries string
 		precompileGCInterval         time.Duration
 		precompileGCGracePeriod      time.Duration
+		precompileArtifactReplicas   uint
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
@@ -159,6 +159,13 @@ func main() {
 		"",
 		"Comma-separated registries the precompile Worker may pull from over plain HTTP.",
 	)
+	flag.UintVar(
+		&precompileArtifactReplicas,
+		"precompile-artifact-replicas",
+		1,
+		"JetStream replica count for the precompiled-artifacts object store bucket. "+
+			"Only takes effect when the bucket doesn't already exist.",
+	)
 	flag.DurationVar(
 		&precompileGCInterval,
 		"precompile-gc-interval",
@@ -224,19 +231,6 @@ func main() {
 	if operatorNamespace == "" {
 		setupLog.Error(errors.New("OPERATOR_NAMESPACE is unset"), "missing required configuration")
 		os.Exit(1)
-	}
-
-	// PRECOMPILE_ARTIFACT_REPLICAS is an env var (not a flag) so it can be
-	// tuned without touching the operator's arg list. Defaults to 1,
-	// matching the JetStream server default.
-	precompileArtifactReplicas := uint(1)
-	if v := os.Getenv("PRECOMPILE_ARTIFACT_REPLICAS"); v != "" {
-		parsed, err := strconv.ParseUint(v, 10, 0)
-		if err != nil {
-			setupLog.Error(err, "invalid PRECOMPILE_ARTIFACT_REPLICAS", "value", v)
-			os.Exit(1)
-		}
-		precompileArtifactReplicas = uint(parsed)
 	}
 
 	operatorCfg := runtime_operator.EmbeddedOperatorConfig{
