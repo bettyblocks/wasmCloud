@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
@@ -44,6 +46,10 @@ type WorkloadDeploymentReconciler struct {
 	// is off — artifact:// references resolve to OCI URLs directly.
 	PrecompileTarget          string
 	PrecompileWasmtimeVersion string
+
+	// MaxConcurrentReconciles bounds how many WorkloadDeployments this
+	// controller reconciles at once. Defaults to 1 when unset.
+	MaxConcurrentReconciles int
 
 	reconciler condition.AnyConditionedReconciler
 }
@@ -335,6 +341,7 @@ func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Owns(&runtimev1alpha1.WorkloadReplicaSet{}).
 		Watches(&runtimev1alpha1.Artifact{}, handler.EnqueueRequestsFromMapFunc(r.getAffectedWorkloads)).
 		Named("workload-deployment").
+		WithOptions(controller.Options{MaxConcurrentReconciles: cmp.Or(r.MaxConcurrentReconciles, 1)}).
 		Complete(r)
 }
 

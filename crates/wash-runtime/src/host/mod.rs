@@ -964,11 +964,7 @@ pub struct HostConfig {
     /// JetStream KV setup), which can hang on a degraded JetStream API.
     pub plugin_lifecycle_timeout: Option<Duration>,
     /// Bound on publishing a command's reply back to NATS. A degraded NATS server can
-    /// leave this pending indefinitely (internal channel/socket backpressure), which —
-    /// unlike a hang inside command handling itself — sits after everything else this
-    /// command does, so no other timeout in the handling path catches it. Without a
-    /// bound here the command's semaphore permit leaks forever even though the work it
-    /// gated already finished.
+    /// leave the publish pending indefinitely (internal channel/socket backpressure).
     pub command_reply_timeout: Option<Duration>,
 }
 

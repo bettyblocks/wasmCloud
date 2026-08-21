@@ -91,6 +91,8 @@ func main() {
 		precompileGCInterval         time.Duration
 		precompileGCGracePeriod      time.Duration
 		precompileArtifactReplicas   uint
+		workloadConcurrency          int
+		heartbeatTTL                 time.Duration
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
@@ -180,6 +182,20 @@ func main() {
 			"delete it (guards the window between a Job writing an object and the "+
 			"operator recording it in Artifact status).",
 	)
+	flag.IntVar(
+		&workloadConcurrency,
+		"workload-concurrency",
+		10,
+		"How many Workloads, WorkloadDeployments, and Hosts each controller reconciles "+
+			"at once.",
+	)
+	flag.DurationVar(
+		&heartbeatTTL,
+		"heartbeat-ttl",
+		3*time.Minute,
+		"How long a Host may go without a processed heartbeat before it's considered "+
+			"unreachable and deleted (which also deletes every Workload assigned to it). ",
+	)
 	flag.StringVar(
 		&watchNamespaces,
 		"watch-namespaces",
@@ -236,7 +252,7 @@ func main() {
 	operatorCfg := runtime_operator.EmbeddedOperatorConfig{
 		DisableArtifactController:    disableArtifactController,
 		NatsURL:                      natsUrl,
-		HeartbeatTTL:                 60 * time.Second,
+		HeartbeatTTL:                 heartbeatTTL,
 		HostCPUThreshold:             cpuBackpressureThreshold,
 		HostMemoryThreshold:          memoryBackpressureThreshold,
 		Namespace:                    operatorNamespace,
@@ -251,6 +267,7 @@ func main() {
 		PrecompileGCInterval:         precompileGCInterval,
 		PrecompileGCGracePeriod:      precompileGCGracePeriod,
 		PrecompileArtifactReplicas:   precompileArtifactReplicas,
+		WorkloadConcurrency:          workloadConcurrency,
 	}
 
 	if natsCreds != "" {
