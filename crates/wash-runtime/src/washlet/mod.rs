@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::fetch_precompiled::download_cwasm;
+use crate::health::HeartbeatHealth;
 use crate::host::{Host, HostApi, HostConfig};
 use crate::oci::{self, OciConfig};
 use crate::plugin::HostPlugin;
@@ -14,7 +15,7 @@ use tracing::{debug, error, info, instrument};
 
 pub const HOST_API_PREFIX: &str = "runtime.host";
 pub const OPERATOR_API_PREFIX: &str = "runtime.operator";
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// Default cap on commands (workload start/stop/status) processed concurrently by a
 /// single host. Commands are spawned onto their own tasks so one slow command can't
 /// block the rest, but spawning is otherwise unbounded — a burst of restarts can queue
@@ -48,6 +49,7 @@ pub struct ClusterHostBuilder {
     compiled_cleanup_grace: Option<Duration>,
     host_config: Option<HostConfig>,
     max_concurrent_commands: Option<usize>,
+    heartbeat_health: Option<Arc<HeartbeatHealth>>,
 }
 
 impl ClusterHostBuilder {
@@ -146,6 +148,16 @@ impl ClusterHostBuilder {
         self
     }
 
+    /// Shares heartbeat liveness state with an external consumer (e.g. the
+    /// HTTP server's `/healthz` route). Must be the same instance passed to
+    /// that consumer, since it's how a wedged heartbeat loop becomes
+    /// observable outside this NATS-only task. Defaults to a fresh instance
+    /// when unset — still correct, just not visible anywhere else.
+    pub fn with_heartbeat_health(mut self, health: Arc<HeartbeatHealth>) -> Self {
+        self.heartbeat_health = Some(health);
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<ClusterHost> {
         let Some(nats_client) = self.nats_client else {
             anyhow::bail!("nats_client is required");
@@ -171,11 +183,18 @@ impl ClusterHostBuilder {
         }
 
         let heartbeat_interval = self.heartbeat_interval.unwrap_or(HEARTBEAT_INTERVAL);
+        // Generous multiple of the interval: avoids flapping unhealthy on a
+        // single slow tick while still catching a genuinely wedged loop
+        // well before the operator's own (minutes-long) eviction timeout.
+        let heartbeat_health = self
+            .heartbeat_health
+            .unwrap_or_else(|| Arc::new(HeartbeatHealth::new(heartbeat_interval * 3)));
         let host = builder.build()?;
         Ok(ClusterHost {
             prepared_host: host,
             nats_client,
             heartbeat_interval,
+            heartbeat_health,
             cleanup_interval: self.cleanup_interval.unwrap_or(Duration::from_secs(300)),
             cleanup_age: self.cleanup_age.unwrap_or(Duration::from_secs(3600)),
             compiled_cleanup_interval: self
@@ -195,6 +214,7 @@ pub struct ClusterHost {
     prepared_host: Host,
     nats_client: Arc<async_nats::Client>,
     heartbeat_interval: Duration,
+    heartbeat_health: Arc<HeartbeatHealth>,
     cleanup_interval: Duration,
     cleanup_age: Duration,
     compiled_cleanup_interval: Duration,
@@ -205,6 +225,10 @@ pub struct ClusterHost {
 impl ClusterHost {
     pub fn host(&self) -> &Host {
         &self.prepared_host
+    }
+
+    pub fn heartbeat_health(&self) -> Arc<HeartbeatHealth> {
+        self.heartbeat_health.clone()
     }
 }
 
@@ -220,6 +244,7 @@ pub async fn run_cluster_host(
         .context("failed to start host")?;
 
     let heartbeat_interval = cluster_host.heartbeat_interval;
+    let heartbeat_health = cluster_host.heartbeat_health;
     let cleanup_interval = cluster_host.cleanup_interval;
     let compiled_cleanup_interval = cluster_host.compiled_cleanup_interval;
     let compiled_cleanup_grace = cluster_host.compiled_cleanup_grace;
@@ -254,6 +279,7 @@ pub async fn run_cluster_host(
         let heartbeat_task = tokio::spawn({
             let host = host.clone();
             let nats_client = nats_client.clone();
+            let heartbeat_health = heartbeat_health.clone();
             async move {
                 let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
                 loop {
@@ -268,11 +294,18 @@ pub async fn run_cluster_host(
                     };
                     match serde_json::to_vec(&heartbeat) {
                         Ok(bytes) => {
-                            if let Err(e) = nats_client
+                            match nats_client
                                 .publish(heartbeat_subject.clone(), bytes.into())
                                 .await
                             {
-                                error!("failed to publish heartbeat: {e}");
+                                // Only a completed publish counts: this is the
+                                // signal /healthz relies on to catch a wedged
+                                // command loop, so a hung publish (degraded
+                                // NATS) must leave it stale rather than get
+                                // marked healthy just because this task is
+                                // still scheduled.
+                                Ok(()) => heartbeat_health.record_success(),
+                                Err(e) => error!("failed to publish heartbeat: {e}"),
                             }
                         }
                         Err(e) => error!("failed to serialize heartbeat: {e}"),

@@ -2,6 +2,7 @@
 
 pub mod engine;
 pub mod fetch_precompiled;
+pub mod health;
 pub mod host;
 pub mod observability;
 pub mod plugin;

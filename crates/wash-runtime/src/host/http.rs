@@ -26,6 +26,7 @@ use std::{
     time::Duration,
 };
 
+use crate::health::HeartbeatHealth;
 use crate::host::allowed_hosts::AllowedHost;
 use crate::wit::WitInterface;
 use crate::{engine::ctx::SharedCtx, observability::Meters};
@@ -598,6 +599,9 @@ pub struct HttpServer<T: Router, O: OutgoingHandler = DefaultOutgoingHandler> {
     tls_acceptor: Option<TlsAcceptor>,
     listener: Arc<tokio::sync::Mutex<Option<TcpListener>>>,
     meters: RwLock<Meters>,
+    /// Backs `GET /healthz`. `None` means no heartbeat health was wired up
+    /// (e.g. tests), in which case `/healthz` always reports OK.
+    health: Option<Arc<HeartbeatHealth>>,
 }
 
 impl<T: Router, O: OutgoingHandler> std::fmt::Debug for HttpServer<T, O> {
@@ -662,6 +666,7 @@ pub struct HttpServerBuilder<T: Router, O: OutgoingHandler = DefaultOutgoingHand
     outgoing_handler: O,
     addr: SocketAddr,
     tls: Option<TlsConfig>,
+    health: Option<Arc<HeartbeatHealth>>,
 }
 
 impl<T: Router> HttpServerBuilder<T, DefaultOutgoingHandler> {
@@ -671,6 +676,7 @@ impl<T: Router> HttpServerBuilder<T, DefaultOutgoingHandler> {
             outgoing_handler: DefaultOutgoingHandler,
             addr,
             tls: None,
+            health: None,
         }
     }
 }
@@ -684,12 +690,21 @@ impl<T: Router, O: OutgoingHandler> HttpServerBuilder<T, O> {
             outgoing_handler: handler,
             addr: self.addr,
             tls: self.tls,
+            health: self.health,
         }
     }
 
     /// Enable TLS using the given [`TlsConfig`].
     pub fn tls(mut self, tls: TlsConfig) -> Self {
         self.tls = Some(tls);
+        self
+    }
+
+    /// Wire up heartbeat health so `GET /healthz` reflects whether this
+    /// host's own NATS heartbeat loop is still making progress, instead of
+    /// just whether this listener accepts TCP connections.
+    pub fn health(mut self, health: Arc<HeartbeatHealth>) -> Self {
+        self.health = Some(health);
         self
     }
 
@@ -717,6 +732,7 @@ impl<T: Router, O: OutgoingHandler> HttpServerBuilder<T, O> {
             tls_acceptor,
             listener: Arc::new(tokio::sync::Mutex::new(Some(listener))),
             meters: Default::default(),
+            health: self.health,
         })
     }
 }
@@ -757,6 +773,7 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
         let shutdown_tx_clone = self.shutdown_tx.clone();
         let workload_handles = self.workload_handles.clone();
         let tls_acceptor = self.tls_acceptor.clone();
+        let health = self.health.clone();
 
         // Store the shutdown sender
         *shutdown_tx_clone.write().await = Some(shutdown_tx);
@@ -785,6 +802,7 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
                 &mut shutdown_rx,
                 tls_acceptor,
                 fuel_meter,
+                health,
             )
             .await
             {
@@ -920,6 +938,7 @@ async fn run_http_server<T: Router>(
     shutdown_rx: &mut mpsc::Receiver<()>,
     tls_acceptor: Option<TlsAcceptor>,
     fuel_meter: FuelConsumptionMeter,
+    health: Option<Arc<HeartbeatHealth>>,
 ) -> anyhow::Result<()> {
     loop {
         tokio::select! {
@@ -938,17 +957,19 @@ async fn run_http_server<T: Router>(
                         let tls_acceptor_clone = tls_acceptor.clone();
                         let handler_clone = handler.clone();
                         let fuel_meter = fuel_meter.clone();
+                        let health_clone = health.clone();
                         tokio::spawn(async move {
                             let service = hyper::service::service_fn(move |req| {
                                 let handles = handles_clone.clone();
                                 let handler = handler_clone.clone();
                                 let fuel_meter = fuel_meter.clone();
+                                let health = health_clone.clone();
                                 async move {
                                     let extractor = opentelemetry_http::HeaderExtractor(req.headers());
                                     let remote_context =
                                         opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&extractor));
 
-                                    handle_http_request(handler, req, handles, fuel_meter).with_context(remote_context).await
+                                    handle_http_request(handler, req, handles, fuel_meter, health).with_context(remote_context).await
                                 }
                             });
 
@@ -1085,9 +1106,34 @@ async fn handle_http_request<T: Router>(
     req: hyper::Request<hyper::body::Incoming>,
     workload_handles: WorkloadHandles,
     fuel_meter: FuelConsumptionMeter,
+    health: Option<Arc<HeartbeatHealth>>,
 ) -> Result<hyper::Response<HyperOutgoingBody>, hyper::Error> {
     let trace_id = new_trace_id();
     tracing::Span::current().record("trace_id", tracing::field::display(&trace_id));
+
+    // Fixed route, checked ahead of workload routing: reflects the host's
+    // own NATS heartbeat liveness rather than just this listener's TCP
+    // accept, so kubelet can detect a wedged command loop and restart the
+    // container instead of relying solely on the operator's Host eviction
+    // (which only removes the CRD, not the stuck pod).
+    if req.uri().path() == "/healthz" {
+        let healthy = health.as_deref().is_none_or(HeartbeatHealth::is_healthy);
+        let mut builder = hyper::Response::builder()
+            .status(if healthy { 200 } else { 503 })
+            .header(TRACE_ID_HEADER, &trace_id);
+        // Raw, monotonically-increasing timestamp (not just the pass/fail
+        // status) so a stuck value can be spotted across repeated polls
+        // when debugging a wedge after the fact.
+        if let Some(h) = &health {
+            builder = builder.header("x-heartbeat-unix-secs", h.last_success_unix_secs());
+        }
+        #[allow(clippy::expect_used)]
+        let resp = builder
+            .body(HyperOutgoingBody::default())
+            .expect("building HTTP response with valid status code should never fail");
+        record_response_status(&resp);
+        return Ok(resp);
+    }
 
     let method = req.method().clone();
     let uri = req.uri().clone();

@@ -5,6 +5,7 @@ use clap::Args;
 use tracing::info;
 use wash_runtime::{
     engine::{Engine, WasmProposal},
+    health::HeartbeatHealth,
     observability::Meters,
     plugin::{self},
 };
@@ -213,10 +214,18 @@ impl CliCommand for HostCommand {
         }
         let engine = engine_builder.build()?;
 
+        // Shared with the HTTP server's `/healthz` route below (when
+        // --http-addr is set) so kubelet can see a wedged heartbeat loop
+        // instead of just this listener's TCP accept.
+        let heartbeat_health = Arc::new(HeartbeatHealth::new(
+            wash_runtime::washlet::HEARTBEAT_INTERVAL * 3,
+        ));
+
         let mut cluster_host_builder = wash_runtime::washlet::ClusterHostBuilder::default()
             .with_engine(engine)
             .with_host_config(host_config)
             .with_nats_client(Arc::new(scheduler_nats_client))
+            .with_heartbeat_health(heartbeat_health.clone())
             .with_host_group(self.host_group.clone())
             .with_plugin(Arc::new(
                 plugin::wasi_config::DynamicConfig::builder()
@@ -297,17 +306,17 @@ impl CliCommand for HostCommand {
 
         if let Some(addr) = self.http_addr {
             let http_router = wash_runtime::host::http::DynamicRouter::default();
-            let http_server = if let (Some(cert_path), Some(key_path)) =
-                (&self.tls_cert_path, &self.tls_key_path)
-            {
+            let mut http_server_builder =
+                wash_runtime::host::http::HttpServer::builder(http_router, addr)
+                    .health(heartbeat_health.clone());
+            if let (Some(cert_path), Some(key_path)) = (&self.tls_cert_path, &self.tls_key_path) {
                 let mut tls = wash_runtime::host::http::TlsConfig::new(cert_path, key_path);
                 if let Some(ca) = self.tls_ca_path.as_deref() {
                     tls = tls.with_ca(ca);
                 }
-                wash_runtime::host::http::HttpServer::new_with_tls(http_router, addr, tls).await?
-            } else {
-                wash_runtime::host::http::HttpServer::new(http_router, addr).await?
-            };
+                http_server_builder = http_server_builder.tls(tls);
+            }
+            let http_server = http_server_builder.build().await?;
             cluster_host_builder = cluster_host_builder.with_http_handler(Arc::new(http_server));
         }
 
