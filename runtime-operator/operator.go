@@ -5,6 +5,7 @@ package runtime_operator
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -50,6 +51,11 @@ type EmbeddedOperatorConfig struct {
 	// window between a precompile Job writing an object and the operator
 	// recording it in Artifact status.
 	PrecompileGCGracePeriod time.Duration
+	// PrecompileArtifactReplicas is the JetStream replica count for the
+	// precompiled-artifacts object store bucket. Only takes effect when the
+	// bucket doesn't already exist — the precompile Worker attaches to
+	// (rather than reconfigures) an existing bucket's replica count.
+	PrecompileArtifactReplicas uint
 	// Namespace is the namespace the operator itself runs in. Every Host
 	// CRD is created here regardless of where the underlying host pod
 	// runs; tenant attribution is carried on the Host's Environment
@@ -67,6 +73,9 @@ type EmbeddedOperatorConfig struct {
 	// is locked to the workload's own namespace and any non-matching
 	// Environment is rejected with a Warning Event.
 	AllowSharedHosts bool
+	// WorkloadConcurrency bounds how many Workloads, WorkloadDeployments,
+	// and Hosts are reconciled at once. Defaults to 1 when zero.
+	WorkloadConcurrency int
 }
 
 // EmbeddedOperator is the main struct for the embedded operator.
@@ -87,6 +96,11 @@ func NewEmbeddedOperator(
 	// namespaced Role for Host CRUD binds there.
 	if cfg.Namespace == "" {
 		return nil, errors.New("EmbeddedOperatorConfig.Namespace is required")
+	}
+	// A replica count of 0 would ask the precompile Worker to create the
+	// precompiled-artifacts bucket with zero copies of the data.
+	if !cfg.DisablePrecompileController && cfg.PrecompileArtifactReplicas == 0 {
+		return nil, errors.New("EmbeddedOperatorConfig.PrecompileArtifactReplicas must be at least 1")
 	}
 
 	nc, err := wasmbus.NatsConnect(cfg.NatsURL, cfg.NatsOptions...)
@@ -113,6 +127,7 @@ func NewEmbeddedOperator(
 				BaseURL: cfg.PrecompileArtifactBaseURL,
 				Env: []corev1.EnvVar{
 					{Name: "NATS_URL", Value: cfg.NatsURL},
+					{Name: "OBJECT_STORE_REPLICAS", Value: strconv.FormatUint(uint64(cfg.PrecompileArtifactReplicas), 10)},
 				},
 			},
 			Target:             cfg.PrecompileTarget,
@@ -134,13 +149,14 @@ func NewEmbeddedOperator(
 	}
 
 	if err = (&runtime_controllers.HostReconciler{
-		Client:             mgr.GetClient(),
-		Scheme:             mgr.GetScheme(),
-		Bus:                bus,
-		UnreachableTimeout: cfg.HeartbeatTTL,
-		CPUThreshold:       cfg.HostCPUThreshold,
-		MemoryThreshold:    cfg.HostMemoryThreshold,
-		OperatorNamespace:  cfg.Namespace,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Bus:                     bus,
+		UnreachableTimeout:      cfg.HeartbeatTTL,
+		CPUThreshold:            cfg.HostCPUThreshold,
+		MemoryThreshold:         cfg.HostMemoryThreshold,
+		OperatorNamespace:       cfg.Namespace,
+		MaxConcurrentReconciles: cfg.WorkloadConcurrency,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
 	}
@@ -154,12 +170,13 @@ func NewEmbeddedOperator(
 	}
 
 	if err = (&runtime_controllers.WorkloadReconciler{
-		Client:            mgr.GetClient(),
-		Scheme:            mgr.GetScheme(),
-		Bus:               bus,
-		Recorder:          mgr.GetEventRecorder("workload-controller"),
-		OperatorNamespace: cfg.Namespace,
-		AllowSharedHosts:  cfg.AllowSharedHosts,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Bus:                     bus,
+		Recorder:                mgr.GetEventRecorder("workload-controller"),
+		OperatorNamespace:       cfg.Namespace,
+		AllowSharedHosts:        cfg.AllowSharedHosts,
+		MaxConcurrentReconciles: cfg.WorkloadConcurrency,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
 	}
@@ -176,6 +193,7 @@ func NewEmbeddedOperator(
 		Scheme:                    mgr.GetScheme(),
 		PrecompileTarget:          cfg.PrecompileTarget,
 		PrecompileWasmtimeVersion: cfg.PrecompileWasmtimeVersion,
+		MaxConcurrentReconciles:   cfg.WorkloadConcurrency,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
 	}

@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use names::{Generator, Name};
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, trace, warn};
@@ -551,9 +551,18 @@ impl Host {
             .engine
             .initialize_workload(&request.workload_id, request.workload)?;
 
-        let mut resolved_workload = unresolved_workload
-            .resolve(Some(&self.plugins), self.http_handler.clone())
-            .await?;
+        // Bounded: resolve() makes remote plugin calls that can hang on a degraded
+        // JetStream API, wedging this start and every command queued behind it.
+        let resolve_future =
+            unresolved_workload.resolve(Some(&self.plugins), self.http_handler.clone());
+        let mut resolved_workload = match self.config.plugin_lifecycle_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, resolve_future)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow!("timed out resolving workload after {timeout:?}"))
+                })?,
+            None => resolve_future.await?,
+        };
 
         // If the service didn't run and we had one, warn
         if service_present && resolved_workload.execute_service().await?.is_none() {
@@ -877,8 +886,19 @@ impl HostApi for Host {
                 // Stop the service if running
                 resolved_workload.stop_service();
 
-                // Unbind all plugins from the workload
-                if let Err(e) = resolved_workload.unbind_all_plugins().await {
+                // Bounded: unbind can make remote calls that hang on a degraded
+                // JetStream API, wedging this stop and every command queued behind it.
+                let unbind_result = match self.config.plugin_lifecycle_timeout {
+                    Some(timeout) => {
+                        tokio::time::timeout(timeout, resolved_workload.unbind_all_plugins())
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(anyhow!("timed out unbinding plugins after {timeout:?}"))
+                            })
+                    }
+                    None => resolved_workload.unbind_all_plugins().await,
+                };
+                if let Err(e) = unbind_result {
                     warn!(
                         workload_id = request.workload_id,
                         error = ?e,
@@ -940,6 +960,12 @@ pub struct HostConfig {
     pub compiled_cache_dir: Option<PathBuf>,
     /// Bound on fetching a single precompiled component.
     pub precompiled_fetch_timeout: Option<Duration>,
+    /// Bound on a workload's plugin bind/unbind calls (e.g. cancellation-broker's
+    /// JetStream KV setup), which can hang on a degraded JetStream API.
+    pub plugin_lifecycle_timeout: Option<Duration>,
+    /// Bound on publishing a command's reply back to NATS. A degraded NATS server can
+    /// leave the publish pending indefinitely (internal channel/socket backpressure).
+    pub command_reply_timeout: Option<Duration>,
 }
 
 impl Default for HostConfig {
@@ -950,6 +976,8 @@ impl Default for HostConfig {
             oci_cache_dir: None,
             compiled_cache_dir: None,
             precompiled_fetch_timeout: Duration::from_secs(30).into(),
+            plugin_lifecycle_timeout: Duration::from_secs(30).into(),
+            command_reply_timeout: Duration::from_secs(30).into(),
         }
     }
 }

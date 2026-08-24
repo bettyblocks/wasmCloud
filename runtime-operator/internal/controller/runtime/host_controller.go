@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
@@ -49,6 +51,11 @@ type HostReconciler struct {
 	// Host object is created here regardless of where the underlying host
 	// pod runs; tenant attribution lives on the Host's Environment field.
 	OperatorNamespace string
+	// MaxConcurrentReconciles bounds how many Hosts this controller
+	// reconciles at once. See WorkloadReconciler.MaxConcurrentReconciles
+	// for why the controller-runtime default of 1 is too low after a
+	// fleet-wide restart. Defaults to 1 when unset.
+	MaxConcurrentReconciles int
 
 	reconciler condition.AnyConditionedReconciler
 }
@@ -222,6 +229,7 @@ func (r *HostReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&runtimev1alpha1.Host{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("workload-host").
+		WithOptions(controller.Options{MaxConcurrentReconciles: cmp.Or(r.MaxConcurrentReconciles, 1)}).
 		Complete(r)
 }
 

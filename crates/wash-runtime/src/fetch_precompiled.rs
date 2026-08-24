@@ -63,9 +63,11 @@ async fn fetch_nats(
     };
 
     match timeout {
-        Some(timeout) => tokio::time::timeout(timeout, fetch).await.with_context(|| {
-            format!("timed out fetching '{key}' from '{bucket}' after {timeout:?}")
-        })?,
+        Some(timeout) => tokio::time::timeout(timeout, fetch)
+            .await
+            .with_context(|| {
+                format!("timed out fetching '{key}' from '{bucket}' after {timeout:?}")
+            })?,
         None => fetch.await,
     }
 }
@@ -260,9 +262,13 @@ mod tests {
 
     #[tokio::test]
     async fn nats_url_without_client_errors() {
-        let err = fetch("nats://precompiled-artifacts/myapp/x86_64.cwasm", None, None)
-            .await
-            .unwrap_err();
+        let err = fetch(
+            "nats://precompiled-artifacts/myapp/x86_64.cwasm",
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("nats client required"));
     }
 }

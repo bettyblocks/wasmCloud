@@ -4,17 +4,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::fetch_precompiled::download_cwasm;
+use crate::health::HeartbeatHealth;
 use crate::host::{Host, HostApi, HostConfig};
 use crate::oci::{self, OciConfig};
 use crate::plugin::HostPlugin;
 use anyhow::{Context as _, anyhow};
 use futures::StreamExt as _;
 use tokio::sync::oneshot;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 pub const HOST_API_PREFIX: &str = "runtime.host";
 pub const OPERATOR_API_PREFIX: &str = "runtime.operator";
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// Default cap on commands (workload start/stop/status) processed concurrently by a
 /// single host. Commands are spawned onto their own tasks so one slow command can't
 /// block the rest, but spawning is otherwise unbounded — a burst of restarts can queue
@@ -48,6 +49,7 @@ pub struct ClusterHostBuilder {
     compiled_cleanup_grace: Option<Duration>,
     host_config: Option<HostConfig>,
     max_concurrent_commands: Option<usize>,
+    heartbeat_health: Option<Arc<HeartbeatHealth>>,
 }
 
 impl ClusterHostBuilder {
@@ -146,6 +148,16 @@ impl ClusterHostBuilder {
         self
     }
 
+    /// Shares heartbeat liveness state with an external consumer (e.g. the
+    /// HTTP server's `/healthz` route). Must be the same instance passed to
+    /// that consumer, since it's how a wedged heartbeat loop becomes
+    /// observable outside this NATS-only task. Defaults to a fresh instance
+    /// when unset — still correct, just not visible anywhere else.
+    pub fn with_heartbeat_health(mut self, health: Arc<HeartbeatHealth>) -> Self {
+        self.heartbeat_health = Some(health);
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<ClusterHost> {
         let Some(nats_client) = self.nats_client else {
             anyhow::bail!("nats_client is required");
@@ -171,11 +183,18 @@ impl ClusterHostBuilder {
         }
 
         let heartbeat_interval = self.heartbeat_interval.unwrap_or(HEARTBEAT_INTERVAL);
+        // Generous multiple of the interval: avoids flapping unhealthy on a
+        // single slow tick while still catching a genuinely wedged loop
+        // well before the operator's own (minutes-long) eviction timeout.
+        let heartbeat_health = self
+            .heartbeat_health
+            .unwrap_or_else(|| Arc::new(HeartbeatHealth::new(heartbeat_interval * 3)));
         let host = builder.build()?;
         Ok(ClusterHost {
             prepared_host: host,
             nats_client,
             heartbeat_interval,
+            heartbeat_health,
             cleanup_interval: self.cleanup_interval.unwrap_or(Duration::from_secs(300)),
             cleanup_age: self.cleanup_age.unwrap_or(Duration::from_secs(3600)),
             compiled_cleanup_interval: self
@@ -195,6 +214,7 @@ pub struct ClusterHost {
     prepared_host: Host,
     nats_client: Arc<async_nats::Client>,
     heartbeat_interval: Duration,
+    heartbeat_health: Arc<HeartbeatHealth>,
     cleanup_interval: Duration,
     cleanup_age: Duration,
     compiled_cleanup_interval: Duration,
@@ -205,6 +225,10 @@ pub struct ClusterHost {
 impl ClusterHost {
     pub fn host(&self) -> &Host {
         &self.prepared_host
+    }
+
+    pub fn heartbeat_health(&self) -> Arc<HeartbeatHealth> {
+        self.heartbeat_health.clone()
     }
 }
 
@@ -220,6 +244,7 @@ pub async fn run_cluster_host(
         .context("failed to start host")?;
 
     let heartbeat_interval = cluster_host.heartbeat_interval;
+    let heartbeat_health = cluster_host.heartbeat_health;
     let cleanup_interval = cluster_host.cleanup_interval;
     let compiled_cleanup_interval = cluster_host.compiled_cleanup_interval;
     let compiled_cleanup_grace = cluster_host.compiled_cleanup_grace;
@@ -254,6 +279,7 @@ pub async fn run_cluster_host(
         let heartbeat_task = tokio::spawn({
             let host = host.clone();
             let nats_client = nats_client.clone();
+            let heartbeat_health = heartbeat_health.clone();
             async move {
                 let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
                 loop {
@@ -268,11 +294,19 @@ pub async fn run_cluster_host(
                     };
                     match serde_json::to_vec(&heartbeat) {
                         Ok(bytes) => {
-                            if let Err(e) = nats_client
+                            match nats_client
                                 .publish(heartbeat_subject.clone(), bytes.into())
                                 .await
                             {
-                                error!("failed to publish heartbeat: {e}");
+                                // Only a completed publish counts: a hung publish
+                                // (degraded NATS) must leave this stale rather than
+                                // get marked healthy just because this task is still
+                                // scheduled. This is one of two signals feeding
+                                // /healthz — the command loop's reply publish
+                                // (below) is the other, catching a wedge here even
+                                // if that separate loop is what actually died.
+                                Ok(()) => heartbeat_health.record_success(),
+                                Err(e) => error!("failed to publish heartbeat: {e}"),
                             }
                         }
                         Err(e) => error!("failed to serialize heartbeat: {e}"),
@@ -344,18 +378,50 @@ pub async fn run_cluster_host(
                     let host = host.clone();
                     let nats_client = nats_client.clone();
                     let command_semaphore = command_semaphore.clone();
+                    let heartbeat_health = heartbeat_health.clone();
+                    let command = msg.subject.split('.').skip(3).collect::<Vec<_>>().join(".");
+
+                    // Heartbeat skips semaphore: gating it same as start/stop lets a burst
+                    // of slow workload cmds starve it, operator sees host as dead.
+                    let is_heartbeat = command == "heartbeat";
                     tokio::spawn(async move {
-                        let _permit = command_semaphore
-                            .acquire_owned()
-                            .await
-                            .expect("command semaphore should never be closed");
-                        let response = handle_command(host.as_ref(), &msg, host.config(), &nats_client).await;
+                        let _permit = if is_heartbeat {
+                            None
+                        } else {
+                            Some(
+                                command_semaphore
+                                    .acquire_owned()
+                                    .await
+                                    .expect("command semaphore should never be closed"),
+                            )
+                        };
+
+                        let response = handle_command(host.as_ref(), &msg, &command, host.config(), &nats_client).await;
                         match response {
                             Ok(resp_bytes) => {
-                                if let Some(reply_to) = msg.reply
-                                    && let Err(e) = nats_client.publish(reply_to, resp_bytes.into()).await
-                                {
-                                    error!("failed to publish API response: {e}");
+                                if let Some(reply_to) = msg.reply {
+                                    // Bounded: publish() can block indefinitely on a
+                                    // degraded NATS server (internal channel/socket
+                                    // backpressure) — a hang here leaks this command's
+                                    // semaphore permit forever even though its actual
+                                    // work already finished successfully.
+                                    let publish_future = nats_client.publish(reply_to, resp_bytes.into());
+                                    // A completed reply proves the full round trip the operator
+                                    // actually relies on (received, handled, replied) — a
+                                    // stronger signal than the self-push heartbeat task alone,
+                                    // which uses its own separate publish and would keep ticking
+                                    // even if this command loop's replies stopped landing.
+                                    match host.config().command_reply_timeout {
+                                        Some(timeout) => match tokio::time::timeout(timeout, publish_future).await {
+                                            Ok(Ok(())) => heartbeat_health.record_success(),
+                                            Ok(Err(e)) => error!("failed to publish API response: {e}"),
+                                            Err(_) => error!("timed out publishing API response after {timeout:?}"),
+                                        },
+                                        None => match publish_future.await {
+                                            Ok(()) => heartbeat_health.record_success(),
+                                            Err(e) => error!("failed to publish API response: {e}"),
+                                        },
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -401,7 +467,24 @@ pub async fn connect_nats(
     addr: impl async_nats::ToServerAddrs,
     options: NatsConnectionOptions,
 ) -> Result<async_nats::Client, anyhow::Error> {
-    let mut opts = async_nats::ConnectOptions::new();
+    let mut opts = async_nats::ConnectOptions::new()
+        // Default is 60s: a connection that's gone silent without erroring the
+        // socket can sit undetected that long before the client even attempts
+        // to reconnect. Reconnection itself is already unlimited-retry by default;
+        // this only shortens how long it takes to notice.
+        .ping_interval(Duration::from_secs(15))
+        .event_callback(|event| async move {
+            match event {
+                async_nats::Event::Connected => info!("NATS connection established"),
+                async_nats::Event::Disconnected
+                | async_nats::Event::SlowConsumer(_)
+                | async_nats::Event::ServerError(_)
+                | async_nats::Event::ClientError(_) => {
+                    warn!(event = %event, "NATS connection event")
+                }
+                other => info!(event = %other, "NATS connection event"),
+            }
+        });
 
     if let Some(timeout) = options.request_timeout {
         opts = opts.request_timeout(Some(timeout));
@@ -450,14 +533,13 @@ fn from_api<'de, T: serde::Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, anyh
 async fn handle_command(
     host: &impl HostApi,
     msg: &async_nats::Message,
+    command: &str,
     config: &HostConfig,
     nats_client: &async_nats::Client,
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let command = msg.subject.split('.').skip(3).collect::<Vec<_>>().join(".");
-
     let payload = &msg.payload;
 
-    match command.as_str() {
+    match command {
         "heartbeat" => {
             let res = host_heartbeat(host).await?;
             to_api(&res)
