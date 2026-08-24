@@ -11,7 +11,7 @@ use crate::plugin::HostPlugin;
 use anyhow::{Context as _, anyhow};
 use futures::StreamExt as _;
 use tokio::sync::oneshot;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 pub const HOST_API_PREFIX: &str = "runtime.host";
 pub const OPERATOR_API_PREFIX: &str = "runtime.operator";
@@ -467,7 +467,24 @@ pub async fn connect_nats(
     addr: impl async_nats::ToServerAddrs,
     options: NatsConnectionOptions,
 ) -> Result<async_nats::Client, anyhow::Error> {
-    let mut opts = async_nats::ConnectOptions::new();
+    let mut opts = async_nats::ConnectOptions::new()
+        // Default is 60s: a connection that's gone silent without erroring the
+        // socket can sit undetected that long before the client even attempts
+        // to reconnect. Reconnection itself is already unlimited-retry by default;
+        // this only shortens how long it takes to notice.
+        .ping_interval(Duration::from_secs(15))
+        .event_callback(|event| async move {
+            match event {
+                async_nats::Event::Connected => info!("NATS connection established"),
+                async_nats::Event::Disconnected
+                | async_nats::Event::SlowConsumer(_)
+                | async_nats::Event::ServerError(_)
+                | async_nats::Event::ClientError(_) => {
+                    warn!(event = %event, "NATS connection event")
+                }
+                other => info!(event = %other, "NATS connection event"),
+            }
+        });
 
     if let Some(timeout) = options.request_timeout {
         opts = opts.request_timeout(Some(timeout));
