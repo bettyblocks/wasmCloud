@@ -29,7 +29,7 @@ async fn workload_starts_with_file_backed_precompiled_component() -> Result<()> 
     let cache_dir = tempfile::tempdir()?;
     let url = format!("nats://{bucket}/{key}");
     set_nats_url(&nats_url);
-    let path = fetch_precompiled::download_cwasm(&url, cache_dir.path()).await?;
+    let path = fetch_precompiled::download_cwasm(&url, cache_dir.path(), None, None).await?;
     assert!(path.exists(), "download_cwasm must write a .cwasm file");
     assert_eq!(path.extension().and_then(|e| e.to_str()), Some("cwasm"));
 
