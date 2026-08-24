@@ -298,12 +298,13 @@ pub async fn run_cluster_host(
                                 .publish(heartbeat_subject.clone(), bytes.into())
                                 .await
                             {
-                                // Only a completed publish counts: this is the
-                                // signal /healthz relies on to catch a wedged
-                                // command loop, so a hung publish (degraded
-                                // NATS) must leave it stale rather than get
-                                // marked healthy just because this task is
-                                // still scheduled.
+                                // Only a completed publish counts: a hung publish
+                                // (degraded NATS) must leave this stale rather than
+                                // get marked healthy just because this task is still
+                                // scheduled. This is one of two signals feeding
+                                // /healthz — the command loop's reply publish
+                                // (below) is the other, catching a wedge here even
+                                // if that separate loop is what actually died.
                                 Ok(()) => heartbeat_health.record_success(),
                                 Err(e) => error!("failed to publish heartbeat: {e}"),
                             }
@@ -377,6 +378,7 @@ pub async fn run_cluster_host(
                     let host = host.clone();
                     let nats_client = nats_client.clone();
                     let command_semaphore = command_semaphore.clone();
+                    let heartbeat_health = heartbeat_health.clone();
                     let command = msg.subject.split('.').skip(3).collect::<Vec<_>>().join(".");
 
                     // Heartbeat skips semaphore: gating it same as start/stop lets a burst
@@ -404,17 +406,21 @@ pub async fn run_cluster_host(
                                     // semaphore permit forever even though its actual
                                     // work already finished successfully.
                                     let publish_future = nats_client.publish(reply_to, resp_bytes.into());
+                                    // A completed reply proves the full round trip the operator
+                                    // actually relies on (received, handled, replied) — a
+                                    // stronger signal than the self-push heartbeat task alone,
+                                    // which uses its own separate publish and would keep ticking
+                                    // even if this command loop's replies stopped landing.
                                     match host.config().command_reply_timeout {
                                         Some(timeout) => match tokio::time::timeout(timeout, publish_future).await {
-                                            Ok(Ok(())) => {}
+                                            Ok(Ok(())) => heartbeat_health.record_success(),
                                             Ok(Err(e)) => error!("failed to publish API response: {e}"),
                                             Err(_) => error!("timed out publishing API response after {timeout:?}"),
                                         },
-                                        None => {
-                                            if let Err(e) = publish_future.await {
-                                                error!("failed to publish API response: {e}");
-                                            }
-                                        }
+                                        None => match publish_future.await {
+                                            Ok(()) => heartbeat_health.record_success(),
+                                            Err(e) => error!("failed to publish API response: {e}"),
+                                        },
                                     }
                                 }
                             }
