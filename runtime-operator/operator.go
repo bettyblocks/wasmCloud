@@ -18,6 +18,13 @@ import (
 type EmbeddedOperatorConfig struct {
 	// NATS connection string. Used to communicate with hosts.
 	NatsURL string
+	// PrecompileNatsURL is the NATS URL the precompile Worker Job connects
+	// to (its NATS_URL env var) to write precompiled .cwasm bytes. This is
+	// the Data plane endpoint that hosts fetch precompiled components from
+	// (wash host --data-nats-url), which may differ from NatsURL (the
+	// Scheduler/control-plane endpoint used for host RPC). Empty reuses
+	// NatsURL.
+	PrecompileNatsURL string
 	// NATS options. Used to configure the NATS connection.
 	NatsOptions []nats.Option
 	// Heartbeat TTL. Used to determine how long to wait before considering a host unreachable.
@@ -119,6 +126,10 @@ func NewEmbeddedOperator(
 	}
 
 	if !cfg.DisablePrecompileController {
+		precompileNatsURL := cfg.PrecompileNatsURL
+		if precompileNatsURL == "" {
+			precompileNatsURL = cfg.NatsURL
+		}
 		if err = (&runtime_controllers.PrecompileReconciler{
 			Client:      mgr.GetClient(),
 			Scheme:      mgr.GetScheme(),
@@ -126,7 +137,7 @@ func NewEmbeddedOperator(
 			ArtifactStore: runtime_controllers.ArtifactStoreConfig{
 				BaseURL: cfg.PrecompileArtifactBaseURL,
 				Env: []corev1.EnvVar{
-					{Name: "NATS_URL", Value: cfg.NatsURL},
+					{Name: "NATS_URL", Value: precompileNatsURL},
 					{Name: "OBJECT_STORE_REPLICAS", Value: strconv.FormatUint(uint64(cfg.PrecompileArtifactReplicas), 10)},
 				},
 			},
@@ -137,9 +148,21 @@ func NewEmbeddedOperator(
 			return nil, err
 		}
 
+		// GC reads/deletes objects from the same precompiled-artifacts bucket
+		// the Worker Jobs write to, so it needs its own connection to
+		// precompileNatsURL whenever that differs from the operator's own
+		// (Scheduler) connection.
+		gcNatsConn := nc
+		if precompileNatsURL != cfg.NatsURL {
+			gcNatsConn, err = wasmbus.NatsConnect(precompileNatsURL, cfg.NatsOptions...)
+			if err != nil {
+				return nil, err
+			}
+		}
+
 		if err = mgr.Add(&runtime_controllers.PrecompileGC{
 			Reader:      mgr.GetClient(),
-			NatsConn:    nc,
+			NatsConn:    gcNatsConn,
 			BaseURL:     cfg.PrecompileArtifactBaseURL,
 			Interval:    cfg.PrecompileGCInterval,
 			GracePeriod: cfg.PrecompileGCGracePeriod,

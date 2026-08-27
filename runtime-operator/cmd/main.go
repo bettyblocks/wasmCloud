@@ -66,6 +66,7 @@ func main() {
 	var (
 		metricsAddr                  string
 		natsUrl                      string
+		precompileNatsUrl            string
 		natsCreds                    string
 		natsCa                       string
 		natsClientCert               string
@@ -104,6 +105,16 @@ func main() {
 	flag.StringVar(&natsClientKey, "nats-client-key", "", "Path to TLS client key pem")
 	flag.BoolVar(&natsTLSFirst, "nats-tls-first", false, "Skip NATS Server discovery during TLS")
 	flag.StringVar(&natsUrl, "nats-url", wasmbus.NatsDefaultURL, "The nats server address to connect to.")
+	flag.StringVar(
+		&precompileNatsUrl,
+		"precompile-nats-url",
+		"",
+		"NATS URL the precompile Worker Job connects to (its NATS_URL env var) to write "+
+			"precompiled .cwasm bytes, and that the precompile GC reads/deletes from. This "+
+			"is the Data plane endpoint hosts fetch precompiled components from "+
+			"(wash host --data-nats-url), which may differ from -nats-url (the "+
+			"Scheduler/control-plane endpoint). Defaults to -nats-url when unset.",
+	)
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -252,6 +263,7 @@ func main() {
 	operatorCfg := runtime_operator.EmbeddedOperatorConfig{
 		DisableArtifactController:    disableArtifactController,
 		NatsURL:                      natsUrl,
+		PrecompileNatsURL:            precompileNatsUrl,
 		HeartbeatTTL:                 heartbeatTTL,
 		HostCPUThreshold:             cpuBackpressureThreshold,
 		HostMemoryThreshold:          memoryBackpressureThreshold,

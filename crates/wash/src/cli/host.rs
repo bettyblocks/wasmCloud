@@ -217,6 +217,7 @@ impl CliCommand for HostCommand {
             .with_engine(engine)
             .with_host_config(host_config)
             .with_nats_client(Arc::new(scheduler_nats_client))
+            .with_data_nats_client(data_nats_client.clone())
             .with_host_group(self.host_group.clone())
             .with_plugin(Arc::new(
                 plugin::wasi_config::DynamicConfig::builder()

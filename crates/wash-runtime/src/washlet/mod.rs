@@ -38,6 +38,7 @@ pub mod types {
 pub struct ClusterHostBuilder {
     host_builder: crate::host::HostBuilder,
     nats_client: Option<Arc<async_nats::Client>>,
+    data_nats_client: Option<Arc<async_nats::Client>>,
     host_group: Option<String>,
     host_name: Option<String>,
     environment: Option<String>,
@@ -82,6 +83,18 @@ impl ClusterHostBuilder {
 
     pub fn with_nats_client(mut self, nats_client: Arc<async_nats::Client>) -> Self {
         self.nats_client = Some(nats_client);
+        self
+    }
+
+    /// Sets the NATS client used to fetch precompiled `.cwasm` bytes (the
+    /// `nats://` object-store scheme in a component's `precompiled_url`).
+    /// Defaults to the control-plane client set via [`with_nats_client`] when
+    /// not called, so precompiled fetches land on the Data plane only when a
+    /// caller opts in.
+    ///
+    /// [`with_nats_client`]: Self::with_nats_client
+    pub fn with_data_nats_client(mut self, data_nats_client: Arc<async_nats::Client>) -> Self {
+        self.data_nats_client = Some(data_nats_client);
         self
     }
 
@@ -171,10 +184,12 @@ impl ClusterHostBuilder {
         }
 
         let heartbeat_interval = self.heartbeat_interval.unwrap_or(HEARTBEAT_INTERVAL);
+        let data_nats_client = self.data_nats_client.unwrap_or_else(|| nats_client.clone());
         let host = builder.build()?;
         Ok(ClusterHost {
             prepared_host: host,
             nats_client,
+            data_nats_client,
             heartbeat_interval,
             cleanup_interval: self.cleanup_interval.unwrap_or(Duration::from_secs(300)),
             cleanup_age: self.cleanup_age.unwrap_or(Duration::from_secs(3600)),
@@ -194,6 +209,7 @@ impl ClusterHostBuilder {
 pub struct ClusterHost {
     prepared_host: Host,
     nats_client: Arc<async_nats::Client>,
+    data_nats_client: Arc<async_nats::Client>,
     heartbeat_interval: Duration,
     cleanup_interval: Duration,
     cleanup_age: Duration,
@@ -213,6 +229,7 @@ pub async fn run_cluster_host(
 ) -> anyhow::Result<impl Future<Output = anyhow::Result<()>>, anyhow::Error> {
     let (one_shot_tx, mut one_shot_rx) = oneshot::channel();
     let nats_client = cluster_host.nats_client.clone();
+    let data_nats_client = cluster_host.data_nats_client.clone();
     let host = cluster_host
         .prepared_host
         .start()
@@ -343,6 +360,7 @@ pub async fn run_cluster_host(
                 Some(msg) = api_subscription.next() => {
                     let host = host.clone();
                     let nats_client = nats_client.clone();
+                    let data_nats_client = data_nats_client.clone();
                     let command_semaphore = command_semaphore.clone();
                     let command = msg.subject.split('.').skip(3).collect::<Vec<_>>().join(".");
 
@@ -361,7 +379,7 @@ pub async fn run_cluster_host(
                             )
                         };
 
-                        let response = handle_command(host.as_ref(), &msg, &command, host.config(), &nats_client).await;
+                        let response = handle_command(host.as_ref(), &msg, &command, host.config(), &data_nats_client).await;
                         match response {
                             Ok(resp_bytes) => {
                                 if let Some(reply_to) = msg.reply {
@@ -479,7 +497,7 @@ async fn handle_command(
     msg: &async_nats::Message,
     command: &str,
     config: &HostConfig,
-    nats_client: &async_nats::Client,
+    data_nats_client: &async_nats::Client,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let payload = &msg.payload;
 
@@ -490,7 +508,7 @@ async fn handle_command(
         }
         "workload.start" => {
             let req: types::v2::WorkloadStartRequest = from_api(payload)?;
-            let res = workload_start(host, req, config, nats_client).await?;
+            let res = workload_start(host, req, config, data_nats_client).await?;
             to_api(&res)
         }
         "workload.stop" => {
@@ -540,7 +558,7 @@ async fn workload_start(
     host: &impl HostApi,
     req: types::v2::WorkloadStartRequest,
     config: &HostConfig,
-    nats_client: &async_nats::Client,
+    data_nats_client: &async_nats::Client,
 ) -> anyhow::Result<types::v2::WorkloadStartResponse> {
     let Some(types::v2::Workload {
         namespace,
@@ -585,7 +603,7 @@ async fn workload_start(
                         match download_cwasm(
                             &component.precompiled_url,
                             dir,
-                            Some(nats_client),
+                            Some(data_nats_client),
                             config.precompiled_fetch_timeout,
                         )
                         .await
