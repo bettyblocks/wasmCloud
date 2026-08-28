@@ -28,8 +28,12 @@ async fn workload_starts_with_file_backed_precompiled_component() -> Result<()> 
     // `.cwasm` once; the engine maps it file-backed via `deserialize_file`.
     let cache_dir = tempfile::tempdir()?;
     let url = format!("nats://{bucket}/{key}");
-    set_nats_url(&nats_url);
-    let path = fetch_precompiled::download_cwasm(&url, cache_dir.path(), None, None).await?;
+    let nats_client = async_nats::connect(&nats_url)
+        .await
+        .with_context(|| format!("failed to connect to NATS at {nats_url}"))?;
+    let path =
+        fetch_precompiled::download_cwasm(&url, cache_dir.path(), Some(&nats_client), None)
+            .await?;
     assert!(path.exists(), "download_cwasm must write a .cwasm file");
     assert_eq!(path.extension().and_then(|e| e.to_str()), Some("cwasm"));
 
@@ -77,13 +81,6 @@ async fn workload_starts_with_file_backed_precompiled_component() -> Result<()> 
     );
 
     Ok(())
-}
-
-fn set_nats_url(nats_url: &str) {
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::set_var("NATS_URL", nats_url);
-    }
 }
 
 async fn start_nats() -> Result<(ContainerAsync<GenericImage>, String)> {
