@@ -32,8 +32,7 @@ async fn workload_starts_with_file_backed_precompiled_component() -> Result<()> 
         .await
         .with_context(|| format!("failed to connect to NATS at {nats_url}"))?;
     let path =
-        fetch_precompiled::download_cwasm(&url, cache_dir.path(), Some(&nats_client), None)
-            .await?;
+        fetch_precompiled::download_cwasm(&url, cache_dir.path(), Some(&nats_client), None).await?;
     assert!(path.exists(), "download_cwasm must write a .cwasm file");
     assert_eq!(path.extension().and_then(|e| e.to_str()), Some("cwasm"));
 
