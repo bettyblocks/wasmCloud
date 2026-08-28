@@ -371,12 +371,9 @@ pub async fn run_cluster_host(
                         let _permit = if is_heartbeat {
                             None
                         } else {
-                            Some(
-                                command_semaphore
-                                    .acquire_owned()
-                                    .await
-                                    .expect("command semaphore should never be closed"),
-                            )
+                            Some(command_semaphore.acquire_owned().await.unwrap_or_else(|_| {
+                                unreachable!("command semaphore should never be closed")
+                            }))
                         };
 
                         let response = handle_command(host.as_ref(), &msg, &command, host.config(), &data_nats_client).await;
