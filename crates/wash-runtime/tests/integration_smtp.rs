@@ -1,3 +1,9 @@
+//! Integration tests for the `betty-blocks:smtp` plugin against a real
+//! SMTP server (`rnwood/smtp4dev`).
+//!
+//! Requires Docker for the smtp4dev container; every test here is marked
+//! `#[ignore]`, run with `cargo test --include-ignored`.
+
 use anyhow::{Context, Result};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use testcontainers::{GenericImage, core::IntoContainerPort, core::WaitFor, runners::AsyncRunner};
@@ -287,6 +293,7 @@ async fn wait_for_smtp4dev_messages(
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (SMTP4Dev); run with `cargo test --include-ignored`"]
 async fn smtp_sends_plaintext_email() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -342,6 +349,7 @@ async fn smtp_sends_plaintext_email() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (SMTP4Dev); run with `cargo test --include-ignored`"]
 async fn smtp_sends_html_email() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -407,6 +415,7 @@ async fn smtp_sends_html_email() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (SMTP4Dev); run with `cargo test --include-ignored`"]
 async fn smtp_sends_email_with_cc_and_bcc() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -456,6 +465,7 @@ async fn smtp_sends_email_with_cc_and_bcc() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (SMTP4Dev); run with `cargo test --include-ignored`"]
 async fn smtp_sends_concurrent_emails() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -520,6 +530,7 @@ async fn smtp_sends_concurrent_emails() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (SMTP4Dev); run with `cargo test --include-ignored`"]
 async fn smtp_sends_large_body_email() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -583,6 +594,7 @@ async fn smtp_sends_large_body_email() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (SMTP4Dev); run with `cargo test --include-ignored`"]
 async fn smtp_returns_error_for_unreachable_server() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -612,6 +624,7 @@ async fn smtp_returns_error_for_unreachable_server() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (SMTP4Dev); run with `cargo test --include-ignored`"]
 async fn smtp_reconnects_after_disconnect() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -672,6 +685,7 @@ async fn smtp_reconnects_after_disconnect() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (SMTP4Dev); run with `cargo test --include-ignored`"]
 async fn smtp_sends_email_with_attachment() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
