@@ -31,8 +31,8 @@ impl Guest for Component {
                 send_response(response_out, 200, message.as_bytes());
             }
             Err(e) => {
-                log(Level::Error, "", &format!("Error: {e}"));
-                let error_msg = format!("Failed to send email: {e}");
+                log(Level::Error, "", &format!("Error: {e:?}"));
+                let error_msg = format!("Failed to send email: {e:?}");
                 send_response(response_out, 500, error_msg.as_bytes());
             }
         }

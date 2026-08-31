@@ -695,10 +695,8 @@ async fn smtp_sends_email_with_attachment() -> Result<()> {
     let server = start_smtp4dev().await?;
     clear_smtp4dev_messages(server.api_port).await?;
 
-    let attachment_port = find_available_port().await?;
     let attachment_bytes = b"Hello, this is a test attachment file content.";
-
-    spawn_attachment_server(attachment_port, attachment_bytes).await?;
+    let (_attachment_server, attachment_port) = spawn_attachment_server(attachment_bytes).await?;
 
     let (http_addr, _host) = setup_test_host("smtp-attach", "attachment-test").await?;
     let client = reqwest::Client::new();
@@ -739,13 +737,17 @@ async fn smtp_sends_email_with_attachment() -> Result<()> {
     Ok(())
 }
 
-async fn spawn_attachment_server(
-    port: u16,
-    attachment_bytes: &'static [u8],
-) -> Result<JoinHandle<()>> {
+/// Binds its own ephemeral port and returns it alongside the server handle,
+/// rather than taking a port chosen by a separate `find_available_port`
+/// call: binding there and rebinding here left a window where another
+/// process (likely on a loaded, multi-job CI runner) could grab the same
+/// port in between, so the second bind either failed or — worse — silently
+/// raced whatever grabbed it. Owning the bind here closes that window.
+async fn spawn_attachment_server(attachment_bytes: &'static [u8]) -> Result<(JoinHandle<()>, u16)> {
     use tokio::io::AsyncWriteExt;
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
 
     let handle = tokio::spawn(async move {
         loop {
@@ -757,9 +759,10 @@ async fn spawn_attachment_server(
 
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.write_all(attachment_bytes).await;
+                let _ = stream.shutdown().await;
             }
         }
     });
 
-    Ok(handle)
+    Ok((handle, port))
 }
