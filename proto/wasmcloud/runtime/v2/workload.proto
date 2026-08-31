@@ -87,6 +87,11 @@ message WitWorld {
 message Component {
   string image = 1;
   LocalResources local_resources = 2;
+  // The instance limits below are signed because they mirror the Kubernetes
+  // CRD fields a workload sets them through (WorkloadComponent in the
+  // runtime-operator), and the Kubernetes API convention is signed integers.
+  // Nothing reads a negative one as a distinct value: zero and negative alike
+  // mean "not configured", decoded in one place on the receiving side.
   sint32 pool_size = 3;
   sint32 max_invocations = 4;
   // Optional credentials for pulling the image from a private registry
@@ -98,6 +103,36 @@ message Component {
   // of pulling the OCI image and compiling fresh. Empty string means
   // no precompiled variant is available — host falls back to OCI.
   string precompiled_url = 8;
+  // How many calls one warm instance may serve at the same time.
+  //
+  // Unset or below 1 means one, which is what a component gets without
+  // asking: an instance serves a single call at a time. Raising it lets an
+  // instance overlap calls while it awaits I/O, and is only safe for a guest
+  // that yields rather than blocks -- a guest driving its own executor with a
+  // blocking call must stay at one. Only meaningful alongside pool_size.
+  sint32 max_concurrency = 9;
+  // How long the pool watches its own peak concurrency before retiring the
+  // warm instances that peak did not need.
+  //
+  // A pool grows to pool_size under load and, without this, stays there:
+  // nothing but max_invocations, a trap or a stop ever ends a warm instance,
+  // so a spike's high-water mark outlives the spike. Set this and the pool
+  // sweeps every window, keeps the instances its measured peak actually
+  // needed (peak concurrent calls divided by max_concurrency, rounded up)
+  // and retires the rest -- draining them, never dropping a call in flight.
+  //
+  // Unset or below 1 means warm instances are never reclaimed for idleness,
+  // which is the behavior of a host that predates this field. Only
+  // meaningful alongside pool_size.
+  sint32 reclaim_window_seconds = 10;
+  // How many warm instances an idle sweep never retires below.
+  //
+  // Unset or below 1 lets a fully idle pool empty out, so the next call after
+  // a quiet spell starts cold. Raise it to keep a floor of instances warm
+  // through the quiet. Capped at pool_size, and only meaningful alongside
+  // reclaim_window_seconds. Note this is a floor under the pool, not a target
+  // to grow to: instances are still only built when a call needs one.
+  sint32 reclaim_min_instances = 11;
 }
 
 message LocalResources {
@@ -116,6 +151,21 @@ message LocalResources {
   // Note this controls socket connections but not DNS lookups.
   // Upon a successful lookup, the host will allow outbound connections to the specified hosts.
   repeated string allowed_hosts = 6;
+  // Names the component may resolve through wasi:sockets/ip-name-lookup
+  // (resolve-addresses). Accepts "*" for any name, a wildcard such as
+  // "*.wasmcloud.io", an exact name, or a literal IP address.
+  // Empty or absent denies every lookup with permanent-resolver-failure.
+  repeated string allowed_ip_name_lookups = 7;
+
+  // Ports on the machine's own loopback this component may reach through
+  // `host.wasmcloud.internal`. Each entry is a port with an optional
+  // protocol: "5432", "5432/tcp", "53/udp".
+  //
+  // An empty or absent list denies every host-loopback connection, and a
+  // non-empty one is inert unless the host was started with
+  // --allow-host-loopback: neither the workload author nor the operator can
+  // open this door alone.
+  repeated string allowed_host_loopback_ports = 8;
 }
 
 message Volume {

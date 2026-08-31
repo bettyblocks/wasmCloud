@@ -34,43 +34,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::Flavor;
+use common::{Flavor, engine, http_host_interfaces};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 use wash_runtime::{
-    engine::Engine,
     host::{
         HostApi, HostBuilder,
-        http::{DevRouter, HttpServer},
+        http::{DevRouter, Ingress},
     },
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
-    wit::WitInterface,
 };
-
-fn flavor_host_header(flavor: Flavor) -> &'static str {
-    match flavor {
-        Flavor::P2 => "bench-p2",
-        Flavor::P3 => "bench-p3",
-    }
-}
-
-fn engine() -> Engine {
-    Engine::builder().build().expect("failed to build engine")
-}
-
-fn http_host_interfaces(host: &str) -> Vec<WitInterface> {
-    let mut config = HashMap::new();
-    config.insert("host".to_string(), host.to_string());
-    vec![WitInterface {
-        namespace: "wasi".to_string(),
-        package: "http".to_string(),
-        interfaces: ["incoming-handler".to_string()].into_iter().collect(),
-        version: Some(semver::Version::parse("0.2.2").unwrap()),
-        config,
-        name: None,
-    }]
-}
 
 /// Holds a warm host bound to a concrete address with a workload resolved and
 /// ready to serve requests. Kept alive for the duration of a benchmark group.
@@ -82,12 +56,19 @@ struct WarmHost {
 }
 
 async fn start_warm_host(flavor: Flavor) -> anyhow::Result<WarmHost> {
-    let http_server = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
-    let addr = http_server.addr();
+    // No instance reuse: a store is built, instantiated and dropped per
+    // request. That is the default, and it is the baseline the pooled groups
+    // below are measured against.
+    start_warm_host_with_pool(flavor, 0).await
+}
+
+async fn start_warm_host_with_pool(flavor: Flavor, pool_size: i32) -> anyhow::Result<WarmHost> {
+    let ingress = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
+    let addr = ingress.addr();
 
     let host = HostBuilder::new()
         .with_engine(engine())
-        .with_http_handler(Arc::new(http_server))
+        .with_http_handler(Arc::new(ingress))
         .build()?;
 
     let host = host.start().await?;
@@ -110,10 +91,13 @@ async fn start_warm_host(flavor: Flavor) -> anyhow::Result<WarmHost> {
                 source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
                     flavor.wasm(),
                 )),
-                pool_size: 0,
+                pool_size,
                 max_invocations: 0,
+                max_concurrency: 1,
+                reclaim_window_seconds: 0,
+                reclaim_min_instances: 0,
             }],
-            host_interfaces: http_host_interfaces(flavor_host_header(flavor)),
+            host_interfaces: http_host_interfaces(flavor.host_header()),
             volumes: vec![],
         },
     };
@@ -129,7 +113,7 @@ async fn start_warm_host(flavor: Flavor) -> anyhow::Result<WarmHost> {
     // Correctness check  - also primes any one-time lazy caches before bench.
     let warmup = client
         .get(format!("http://{addr}/"))
-        .header("HOST", flavor_host_header(flavor))
+        .header("HOST", flavor.host_header())
         .send()
         .await?;
     anyhow::ensure!(
@@ -147,7 +131,7 @@ async fn start_warm_host(flavor: Flavor) -> anyhow::Result<WarmHost> {
         _host: Box::new(host),
         addr,
         client,
-        host_header: flavor_host_header(flavor),
+        host_header: flavor.host_header(),
     })
 }
 
@@ -174,6 +158,52 @@ async fn hot_invocation(warm: &WarmHost) -> anyhow::Result<()> {
     // Consume body so the server-side stream completes before timing stops.
     let _ = resp.bytes().await?;
     Ok(())
+}
+
+/// Paced invocation: request latency on a **pooled** instance whose store sat
+/// idle since the previous request, so the engine's epoch advanced while
+/// nothing ran on it.
+///
+/// This is the low-rps shape [`hot_invocation`] cannot produce: back-to-back
+/// requests never leave the store idle, and an unpooled host builds a fresh
+/// store per request, so neither ever holds a store whose epoch state has
+/// gone stale. P3 only — the pool path is p3-only, and p2 has no persistent
+/// request store for the idle gap to age.
+///
+/// The gap is slept **off the clock** (`iter_custom`); only the request is
+/// timed, so a per-request entry cost is not buried under the gap.
+fn bench_paced_latency(c: &mut Criterion) {
+    /// Longer than the epoch deadline a store arms, so each request finds the
+    /// idle store's deadline already expired.
+    const IDLE_GAP: Duration = Duration::from_millis(200);
+
+    let rt = Runtime::new().expect("tokio runtime");
+    let mut group = c.benchmark_group("paced_invocation");
+    group.throughput(Throughput::Elements(1));
+    // Each iteration costs the idle gap before the timed request starts.
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(30));
+
+    let warm = rt
+        .block_on(start_warm_host_with_pool(Flavor::P3, 1))
+        .expect("warm pooled host");
+    group.bench_function(BenchmarkId::from_parameter("p3_pooled"), |b| {
+        b.to_async(&rt).iter_custom(|iters| {
+            let warm = &warm;
+            async move {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    tokio::time::sleep(IDLE_GAP).await;
+                    let started = Instant::now();
+                    hot_invocation(warm).await.unwrap();
+                    total += started.elapsed();
+                }
+                total
+            }
+        });
+    });
+    drop(warm);
+    group.finish();
 }
 
 fn bench_cold(c: &mut Criterion) {
@@ -285,5 +315,137 @@ fn bench_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_cold, bench_hot_latency, bench_throughput);
+/// An I/O-bound component: each request parks on the clock rather than
+/// returning immediately. Instance reuse is only interesting for a guest that
+/// *waits* — one that returns straight away never has two calls in flight, so
+/// it cannot show what serving them concurrently is worth.
+const HTTP_SLEEPER_WASM: &[u8] = include_bytes!("../tests/wasm/http_sleeper.wasm");
+
+async fn start_sleeper_host(
+    host_header: &'static str,
+    pool_size: i32,
+    max_concurrency: i32,
+) -> anyhow::Result<WarmHost> {
+    let ingress = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
+    let addr = ingress.addr();
+    let host = HostBuilder::new()
+        .with_engine(engine())
+        .with_http_handler(Arc::new(ingress))
+        .build()?
+        .start()
+        .await?;
+
+    host.workload_start(WorkloadStartRequest {
+        workload_id: uuid::Uuid::new_v4().to_string(),
+        workload: Workload {
+            namespace: "bench".to_string(),
+            name: host_header.to_string(),
+            annotations: HashMap::new(),
+            service: None,
+            components: vec![Component {
+                name: "sleeper".to_string(),
+                digest: None,
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(HTTP_SLEEPER_WASM)),
+                local_resources: LocalResources::default(),
+                pool_size,
+                max_invocations: 0,
+                max_concurrency,
+                reclaim_window_seconds: 0,
+                reclaim_min_instances: 0,
+            }],
+            host_interfaces: http_host_interfaces(host_header),
+            volumes: vec![],
+        },
+    })
+    .await?;
+
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(256)
+        .tcp_nodelay(true)
+        .build()?;
+    Ok(WarmHost {
+        _host: Box::new(host),
+        addr,
+        client,
+        host_header,
+    })
+}
+
+/// Fire `n` requests at once and wait for all of them.
+async fn sleeper_burst(warm: &WarmHost, n: usize) -> anyhow::Result<()> {
+    let mut tasks = Vec::with_capacity(n);
+    for _ in 0..n {
+        let client = warm.client.clone();
+        let url = format!("http://{}/", warm.addr);
+        let host_header = warm.host_header;
+        tasks.push(tokio::spawn(async move {
+            let resp = client.get(url).header("HOST", host_header).send().await?;
+            anyhow::ensure!(resp.status().is_success(), "non-2xx: {}", resp.status());
+            let _ = resp.bytes().await?;
+            Ok::<(), anyhow::Error>(())
+        }));
+    }
+    for t in tasks {
+        t.await??;
+    }
+    Ok(())
+}
+
+/// What instance reuse is worth to an I/O-bound component, at a concurrency no
+/// single instance could serve without it.
+///
+/// * `ephemeral` — the default. Every request builds, instantiates and drops
+///   its own store; the sleeps overlap, but the workload pays for a store per
+///   request to get that.
+/// * `warm_serial` — `pool_size: 4` with the default `max_concurrency: 1`.
+///   Four calls run on warm instances and the rest still fall back to a store
+///   each, because an instance serving one call at a time is busy for the whole
+///   sleep.
+/// * `warm_concurrent` — the same four instances at `max_concurrency: 16`,
+///   which covers the whole burst. No store is built per request at all.
+///
+/// The fixture sleeps 100ms per request, so an iteration is roughly one sleep
+/// plus whatever the policy spends on stores.
+fn bench_pooled_throughput(c: &mut Criterion) {
+    const CONCURRENCY: usize = 64;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("pooled throughput bench runtime");
+
+    let mut group = c.benchmark_group("pooled_instance_throughput");
+    group.throughput(Throughput::Elements(CONCURRENCY as u64));
+    // Each iteration is a burst of sleeps; keep the run bounded.
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
+
+    for (label, host_header, pool_size, max_concurrency) in [
+        ("ephemeral", "bench-sleep-cold", 0, 1),
+        ("warm_serial", "bench-sleep-warm", 4, 1),
+        ("warm_concurrent", "bench-sleep-conc", 4, 16),
+    ] {
+        let warm = rt
+            .block_on(start_sleeper_host(host_header, pool_size, max_concurrency))
+            .expect("sleeper host");
+        // Prime: the first burst pays for whatever instances the policy keeps.
+        rt.block_on(sleeper_burst(&warm, CONCURRENCY))
+            .expect("warmup burst");
+
+        group.bench_function(BenchmarkId::from_parameter(label), |b| {
+            b.to_async(&rt)
+                .iter(|| async { sleeper_burst(&warm, CONCURRENCY).await.expect("burst") });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_cold,
+    bench_hot_latency,
+    bench_paced_latency,
+    bench_throughput,
+    bench_pooled_throughput
+);
 criterion_main!(benches);

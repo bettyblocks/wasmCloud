@@ -1,5 +1,6 @@
 use super::{SocketAddrCheck, SocketAddrUse};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use wasmtime_wasi::TrappableError;
 use wasmtime_wasi::p2::bindings::sockets::network::ErrorCode;
 
@@ -54,15 +55,19 @@ pub(crate) fn error_code_from_io(error: std::io::ErrorKind) -> ErrorCode {
 
 pub struct Network {
     pub(crate) socket_addr_check: SocketAddrCheck,
-    pub(crate) allow_ip_name_lookup: bool,
+    pub(crate) allowed_ip_name_lookups: Arc<[crate::host::allowed_ip_name::AllowedIpName]>,
 }
 
 impl Network {
+    /// Run the socket policy, yielding the address and plane to actually use.
+    ///
+    /// The returned address may differ from `addr`: an internal-zone sentinel
+    /// resolves to a real address here.
     pub async fn check_socket_addr(
         &self,
         addr: SocketAddr,
         reason: SocketAddrUse,
-    ) -> std::io::Result<()> {
+    ) -> Result<super::Allowed, super::util::ErrorCode> {
         self.socket_addr_check.check(addr, reason).await
     }
 }

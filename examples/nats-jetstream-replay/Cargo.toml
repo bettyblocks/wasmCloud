@@ -1,0 +1,19 @@
+[package]
+name = "nats-jetstream-replay"
+version = "0.1.0"
+authors = ["wasmCloud Team"]
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+name = "nats_jetstream_replay"
+
+[workspace]
+
+[dependencies]
+wit-bindgen = { version = "0.60", features = ["async-spawn", "inter-task-wakeup"] }
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = true

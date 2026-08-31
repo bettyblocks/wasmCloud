@@ -43,6 +43,17 @@
 /crates/bench-tools/                    @wasmCloud/ci-maintainers @wasmCloud/wash-maintainers
 /crates/wash-runtime/benches/           @wasmCloud/ci-maintainers @wasmCloud/wash-maintainers
 
+# The xtask build-fixtures runner compiles the wash-runtime test fixtures, so
+# it's owned jointly: wash maintainers keep context on the fixture build, ci
+# maintainers gate the build tooling. Without this it falls to the default
+# owner below.
+/xtask/                                 @wasmCloud/ci-maintainers @wasmCloud/wash-maintainers
+
 # Examples and project templates
 /examples/              @wasmCloud/examples-maintainers
 /templates/             @wasmCloud/examples-maintainers
+
+# Adding an example registers it in the examples CI matrix, so example
+# maintainers own that workflow to keep new examples reviewable by them
+# alone. This override comes after /.github/ so it takes precedence.
+/.github/workflows/examples.yml         @wasmCloud/examples-maintainers @wasmCloud/ci-maintainers

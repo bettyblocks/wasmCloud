@@ -69,6 +69,28 @@ impl WitWorld {
         })
     }
 
+    /// Whether this world *provides* `interface` — covers every one of its
+    /// interfaces from this world's own imports.
+    ///
+    /// A plugin's world states what it provides in `imports`, by the convention
+    /// [`crate::plugin::HostPlugin::world`] follows: a plugin declaring
+    /// `wasi:keyvalue/store` there is offering to serve it. Its `exports` mean
+    /// the opposite direction — an interface the plugin *calls* on a workload,
+    /// as `wasmcloud:messaging` does with `handler`.
+    ///
+    /// [`WitWorld::includes_bidirectional`] deliberately ignores that
+    /// distinction, because a workload satisfies an interface by importing or
+    /// exporting it. Asking whether a *provider* exists is the opposite
+    /// question, and answering it with the bidirectional check would count a
+    /// plugin's own outbound calls as though it served them.
+    pub fn provides(&self, interface: &WitInterface) -> bool {
+        interface.interfaces.iter().all(|i| {
+            self.imports
+                .iter()
+                .any(|im| interface.same_package(im) && im.interfaces.contains(i))
+        })
+    }
+
     /// Checks if a guest world (imports) can be satisfied by a host world (exports).
     ///
     /// A host world satisfies a guest world if all interfaces required by the guest
@@ -121,7 +143,7 @@ impl WitWorld {
 /// - `wasi:http` - Just namespace and package
 /// - `wasi:http/incoming-handler` - With a single interface
 /// - `wasi:http/incoming-handler,outgoing-handler@0.2.0` - Multiple interfaces with version
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WitInterface {
     /// The namespace of the interface (e.g., "wasi")
     pub namespace: String,
@@ -139,6 +161,35 @@ pub struct WitInterface {
     /// of the same namespace:package exist. Used as the routing key in
     /// multiplexing plugins (the `identifier` in store::open, etc.).
     pub name: Option<String>,
+}
+
+/// Config keys, never config values.
+///
+/// Once bindings resolve, `config` carries whatever the operator's `secretFrom`
+/// resolved to — creds, tokens, TLS keys — and this type is `?`-logged on
+/// several paths. A plugin that wants a value in a log names that value itself.
+impl std::fmt::Debug for WitInterface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct Keys<'a>(&'a HashMap<String, String>);
+        impl std::fmt::Debug for Keys<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let mut keys: Vec<&str> = self.0.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                f.debug_map()
+                    .entries(keys.into_iter().map(|k| (k, format_args!("<redacted>"))))
+                    .finish()
+            }
+        }
+
+        f.debug_struct("WitInterface")
+            .field("namespace", &self.namespace)
+            .field("package", &self.package)
+            .field("interfaces", &self.interfaces)
+            .field("version", &self.version)
+            .field("name", &self.name)
+            .field("config", &Keys(&self.config))
+            .finish()
+    }
 }
 
 impl WitInterface {
@@ -214,6 +265,17 @@ impl WitInterface {
         }
 
         self.interfaces.is_superset(&other.interfaces)
+    }
+
+    /// Returns `true` if this interface is an incoming `wasi:http` handler.
+    ///
+    /// This recognises both the WASI P2 `incoming-handler` interface and the
+    /// unified WASI P3 `handler` interface, so HTTP entrypoints are detected
+    /// regardless of which WASI version a component targets.
+    pub fn is_incoming_http_handler(&self) -> bool {
+        self.namespace == "wasi"
+            && self.package == "http"
+            && (self.interfaces.contains("incoming-handler") || self.interfaces.contains("handler"))
     }
 }
 
@@ -309,6 +371,36 @@ impl From<String> for WitInterface {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    /// `WitInterface` is `?`-logged on several bind paths, and after binding
+    /// resolution its config carries the operator's resolved `secretFrom`
+    /// material.
+    #[test]
+    fn debug_shows_config_keys_and_no_config_values() {
+        let interface = WitInterface {
+            namespace: "wasmcloud".to_string(),
+            package: "nats".to_string(),
+            interfaces: ["core".to_string()].into_iter().collect(),
+            version: Some(semver::Version::new(0, 1, 0)),
+            config: [
+                ("creds".to_string(), "SUPERSECRET".to_string()),
+                ("password".to_string(), "hunter2".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            name: None,
+        };
+
+        let rendered = format!("{interface:?}");
+        assert!(!rendered.contains("SUPERSECRET"), "{rendered}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        // Keys stay: which settings are present is the diagnostic value, and a
+        // key name is not the secret.
+        assert!(rendered.contains("creds"), "{rendered}");
+        assert!(rendered.contains("password"), "{rendered}");
+        assert!(rendered.contains("wasmcloud"), "{rendered}");
+    }
+
     use super::*;
     use std::collections::HashSet;
 
@@ -449,6 +541,29 @@ mod tests {
         assert!(interface_a.contains(&interface_b));
         // Different versions should not match
         assert!(!interface_a.contains(&interface_c));
+    }
+
+    #[test]
+    fn test_is_incoming_http_handler() {
+        // P2 incoming handler
+        let p2 = WitInterface::from("wasi:http/incoming-handler");
+        assert!(p2.is_incoming_http_handler());
+
+        // Unified P3 handler, with and without version
+        let p3 = WitInterface::from("wasi:http/handler");
+        assert!(p3.is_incoming_http_handler());
+        let p3_versioned = WitInterface::from("wasi:http/handler@0.3.0");
+        assert!(p3_versioned.is_incoming_http_handler());
+
+        // Outgoing-only is not an incoming handler
+        let outgoing = WitInterface::from("wasi:http/outgoing-handler");
+        assert!(!outgoing.is_incoming_http_handler());
+
+        // Same interface name in a different package does not match
+        let messaging = WitInterface::from("wasmcloud:messaging/handler");
+        assert!(!messaging.is_incoming_http_handler());
+        let other_ns = WitInterface::from("wasi:messaging/incoming-handler");
+        assert!(!other_ns.is_incoming_http_handler());
     }
 
     #[test]

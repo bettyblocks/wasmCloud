@@ -15,7 +15,7 @@ use wash_runtime::{
     engine::Engine,
     host::{
         HostApi, HostBuilder,
-        http::{DevRouter, HttpServer},
+        http::{DevRouter, Ingress},
     },
     plugin::{smtp::BettySmtp, wasi_config::DynamicConfig, wasi_logging::TracingLogger},
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
@@ -51,12 +51,17 @@ fn create_workload_request(name: &str, host_header: &str) -> WorkloadStartReques
                     // Allow loopback egress so the component can fetch attachments from
                     // the test's local HTTP server (outgoing HTTP is deny-by-default).
                     allowed_hosts: ["127.0.0.1".parse().expect("valid allowed host")].into(),
+                    allowed_ip_name_lookups: Default::default(),
+                    allowed_host_loopback_ports: Default::default(),
                 },
                 pool_size: 1,
                 max_invocations: 100,
                 source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
                     SMTP_DEMO_WASM,
                 )),
+                max_concurrency: 1,
+                reclaim_window_seconds: 0,
+                reclaim_min_instances: 0,
             }],
             host_interfaces: vec![
                 WitInterface {
@@ -114,7 +119,7 @@ async fn setup_test_host(
     workload_name: &str,
 ) -> Result<(SocketAddr, impl std::any::Any)> {
     let engine = Engine::builder().build()?;
-    let http_plugin = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
+    let http_plugin = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
     let http_addr = http_plugin.addr();
 
     let host = HostBuilder::new()

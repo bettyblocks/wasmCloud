@@ -299,12 +299,7 @@ ansible-playbook provision.yml --check          # dry-run; no changes
 The playbook installs (as `root` on the bench host):
 
 - **apt:** `build-essential pkg-config libssl-dev clang cmake git curl jq
-  ca-certificates protobuf-compiler libprotobuf-dev valgrind`
-  - `protobuf-compiler` (the `protoc` binary) is needed by
-    `crates/wash-runtime/build.rs` for proto-generated bindings.
-  - `libprotobuf-dev` provides `/usr/include/google/protobuf/*.proto`
-    (the well-known types like `timestamp.proto`); without it,
-    `protoc` finds the binary but fails to import.
+  ca-certificates valgrind`
   - `valgrind` is the measurement engine for the `gungraun`
     instruction-count bench (see §9 and the `gungraun-runner`
     bullet below).
@@ -342,7 +337,6 @@ Verify after the script:
 nproc                              # 6
 uname -r                           # 6.8.0-* (Ubuntu Noble)
 cargo --version                    # rustup-pinned stable
-protoc --version                   # libprotoc 3.21.x or newer
 valgrind --version                 # valgrind-3.22.x or newer
 gungraun-runner --version          # 0.19.1
 node --version                     # the node_lts_major pinned in provision.yml
@@ -386,7 +380,7 @@ with a fresh token). It:
 - Installs **rustup as the `bench` user** so `cargo` is available in
   the workflow's PATH. The actual toolchain is auto-installed on
   first build via `rust-toolchain.toml`.
-- Downloads `actions-runner-linux-x64-2.334.0.tar.gz`, **verifies the
+- Downloads `actions-runner-linux-x64-2.335.1.tar.gz`, **verifies the
   SHA256** (constant in the script — bump version + sha together
   when upgrading), extracts to `/opt/actions-runner`.
 - Registers the runner with labels `self-hosted, bench, hetzner` and
@@ -569,8 +563,16 @@ GitHub → **Actions** → **bench** → **Run workflow**:
 
 | Input   | Description                                                                                | Default          |
 | ------- | ------------------------------------------------------------------------------------------ | ---------------- |
-| `bench` | which bench to run (`http_invoke`, `gungraun`, `wasmtime_baseline`, `wasmtime_serve`) | `http_invoke`    |
-| `ref`   | git ref to bench (branch, tag, or sha)                                                     | the workflow ref |
+| `bench` | which bench to run (`http_invoke`, `service_http`, `gungraun`, `wasmtime_baseline`, `wasmtime_serve`, `gungraun_plugin`) | `http_invoke`    |
+| `ref`   | git ref to bench (branch, tag, sha, or a pull request as `#123` / `pull/123` / `pr/123` — the same spellings bench-compare accepts) | the workflow ref |
+
+A pull-request ref produces a step summary and an uploaded artifact but is
+deliberately **not** pushed to S3, so it never lands on the trends timeline —
+that timeline tracks merged history, and the run's data row would otherwise
+describe code that may never land. Rows from a PR run are labelled `pull/123`;
+the exact commit is on the row's `sha` field either way. To compare a PR
+against its baseline rather than read its absolute numbers, use **bench-compare**
+(§9.4) — that is the workflow built for it.
 
 **Bench types:**
 
@@ -580,6 +582,7 @@ GitHub → **Actions** → **bench** → **Run workflow**:
 | `gungraun`          | gungraun      | CPU instruction count (cachegrind) | deterministic regression detection; not subject to shared-runner timing noise. `gungraun` is the renamed/refreshed `iai-callgrind` (rename landed upstream at 0.17.0) |
 | `wasmtime_baseline` | criterion     | wall-clock                         | wasmtime-only baseline for context                                                                                                                             |
 | `wasmtime_serve`    | criterion     | wall-clock                         | wasmtime serve subcommand baseline                                                                                                                             |
+| `gungraun_plugin`   | gungraun      | CPU instruction count (cachegrind) | host component plugin: the cross-store capability hop, and the plugin's `on-workload-bind` contribution separated from component instantiation. Both are far below what a wall-clock harness can resolve, which is why this is an instruction-count bench rather than a criterion one. Needs `--features host-component-plugins` (added by `run-bench.sh`) plus valgrind — no Apple Silicon support, so it runs on the bench host only |
 
 Anyone with repo-write can dispatch. The job queues on the
 `bench-host` concurrency group, so two dispatched runs serialize.
@@ -817,13 +820,6 @@ If the service crashed: `journalctl -u actions.runner.* -n 100`.
 Common cause is GitHub revoked the registration; re-register with a
 fresh token.
 
-### `cargo bench` is missing `protoc` or proto includes
-
-Re-run the Ansible playbook (`cd scripts/bench/ansible && ansible-playbook
-provision.yml --tags toolchain,apt`); it installs `protobuf-compiler` +
-`libprotobuf-dev`. The build needs both — the binary alone fails when
-`.proto` files import `google/protobuf/timestamp.proto`.
-
 ### `nproc` returns 12 instead of 6
 
 `nosmt` didn't apply. Check:
@@ -883,7 +879,7 @@ cache). For longer staleness:
 | [`op-env.sh`](./op-env.sh)                                                                                     | `source`-only helper: pulls `WASMCLOUD_BENCH_HOST_IP` / `WASMCLOUD_BENCH_HOSTNAME` / `WASMCLOUD_BENCH_HOST_IPV6` from the 1Password item `WASMCLOUD_BENCH_BOX` into the current shell                                     |
 | [`stage-hetzner.sh`](./stage-hetzner.sh)                                                                       | Phase 1 from your laptop: rescue → installed OS                                                                                                                                                                           |
 | [`ansible/`](./ansible/)                                                                                       | Phase 2 from your laptop: deps + Rust + valgrind + gungraun-runner + repo + kernel cmdline + perf governor. Idempotent; re-run to apply drift or as the "patch a live box without re-staging" path (`--tags kernel`) |
-| [`install-runner.sh`](./install-runner.sh)                                                                     | Phase 3 on the host: GH Actions runner under `bench` user; also installs gungraun-runner. Kept as bash because runner registration takes a one-shot token whose lifecycle is awkward to model declaratively.             |
+| [`install-runner.sh`](./install-runner.sh)                                                                     | Phase 3 on the host: registers the GH Actions runner under the `bench` user and wires it to the shared bench tools in `/usr/local` (installed by `provision.yml`). Kept as bash because runner registration takes a one-shot token whose lifecycle is awkward to model declaratively.             |
 | [`../../.github/scripts/bench-preflight.mjs`](../../.github/scripts/bench-preflight.mjs)                       | CI step: refuses to bench on a drifted host (env: `WASMCLOUD_BENCH_HOSTNAME`). GHA-only — runs via `node` from the workflow.                                                                                              |
 | [`run-bench.sh`](./run-bench.sh)                                                                               | CI step + local: invokes `cargo bench`, writes a run log. Stays bash because compare-bench.sh invokes it on the host for local operator runs.                                                                             |
 | [`../../.github/scripts/bench-push-results.mjs`](../../.github/scripts/bench-push-results.mjs)                 | CI step: per-run upload + history.json aggregate + CloudFront invalidate; archives `target/criterion/` and/or `target/gungraun/`. GHA-only.                                                                                    |
@@ -939,7 +935,7 @@ into layers, each with its own cadence.
 | glibc / libstdc++                      | with the kernel                                   | apt                                                                                                | Same reason.                                                                                                                                                                                                           |
 | valgrind                               | yearly, or when gungraun asks for it              | apt                                                                                                | Major valgrind bumps have historically renamed cachegrind event columns; our `Ir` parser is robust to that, but verify.                                                                                                |
 | Rust toolchain                         | rolls with `rust-toolchain.toml` (monthly stable) | repo file                                                                                          | No bench-host-specific pin.                                                                                                                                                                                            |
-| `gungraun` crate + runner              | when the bench fails to start, or yearly          | `crates/wash-runtime/Cargo.toml` (single source of truth)                                          | Bump the dep version in `Cargo.toml`; `provision.yml` and `install-runner.sh` both derive the runner version from there at install time. gungraun enforces crate-vs-runner equality at run time.                       |
+| `gungraun` crate + runner              | when the bench fails to start, or yearly          | `crates/wash-runtime/Cargo.toml`, resolved in `Cargo.lock`                                          | Bump the dep in `Cargo.toml` and `cargo update -p gungraun`; `provision.yml` installs the matching `gungraun-runner` (derived from the **resolved** `Cargo.lock` version — a caret req resolves up to the latest patch) to the shared `/usr/local`. gungraun enforces crate-vs-runner equality at run time.                       |
 | Node.js                                | quarterly (with the kernel bump)                  | `provision.yml` (`node_lts_major`)                                                                 | Bump to the current active LTS line. Built-ins-only scripts; Node version changes are usually low-risk.                                                                                                                |
 | GitHub Actions runner agent            | monthly check, bump on changelog review           | `install-runner.sh` (`RUNNER_VERSION` + `RUNNER_SHA256`)                                           | Auto-tracked via [`bench-host-checks.yml`](../../.github/workflows/bench-host-checks.yml); see below.                                                                                                                  |
 | Action SHA pins (`actions/checkout@…`) | weekly via Dependabot                             | `.github/workflows/*.yml`                                                                          | Low risk — these execute on hosted runners, not the bench host.                                                                                                                                                        |

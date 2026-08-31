@@ -1,0 +1,17 @@
+package wasmcloud:nats-jetstream-replay;
+
+/// Order processing over JetStream, with replay.
+///
+/// The host pushes each new delivery into `jetstream-handler`, which is the
+/// at-least-once path. The handler is per-request: it holds no consumer and no
+/// stream, so it scales down to nothing between bursts.
+///
+/// `js-processor` carries the whole `wasmcloud:nats` import surface, which is
+/// what makes this one line: the grant, not the import list, is what bounds
+/// reach, and imports the component never calls are dropped at build time.
+/// `jetstream` is what this one uses, for the durable publish and for `scan` —
+/// a replay from an arbitrary stream sequence without creating a consumer, the
+/// thing `wasmcloud:messaging` cannot express.
+world nats-jetstream-replay {
+  include wasmcloud:nats/js-processor@0.1.0;
+}

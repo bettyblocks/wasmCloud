@@ -8,11 +8,7 @@ repository = "https://github.com/wasmCloud/wasmCloud"
 authors = ["The wasmCloud Team"]
 categories = ["wasm"]
 readme = "README.md"
-# Not published to crates.io: the optional `wasi-webgpu` feature pulls in
-# git-only deps (`wasi-graphics-context-wasmtime`, `wasi-webgpu-wasmtime`
-# from wasi-gfx/wasi-gfx-runtime) that have no crates.io release, and
-# cargo's publish manifest check rejects deps without a version
-# requirement. Revisit once those crates are on crates.io or vendored.
+# Not published to crates.io: this is an internal runtime crate.
 publish = false
 # Allowlist preserved for the eventual re-enable of publishing. Cargo
 # always includes Cargo.toml, Cargo.lock, Cargo.toml.orig, and
@@ -24,7 +20,6 @@ publish = false
 include = [
     "src/**/*",
     "wit/**/*",
-    "build.rs",
     "wkg.lock",
     "README.md",
     "LICENSE",
@@ -37,8 +32,8 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
-# BettyBlocks: `wasmcloud-smtp` kept in defaults across the upstream merge (`wasi-webgpu` is upstream's addition).
-default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel", "wasi-webgpu", "wasmcloud-smtp"]
+# BettyBlocks: `wasmcloud-smtp` kept in defaults across the upstream merge (`wasi-webgpu`, `wasm_component_model_implements`, `wasmcloud-nats` are upstream's additions).
+default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel", "wasi-webgpu", "wasm_component_model_implements", "wasmcloud-nats", "wasmcloud-smtp"]
 oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:sha2", "dep:wit-component"]
 wasi-otel = []
 washlet = ["oci"]
@@ -46,9 +41,17 @@ wasi-config = []
 wasi-logging = []
 wasi-blobstore = []
 wasi-keyvalue = []
-# Component-model `(implements ..)` / `named_imports` multiplexing
+# Component-model `(implements ..)` / `named_imports` multiplexing. On by
+# default; disable with `--no-default-features` for a build that neither
+# accepts nor routes named imports.
 wasm_component_model_implements = []
-wasi-webgpu = ["dep:wasi-webgpu-wasmtime", "dep:wasi-graphics-context-wasmtime"]
+# Host component plugins: a component providing a host capability from its own
+# long-lived, supervised store, serving cross-store capability calls.
+# See `plugin::component_host` for the adapter and how it wires up.
+host-component-plugins = []
+# NATS-native capability: core pub/sub, JetStream, and KV.
+wasmcloud-nats = ["dep:nkeys"]
+wasi-webgpu = ["dep:wasi-webgpu-wasmtime"]
 wasmcloud-postgres = [
     "dep:tokio-postgres", "dep:tokio-postgres-rustls",
     "dep:deadpool-postgres", "dep:postgres-types",
@@ -64,27 +67,33 @@ epoch-interruption = []
 
 [dependencies]
 anyhow = { workspace = true }
-async-nats = { workspace = true, features = ["aws-lc-rs"] }
+arc-swap = { workspace = true }
+async-nats = { workspace = true, features = ["aws-lc-rs", "server_2_10", "server_2_11", "server_2_12"] }
 dashmap = { version = "6" }
 async-trait = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+etcetera = { workspace = true }
+fastrand = { workspace = true }
 futures = { workspace = true }
 hostname = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
+humantime = { workspace = true }
 hyper = { workspace = true, features = ["server", "http1", "http2"] }
+hyper-rustls = { workspace = true, features = ["http1", "http2", "tls12", "aws-lc-rs"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "tokio", "server-auto"] }
 moka = { workspace = true, features = ["sync"]}
 names = { workspace = true }
 redis = { workspace = true }
 semver = { workspace = true }
 sysinfo = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "macros", "fs"] }
 tracing = { workspace = true }
+zeroize = { workspace = true }
 wasmtime = { workspace = true, features = ["anyhow", "component-model", "component-model-async", "cranelift", "pooling-allocator", "gc", "gc-null", "threads"] }
 wasmtime-wasi = { workspace = true, features = ["p3"] }
 wasmtime-wasi-io = { workspace = true }
@@ -95,6 +104,8 @@ cap-std = { workspace = true }
 io-lifetimes = { workspace = true }
 rustix = { workspace = true }
 rustls = { workspace = true, features = ["std", "tls12"] }
+rustls-native-certs = { workspace = true }
+tower-service = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -124,6 +135,7 @@ opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_ex
 
 # OCI dependencies (optional, behind 'oci' feature)
 docker_credential = { workspace = true, optional = true }
+nkeys = { workspace = true, optional = true }
 oci-client = { workspace = true, optional = true, features = ["rustls-tls"] }
 oci-wasm = { workspace = true, optional = true, features = ["rustls-tls"] }
 sha2 = { workspace = true, optional = true }
@@ -153,19 +165,14 @@ webpki-roots = { workspace = true }
 # fails to build on Windows and s390x, so the deps are gated to match the
 # `#[cfg]` on `plugin::wasi_webgpu`.
 [target.'cfg(all(not(target_os = "windows"), not(target_arch = "s390x")))'.dependencies]
-wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "301716b5591bc6e08eca852b936fc8a17dea5379", optional = true }
-wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "301716b5591bc6e08eca852b936fc8a17dea5379", optional = true }
-
-# Proto codegen only. Wasm fixtures are built by `cargo xtask
-# build-fixtures` (see /xtask), which owns wit-component and the WASI
-# adapter provider.
-[build-dependencies]
-anyhow = { workspace = true, default-features = true }
-tonic-prost-build = { workspace = true, default-features = true }
-pbjson-build = { workspace = true, default-features = true }
+wasi-webgpu-wasmtime = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+# `testing` brings in `InMemoryMetricExporter`, which is how the guest memory
+# budget's OTel instruments are asserted against a real collection rather than
+# by calling their getters.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # `stream` (bytes_stream / Body::wrap_stream) is used by the blobstore
@@ -180,6 +187,10 @@ wasmtime-wasi-http = { workspace = true, features = ["p2"] }
 gag = "1.0"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 testcontainers = { workspace = true }
+# redis client for the keyvalue redis interop test
+redis = { workspace = true }
+# postgres client for admin setup (create roles/tables) in tests
+tokio-postgres = { workspace = true, features = ["runtime"] }
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 # Pinned to match the gungraun-runner version the bench host's Ansible
 # playbook installs (scripts/bench/ansible/provision.yml). gungraun
@@ -192,6 +203,10 @@ name = "http_invoke"
 harness = false
 
 [[bench]]
+name = "service_http"
+harness = false
+
+[[bench]]
 name = "gungraun"
 harness = false
 
@@ -201,5 +216,11 @@ harness = false
 
 [[bench]]
 name = "wasmtime_serve"
+harness = false
+
+# Requires `--features host-component-plugins`, plus valgrind and a
+# version-matched gungraun-runner on PATH.
+[[bench]]
+name = "gungraun_plugin"
 harness = false
 

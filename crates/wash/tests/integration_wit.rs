@@ -1,6 +1,7 @@
 //! Integration tests for `wash wit` commands
 //!
-//! These tests verify end-to-end workflows with real file I/O and network access.
+//! Real file I/O, no network: dependencies resolve from the in-repo vendored
+//! WIT — see [`setup_test_project_with_world`].
 
 // Increase the default recursion limit
 #![recursion_limit = "256"]
@@ -16,7 +17,35 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 use wash::cli::{CliCommand, CliContext, wit::WitCommand};
 
-/// Helper to create a test project with world.wit
+/// The `wasi:logging` these tests add and fetch, vendored under wash-runtime.
+const VENDORED_WASI_LOGGING: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../wash-runtime/wit/deps/wasi-logging-0.1.0-draft"
+);
+
+/// Likewise `wasi:config`. The `store` interface is in the rc, not the draft.
+const VENDORED_WASI_CONFIG: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../wash-runtime/wit/deps/wasi-config-0.2.0-rc.1"
+);
+
+/// `CliContext::build()` moves the *process* working directory, so tests that
+/// build one cannot overlap. Every such test takes this for its whole body.
+///
+/// Async-aware, because the body it guards is full of `.await`: a
+/// `std::sync::MutexGuard` held across one blocks the worker thread rather than
+/// the task, which deadlocks as soon as the runtime schedules another of these
+/// tests onto it.
+static CWD_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// No poisoning to handle: a panicking test leaves the cwd wherever it was, and
+/// the next holder overwrites it regardless.
+async fn lock_cwd() -> tokio::sync::MutexGuard<'static, ()> {
+    CWD_GUARD.lock().await
+}
+
+/// A test project with a world.wit, plus a `wkg.toml` pointing both packages at
+/// the vendored copies. Paths are absolute because the project is a `TempDir`.
 async fn setup_test_project_with_world(content: &str) -> Result<(TempDir, std::path::PathBuf)> {
     let temp = TempDir::new().context("failed to create temp dir")?;
     let wit_dir = temp.path().join("wit");
@@ -26,11 +55,26 @@ async fn setup_test_project_with_world(content: &str) -> Result<(TempDir, std::p
     tokio::fs::write(wit_dir.join("world.wit"), content)
         .await
         .context("failed to write world.wit")?;
+    // TOML reads `\` in a basic string as an escape, and `CARGO_MANIFEST_DIR` is
+    // backslash-separated on Windows; forward slashes work on every platform.
+    let logging = VENDORED_WASI_LOGGING.replace('\\', "/");
+    let config = VENDORED_WASI_CONFIG.replace('\\', "/");
+    tokio::fs::write(
+        temp.path().join("wkg.toml"),
+        format!(
+            "[overrides]\n\
+             \"wasi:logging\" = {{ path = \"{logging}\" }}\n\
+             \"wasi:config\" = {{ path = \"{config}\" }}\n"
+        ),
+    )
+    .await
+    .context("failed to write wkg.toml")?;
     Ok((temp, wit_dir))
 }
 
 #[tokio::test]
 async fn wit_integration() -> Result<()> {
+    let _cwd = lock_cwd().await;
     test_remove_workflow().await?;
     test_error_missing_world_wit().await?;
     Ok(())
@@ -39,8 +83,8 @@ async fn wit_integration() -> Result<()> {
 /// Test 1: Add + Fetch + Clean workflow
 /// Tests the most common user workflow end-to-end
 #[tokio::test]
-#[ignore] // Requires network access
 async fn test_add_fetch_clean_workflow() -> Result<()> {
+    let _cwd = lock_cwd().await;
     let (temp, wit_dir) =
         setup_test_project_with_world("package test:component@0.1.0;\n\nworld example {\n}\n")
             .await?;
@@ -110,8 +154,8 @@ async fn test_add_fetch_clean_workflow() -> Result<()> {
 /// Test 1b: Add dependency when the world opening brace is on the next line
 /// Verifies `wash wit add` handles valid multi-line world declarations
 #[tokio::test]
-#[ignore] // Requires network access
 async fn test_add_with_next_line_world_brace() -> Result<()> {
+    let _cwd = lock_cwd().await;
     let (temp, wit_dir) =
         setup_test_project_with_world("package test:component@0.1.0;\n\nworld example\n{\n}\n")
             .await?;
@@ -142,16 +186,17 @@ async fn test_add_with_next_line_world_brace() -> Result<()> {
 }
 
 /// Test 2: Update workflow (selective and full)
-/// Tests that update modifies lock file correctly
+///
+/// Overridden packages get no `wkg.lock` entry, which splits the two halves.
 #[tokio::test]
-#[ignore] // Requires network access
 async fn test_update_selective_and_full() -> Result<()> {
+    let _cwd = lock_cwd().await;
     let (temp, _wit_dir) = setup_test_project_with_world(
         r#"package test:component@0.1.0;
 
 world example {
     import wasi:logging/logging@0.1.0-draft;
-    import wasi:config/store@0.2.0-draft;
+    import wasi:config/store@0.2.0-rc.1;
 }
 "#,
     )
@@ -173,7 +218,8 @@ world example {
 
     let lock_before = fs::read_to_string(temp.path().join("wkg.lock"))?;
 
-    // Selective update of one package (with timeout)
+    // Selective update invalidates by dropping the package's `wkg.lock` entry.
+    // An overridden package has none, so it reports that instead.
     let update_cmd = WitCommand::Update {
         package: Some("wasi:logging".to_string()),
     };
@@ -181,14 +227,17 @@ world example {
         .await
         .context("selective update timed out after 60s")?
         .context("selective update failed")?;
-    assert!(result.is_success(), "selective update should succeed");
+    assert!(
+        !result.is_success(),
+        "selective update of a path-overridden package should report it is not locked"
+    );
 
+    // Rejecting it returns before the lock file is rewritten.
     let lock_after = fs::read_to_string(temp.path().join("wkg.lock"))?;
-
-    // Lock file should have changed (or at least been reprocessed)
-    // Note: If already at latest, content might be same but process should succeed
-    let _ = lock_before;
-    let _ = lock_after;
+    assert_eq!(
+        lock_before, lock_after,
+        "a rejected selective update should leave wkg.lock untouched"
+    );
 
     // Full update (with timeout)
     let update_all_cmd = WitCommand::Update { package: None };
@@ -209,7 +258,7 @@ async fn test_remove_workflow() -> Result<()> {
 
 world example {
     import wasi:logging/logging@0.1.0-draft;
-    import wasi:config/store@0.2.0-draft;
+    import wasi:config/store@0.2.0-rc.1;
 }
 "#,
     )
@@ -253,8 +302,8 @@ world example {
 /// Test 4: Build workflow
 /// Tests that build creates wasm file in correct location
 #[tokio::test]
-#[ignore] // Requires valid WIT and network
 async fn test_build_output_location() -> Result<()> {
+    let _cwd = lock_cwd().await;
     let (temp, _wit_dir) = setup_test_project_with_world(
         r#"package test:component@1.0.0;
 

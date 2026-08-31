@@ -9,17 +9,15 @@
 //! outgoing-request egress policy itself lives on the unified
 //! [`crate::host::http::OutgoingHandler`] trait via its `send_request_p3` method.
 
-use crate::engine::ctx::SharedCtx;
-use crate::observability::FuelConsumptionMeter;
+use crate::engine::instance_pool::ComponentInstance;
+use crate::observability::GuestMeter;
 use http_body_util::BodyExt;
 use tracing::Instrument;
-use wasmtime::Store;
-use wasmtime::component::InstancePre;
-use wasmtime_wasi_http::p3::bindings::ServicePre;
+use wasmtime_wasi_http::p3::bindings::Service;
 use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
 
 /// Body type used on the P3 outgoing path (also used as the return-body type
-/// for [`handle_component_request_p3`]).
+/// for `handle_component_request_p3`).
 pub type P3Body = http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, ErrorCode>;
 
 /// Future returned to the guest to communicate request-side processing errors.
@@ -41,10 +39,10 @@ pub type P3SendFuture = Box<dyn std::future::Future<Output = P3SendResult> + Sen
 struct ChannelBody {
     rx: tokio::sync::mpsc::Receiver<Result<hyper::body::Frame<bytes::Bytes>, ErrorCode>>,
     /// Aborts the component task when this body is dropped before the stream
-    /// completes (e.g. the client disconnects). Without this, a guest that is
-    /// busy computing — rather than parked on a frame send — would keep running
-    /// until its next send; there is no epoch/wall-clock backstop. Held only
-    /// for its `Drop`.
+    /// completes (e.g. the client disconnects). The abort lands at the guest's
+    /// next await, reclaiming a yielding guest at once; a guest that never
+    /// yields is unreachable by it and is ended by its abandoned call instead
+    /// (see [`crate::engine::abandon`]). Held only for its `Drop`.
     _task: tokio_util::task::AbortOnDropHandle<()>,
 }
 
@@ -57,6 +55,18 @@ impl hyper::body::Body for ChannelBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
         self.rx.poll_recv(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.rx.is_closed() && self.rx.is_empty()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        if self.is_end_stream() {
+            hyper::body::SizeHint::with_exact(0)
+        } else {
+            hyper::body::SizeHint::default()
+        }
     }
 }
 
@@ -71,16 +81,15 @@ impl hyper::body::Body for ChannelBody {
 /// guest stays alive until the body has been fully drained, and a slow client
 /// applies backpressure to the guest rather than buffering the whole body in
 /// memory.
-pub async fn handle_component_request_p3(
-    mut store: Store<SharedCtx>,
-    pre: InstancePre<SharedCtx>,
+pub(crate) async fn handle_component_request_p3(
+    warm: ComponentInstance,
     req: hyper::Request<hyper::body::Incoming>,
-    fuel_meter: FuelConsumptionMeter,
+    abandoned: std::sync::Arc<crate::engine::abandon::AbandonFlag>,
+    guest_meter: GuestMeter,
 ) -> anyhow::Result<hyper::Response<P3Body>> {
-    let _ = &fuel_meter; // fuel metering integration deferred to match P2's observe() pattern
-
-    let service_pre = ServicePre::new(pre)
-        .map_err(|e| anyhow::anyhow!(e).context("failed to create P3 ServicePre"))?;
+    // Not measured here: this path hands its store to `run_concurrent` and
+    // never holds a `&mut Store` around the call, so it has nothing to wrap.
+    let _ = &guest_meter;
 
     // Convert the hyper request body — map error type since hyper::Error doesn't impl Into<ErrorCode>
     let (parts, body) = req.into_parts();
@@ -108,11 +117,21 @@ pub async fn handle_component_request_p3(
     // task is aborted rather than detached to run unbounded.
     let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
         async move {
-            let service = match service_pre.instantiate_async(&mut store).await {
+            let ComponentInstance {
+                mut store,
+                instance,
+            } = warm;
+            // Watched for the life of the store's run: the dispatcher enforces
+            // the deadline out where a non-yielding guest cannot block it.
+            let _abandoned = store.data().abandoned.watch(abandoned);
+            // A binding view over the instance, rebuilt per request. Cheap
+            // (export lookups); the expensive part -- the store and the
+            // instantiation -- is what a warm instance carries over.
+            let service = match Service::new(&mut store, &instance) {
                 Ok(service) => service,
                 Err(e) => {
                     let _ = parts_tx.send(Err(
-                        anyhow::anyhow!(e).context("failed to instantiate P3 service")
+                        anyhow::anyhow!(e).context("failed to bind P3 service exports")
                     ));
                     return;
                 }
@@ -214,11 +233,16 @@ pub async fn handle_component_request_p3(
                     handler_result
                 })
                 .await;
+            // This store served exactly this request: a component that keeps
+            // instances warm is served by a driver instead (see
+            // `engine::instance_driver`), and only reaches here when every warm
+            // instance was busy.
             match run {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::error!(err = ?e, "P3 response streaming failed"),
                 Err(e) => tracing::error!(err = ?e, "P3 run_concurrent failed"),
             }
+            drop(store);
         }
         .in_current_span(),
     ));
@@ -239,6 +263,38 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use hyper::body::Frame;
+
+    /// `ChannelBody` must report end-of-stream **at rest** — closed sender,
+    /// drained buffer — not only through a terminal poll: hyper stops polling
+    /// a fixed-length body early, and `WatchedBody` reads this to tell a
+    /// delivered response from an abandoned one.
+    #[tokio::test]
+    async fn channel_body_reports_end_of_stream_at_rest() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, ErrorCode>>(4);
+        let mut body = ChannelBody {
+            rx,
+            _task: tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async {})),
+        };
+        assert!(!hyper::body::Body::is_end_stream(&body));
+
+        tx.send(Ok(Frame::data(Bytes::from_static(b"data"))))
+            .await
+            .expect("send");
+        drop(tx);
+        // Closed but not yet drained: the last frame is still deliverable.
+        assert!(!hyper::body::Body::is_end_stream(&body));
+
+        let frame = std::future::poll_fn(|cx| {
+            hyper::body::Body::poll_frame(std::pin::Pin::new(&mut body), cx)
+        })
+        .await
+        .expect("a frame")
+        .expect("not an error");
+        assert!(frame.is_data());
+        // Closed and drained: ended, with an exact size of zero.
+        assert!(hyper::body::Body::is_end_stream(&body));
+        assert_eq!(hyper::body::Body::size_hint(&body).exact(), Some(0));
+    }
 
     /// `ChannelBody` must forward frames **incrementally**, a consumer should
     /// receive a frame while the producer is still parked, not only after the

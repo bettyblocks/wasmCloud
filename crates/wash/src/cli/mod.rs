@@ -253,7 +253,7 @@ pub struct CliContext {
     // the original working directory when the CLI was invoked, used for resolving relative paths in commands
     original_working_dir: PathBuf,
     // Enable fuel meter
-    enable_meters: bool,
+    meters: wash_runtime::observability::MeterKind,
 }
 
 impl Deref for CliContext {
@@ -270,7 +270,9 @@ pub struct CliContextBuilder {
     non_interactive: bool,
     config: Option<PathBuf>,
     project_dir: Option<PathBuf>,
-    enable_meters: bool,
+    meters: wash_runtime::observability::MeterKind,
+    #[cfg(test)]
+    keep_working_dir: bool,
 }
 
 impl CliContextBuilder {
@@ -289,8 +291,16 @@ impl CliContextBuilder {
         self
     }
 
-    pub fn enable_meters(mut self, enable_meters: bool) -> Self {
-        self.enable_meters = enable_meters;
+    pub fn meters(mut self, meters: wash_runtime::observability::MeterKind) -> Self {
+        self.meters = meters;
+        self
+    }
+
+    /// Leave the process working directory where it is. Tests share one process, so a test that
+    /// moved it would move it under every other test running at the same time.
+    #[cfg(test)]
+    pub(crate) fn keep_working_dir(mut self) -> Self {
+        self.keep_working_dir = true;
         self
     }
 
@@ -361,7 +371,13 @@ impl CliContextBuilder {
         };
 
         // Change working directory to project path
-        std::env::set_current_dir(&project_dir).context("failed to open project directory")?;
+        #[cfg(test)]
+        let move_working_dir = !self.keep_working_dir;
+        #[cfg(not(test))]
+        let move_working_dir = true;
+        if move_working_dir {
+            std::env::set_current_dir(&project_dir).context("failed to open project directory")?;
+        }
 
         Ok(CliContext {
             app_strategy,
@@ -369,7 +385,7 @@ impl CliContextBuilder {
             project_dir,
             original_working_dir,
             config: self.config,
-            enable_meters: self.enable_meters,
+            meters: self.meters,
         })
     }
 }
@@ -471,8 +487,8 @@ impl CliContext {
         locate_project_config(self.project_dir())
     }
 
-    pub fn enable_meters(&self) -> bool {
-        self.enable_meters
+    pub fn meters(&self) -> wash_runtime::observability::MeterKind {
+        self.meters
     }
 
     pub fn load_config<T>(&self, overrides: Option<T>) -> anyhow::Result<Config>

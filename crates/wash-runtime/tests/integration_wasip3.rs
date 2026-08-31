@@ -17,7 +17,7 @@ use wash_runtime::{
 };
 
 mod common;
-use common::{http_counter_host_interfaces, start_host_with_p3};
+use common::{http_counter_host_interfaces, start_host_with_p3_http_handler};
 
 const HTTP_COUNTER_WASM: &[u8] = include_bytes!("wasm/http_counter.wasm");
 
@@ -117,7 +117,7 @@ fn test_targets_wasip3_ignores_non_wasi() {
 
 #[tokio::test]
 async fn test_p2_http_component_works_with_p3_enabled() -> Result<()> {
-    let (addr, host) = start_host_with_p3("127.0.0.1:0").await?;
+    let (addr, host) = start_host_with_p3_http_handler("127.0.0.1:0").await?;
 
     let req = WorkloadStartRequest {
         workload_id: uuid::Uuid::new_v4().to_string(),
@@ -140,12 +140,17 @@ async fn test_p2_http_component_works_with_p3_enabled() -> Result<()> {
                     volume_mounts: vec![],
                     // http-counter calls example.com — empty-list default would deny.
                     allowed_hosts: vec!["example.com".parse().unwrap()].into(),
+                    allowed_ip_name_lookups: Default::default(),
+                    allowed_host_loopback_ports: Default::default(),
                 },
                 source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
                     HTTP_COUNTER_WASM,
                 )),
                 pool_size: 1,
                 max_invocations: 100,
+                max_concurrency: 1,
+                reclaim_window_seconds: 0,
+                reclaim_min_instances: 0,
             }],
             host_interfaces: http_counter_host_interfaces("p2-test"),
             volumes: vec![],
@@ -182,7 +187,7 @@ async fn test_p2_http_component_works_with_p3_enabled() -> Result<()> {
 
 #[tokio::test]
 async fn test_p2_concurrent_requests_with_p3_enabled() -> Result<()> {
-    let (addr, host) = start_host_with_p3("127.0.0.1:0").await?;
+    let (addr, host) = start_host_with_p3_http_handler("127.0.0.1:0").await?;
 
     let req = WorkloadStartRequest {
         workload_id: uuid::Uuid::new_v4().to_string(),
@@ -204,6 +209,9 @@ async fn test_p2_concurrent_requests_with_p3_enabled() -> Result<()> {
                 )),
                 pool_size: 1,
                 max_invocations: 100,
+                max_concurrency: 1,
+                reclaim_window_seconds: 0,
+                reclaim_min_instances: 0,
             }],
             host_interfaces: http_counter_host_interfaces("concurrent-test"),
             volumes: vec![],
@@ -267,6 +275,9 @@ async fn test_p3_linker_accepts_p2_component() -> Result<()> {
             )),
             pool_size: 1,
             max_invocations: 100,
+            max_concurrency: 1,
+            reclaim_window_seconds: 0,
+            reclaim_min_instances: 0,
         }],
         host_interfaces: http_counter_host_interfaces("linker-test"),
         volumes: vec![],
