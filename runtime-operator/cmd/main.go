@@ -203,7 +203,7 @@ func main() {
 	flag.DurationVar(
 		&heartbeatTTL,
 		"heartbeat-ttl",
-		3*time.Minute,
+		runtime_operator.DefaultHeartbeatTTL,
 		"How long a Host may go without a processed heartbeat before it's considered "+
 			"unreachable and deleted (which also deletes every Workload assigned to it). ",
 	)
