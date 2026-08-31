@@ -178,6 +178,13 @@ operator:
   # `CrossEnvironmentSchedulingDenied` Warning Event and a
   # `HostSelection=False` condition on the Workload.
   allowSharedHosts: true
+  # -- How long a Host may go without a processed heartbeat before it's
+  # considered unreachable and deleted (which also deletes every Workload
+  # assigned to it). Go duration string.
+  heartbeatTTL: "60s"
+  # -- How many Workloads, WorkloadDeployments, and Hosts each controller
+  # reconciles at once.
+  workloadConcurrency: 10
   # -- Additional environment variables for the operator container, appended
   # after the chart-managed vars. Standard Kubernetes env shape (supports
   # `valueFrom` secretKeyRef / configMapKeyRef).
@@ -223,6 +230,20 @@ operator:
     # -- Scheme-qualified URL prefix where precompiled .cwasm bytes are
     # stored.
     artifactBaseURL: "nats://precompiled-artifacts"
+    # -- NATS URL the precompile Worker Job connects to (its NATS_URL env
+    # var) to write precompiled .cwasm bytes, and that the precompile GC
+    # reads/deletes from. This is the Data plane endpoint hosts fetch
+    # precompiled components from (wash host --data-nats-url), which may
+    # differ from the Scheduler/control-plane endpoint used elsewhere.
+    # Empty defaults to the Scheduler NATS URL — that fallback exists for
+    # local dev (avoids running two NATS instances) and should not be
+    # relied on where the Data and Scheduler planes are actually separate.
+    natsURL: ""
+    # -- JetStream replica count for the precompiled-artifacts object store
+    # bucket. Only takes effect when the bucket doesn't already exist — the
+    # precompile Worker attaches to (rather than reconfigures) an existing
+    # bucket's replica count.
+    artifactReplicas: 1
     # -- Comma-separated registries the precompile Worker may pull from over
     # plain HTTP (e.g. a local dev registry). Mirrors the host's
     # INSECURE_REGISTRIES allowlist. Empty (default) means HTTPS-only.

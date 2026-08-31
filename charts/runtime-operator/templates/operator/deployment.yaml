@@ -52,10 +52,16 @@ spec:
             - "-host-namespaces={{ . }}"
             {{- end }}
             - "-allow-shared-hosts={{ .Values.operator.allowSharedHosts }}"
+            - "-heartbeat-ttl={{ .Values.operator.heartbeatTTL }}"
+            - "-workload-concurrency={{ .Values.operator.workloadConcurrency }}"
             # BettyBlocks: precompile-controller args (retained in upstream merge; -leader-elect/extraArgs below are upstream's).
             {{- if .Values.operator.precompile.enabled }}
             - "-precompile-worker-image={{ if $precompileRegistry }}{{ printf "%s/%s" $precompileRegistry .Values.operator.precompile.image.repository }}{{ else }}{{ .Values.operator.precompile.image.repository }}{{ end }}:{{ .Values.operator.precompile.image.tag | default .Chart.AppVersion }}"
+            {{- with .Values.operator.precompile.natsURL }}
+            - "-precompile-nats-url={{ . }}"
+            {{- end }}
             - "-precompile-artifact-base-url={{ .Values.operator.precompile.artifactBaseURL }}"
+            - "-precompile-artifact-replicas={{ .Values.operator.precompile.artifactReplicas }}"
             - "-precompile-target={{ .Values.operator.precompile.target }}"
             - "-precompile-wasmtime-version={{ required "operator.precompile.wasmtimeVersion is required when operator.precompile.enabled is true" .Values.operator.precompile.wasmtimeVersion }}"
             {{- with .Values.operator.precompile.insecureRegistries }}
