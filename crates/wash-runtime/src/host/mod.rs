@@ -553,15 +553,65 @@ impl Host {
 
         // Bounded: resolve() makes remote plugin calls that can hang on a degraded
         // JetStream API, wedging this start and every command queued behind it.
-        let resolve_future =
-            unresolved_workload.resolve(Some(&self.plugins), self.http_handler.clone());
-        let mut resolved_workload = match self.config.plugin_lifecycle_timeout {
-            Some(timeout) => tokio::time::timeout(timeout, resolve_future)
+        //
+        // Spawned rather than raced-and-dropped: `resolve()` already unbinds
+        // whatever it bound on every internal error path, but that cleanup
+        // lives *after* the await points that can hang — dropping the future
+        // on timeout (as `tokio::time::timeout(timeout, resolve_future)`
+        // would) cancels it mid-flight and skips that cleanup entirely,
+        // orphaning anything already bound (e.g. NatsMessaging's subscriber
+        // task, spawned detached inside `on_workload_resolved` before the
+        // tracker even records its handle). Spawning instead lets the task
+        // keep running and reach its own cleanup regardless of how long this
+        // caller waits on it; if it later succeeds after we've already
+        // reported the start as failed, we unbind everything ourselves.
+        let plugins = self.plugins.clone();
+        let http_handler = self.http_handler.clone();
+        let mut resolve_task = tokio::spawn(async move {
+            unresolved_workload
+                .resolve(Some(&plugins), http_handler)
                 .await
-                .unwrap_or_else(|_| {
-                    Err(anyhow!("timed out resolving workload after {timeout:?}"))
-                })?,
-            None => resolve_future.await?,
+        });
+        let mut resolved_workload = match self.config.plugin_lifecycle_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, &mut resolve_task).await {
+                Ok(join_result) => {
+                    join_result.context("workload resolve task panicked or was cancelled")??
+                }
+                Err(_) => {
+                    let workload_id = request.workload_id.clone();
+                    tokio::spawn(async move {
+                        match resolve_task.await {
+                            Ok(Ok(resolved)) => {
+                                warn!(
+                                    workload_id,
+                                    "workload resolved after its start already timed out; unbinding"
+                                );
+                                if let Err(e) = resolved.unbind_all_plugins().await {
+                                    warn!(
+                                        workload_id,
+                                        error = ?e,
+                                        "failed to unbind plugins for a workload that resolved after its start timed out"
+                                    );
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                debug!(
+                                    workload_id,
+                                    error = ?e,
+                                    "workload resolve failed after its start already timed out (already unbound internally)"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(workload_id, error = ?e, "workload resolve task panicked or was cancelled after its start already timed out");
+                            }
+                        }
+                    });
+                    return Err(anyhow!("timed out resolving workload after {timeout:?}"));
+                }
+            },
+            None => resolve_task
+                .await
+                .context("workload resolve task panicked or was cancelled")??,
         };
 
         // If the service didn't run and we had one, warn
