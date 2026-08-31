@@ -37,6 +37,7 @@ async fn write_nats(output: &Url, mut bytes: &[u8]) -> Result<()> {
         Err(_) => jetstream
             .create_object_store(object_store::Config {
                 bucket: bucket.clone(),
+                num_replicas: object_store_replicas()?,
                 ..Default::default()
             })
             .await
@@ -49,6 +50,19 @@ async fn write_nats(output: &Url, mut bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("failed to put '{key}' in '{bucket}'"))?;
 
     Ok(())
+}
+
+/// Reads `OBJECT_STORE_REPLICAS`, defaulting to 1 when unset. Only applies
+/// when the object store bucket doesn't already exist, since we attach to
+/// (rather than reconfigure) an existing bucket's replica count.
+fn object_store_replicas() -> Result<usize> {
+    match env::var("OBJECT_STORE_REPLICAS") {
+        Ok(val) => val
+            .parse()
+            .with_context(|| format!("invalid OBJECT_STORE_REPLICAS value: '{val}'")),
+        Err(env::VarError::NotPresent) => Ok(1),
+        Err(e) => Err(e).context("failed to read OBJECT_STORE_REPLICAS"),
+    }
 }
 
 fn parse_nats_url(url: &Url) -> Result<(String, String)> {
@@ -98,5 +112,42 @@ mod tests {
         let url = Url::parse("nats://bucket/").unwrap();
         let err = parse_nats_url(&url).unwrap_err();
         assert!(err.to_string().contains("missing object key"));
+    }
+
+    // OBJECT_STORE_REPLICAS is process-global env state; serialize access so
+    // these tests don't race each other when run in parallel test threads.
+    static REPLICAS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn object_store_replicas_defaults_to_one_when_unset() {
+        let _guard = REPLICAS_ENV_LOCK.lock().unwrap();
+        unsafe { env::remove_var("OBJECT_STORE_REPLICAS") };
+        assert_eq!(object_store_replicas().unwrap(), 1);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn object_store_replicas_reads_configured_value() {
+        let _guard = REPLICAS_ENV_LOCK.lock().unwrap();
+        unsafe { env::set_var("OBJECT_STORE_REPLICAS", "3") };
+        let result = object_store_replicas();
+        unsafe { env::remove_var("OBJECT_STORE_REPLICAS") };
+        assert_eq!(result.unwrap(), 3);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn object_store_replicas_errors_on_invalid_value() {
+        let _guard = REPLICAS_ENV_LOCK.lock().unwrap();
+        unsafe { env::set_var("OBJECT_STORE_REPLICAS", "not-a-number") };
+        let result = object_store_replicas();
+        unsafe { env::remove_var("OBJECT_STORE_REPLICAS") };
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid OBJECT_STORE_REPLICAS")
+        );
     }
 }

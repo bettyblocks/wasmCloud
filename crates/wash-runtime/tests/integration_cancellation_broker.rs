@@ -219,6 +219,7 @@ fn parse_steps(body: &str) -> (Vec<&str>, bool) {
 /// Baseline: nobody cancels, so the plan runs all ten steps to completion.
 /// Without this, a broker that cancelled everything would pass the tests below.
 #[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
 async fn test_uncancelled_plan_runs_to_completion() -> Result<()> {
     let harness = setup().await?;
 
@@ -236,6 +237,7 @@ async fn test_uncancelled_plan_runs_to_completion() -> Result<()> {
 /// The headline: a cancel issued by a component on a *different host* stops the
 /// worker mid-job. The only path between the two is the JetStream KV bucket.
 #[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
 async fn test_cancel_from_another_host_stops_worker_midway() -> Result<()> {
     const PLAN: &str = "cross-host";
     let harness = setup().await?;
@@ -275,6 +277,7 @@ async fn test_cancel_from_another_host_stops_worker_midway() -> Result<()> {
 /// reading its current value: a watch-only implementation would hang here until
 /// the job ran to completion, since no further update is ever published.
 #[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
 async fn test_cancel_set_before_run_is_observed_immediately() -> Result<()> {
     const PLAN: &str = "pre-cancelled";
     let harness = setup().await?;
@@ -299,6 +302,7 @@ async fn test_cancel_set_before_run_is_observed_immediately() -> Result<()> {
 /// `set-cancel(id, false)` clears the flag, so an id used by a cancelled run is
 /// reusable — the flag is per-plan state, not a permanent tombstone.
 #[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
 async fn test_cleared_flag_allows_plan_id_reuse() -> Result<()> {
     const PLAN: &str = "reused";
     let harness = setup().await?;
@@ -329,6 +333,7 @@ async fn test_cleared_flag_allows_plan_id_reuse() -> Result<()> {
 /// Cancellation is scoped to its plan id: cancelling one plan leaves another
 /// running. A bucket-wide or key-agnostic watch would fail this.
 #[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
 async fn test_cancel_for_different_plan_does_not_affect_worker() -> Result<()> {
     const RUNNING_PLAN: &str = "alpha";
     const OTHER_PLAN: &str = "beta";

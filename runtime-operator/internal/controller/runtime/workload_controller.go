@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math/rand/v2"
@@ -12,6 +13,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 
 	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
 	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus"
@@ -50,7 +52,12 @@ type WorkloadReconciler struct {
 	// Spec.Environment). When false, cross-tenant scheduling is rejected
 	// and a Warning Event is recorded on the Workload.
 	AllowSharedHosts bool
-	reconciler       condition.AnyConditionedReconciler
+	// MaxConcurrentReconciles bounds how many Workloads this controller
+	// reconciles at once.
+	// Defaults to 1 when unset, so
+	// existing callers that don't set it keep today's behavior.
+	MaxConcurrentReconciles int
+	reconciler              condition.AnyConditionedReconciler
 }
 
 func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -508,5 +515,6 @@ func (r *WorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&runtimev1alpha1.Workload{}).
 		Named("workload-replica").
+		WithOptions(controller.Options{MaxConcurrentReconciles: cmp.Or(r.MaxConcurrentReconciles, 1)}).
 		Complete(r)
 }

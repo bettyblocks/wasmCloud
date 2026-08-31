@@ -46,7 +46,7 @@ type PrecompileReconciler struct {
 
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=artifacts,verbs=get;list;watch
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=artifacts/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
 
 func (r *PrecompileReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -77,8 +77,8 @@ func (r *PrecompileReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
-	if res, err, done := r.handleImageChange(ctx, &a, desired); done {
-		return res, err
+	if err, done := r.handleImageChange(ctx, &a, desired); done {
+		return ctrl.Result{}, err
 	}
 
 	if err := r.Create(ctx, desired); err != nil && !apierrors.IsAlreadyExists(err) {
@@ -290,7 +290,7 @@ func (r *PrecompileReconciler) handleFailedJob(
 
 func (r *PrecompileReconciler) handleImageChange(
 	ctx context.Context, a *runtimev1alpha1.Artifact, desired *batchv1.Job,
-) (ctrl.Result, error, bool) {
+) (error, bool) {
 	var existing batchv1.Job
 	err := r.Get(ctx, types.NamespacedName{
 		Name: desired.Name, Namespace: desired.Namespace,
@@ -298,23 +298,23 @@ func (r *PrecompileReconciler) handleImageChange(
 	switch {
 	case err == nil:
 		if existing.DeletionTimestamp != nil {
-			return ctrl.Result{}, nil, true
+			return nil, true
 		}
 		if !argsMatch(&existing, desired) {
 			if delErr := r.Delete(ctx, &existing,
 				client.PropagationPolicy(metav1.DeletePropagationBackground),
 				client.GracePeriodSeconds(0),
 			); delErr != nil && !apierrors.IsNotFound(delErr) {
-				return ctrl.Result{}, delErr, true
+				return delErr, true
 			}
 			base := a.DeepCopy()
 			a.Status.Precompiled = nil
-			return ctrl.Result{}, r.Status().Patch(ctx, a, client.MergeFrom(base)), true
+			return r.Status().Patch(ctx, a, client.MergeFrom(base)), true
 		}
-		return ctrl.Result{}, nil, false
+		return nil, false
 	case !apierrors.IsNotFound(err):
-		return ctrl.Result{}, err, true
+		return err, true
 	default:
-		return ctrl.Result{}, nil, false
+		return nil, false
 	}
 }

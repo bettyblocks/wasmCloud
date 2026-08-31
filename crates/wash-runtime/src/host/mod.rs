@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use names::{Generator, Name};
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, trace, warn};
@@ -551,9 +551,68 @@ impl Host {
             .engine
             .initialize_workload(&request.workload_id, request.workload)?;
 
-        let mut resolved_workload = unresolved_workload
-            .resolve(Some(&self.plugins), self.http_handler.clone())
-            .await?;
+        // Bounded: resolve() makes remote plugin calls that can hang on a degraded
+        // JetStream API, wedging this start and every command queued behind it.
+        //
+        // Spawned rather than raced-and-dropped: `resolve()` already unbinds
+        // whatever it bound on every internal error path, but that cleanup
+        // lives *after* the await points that can hang — dropping the future
+        // on timeout (as `tokio::time::timeout(timeout, resolve_future)`
+        // would) cancels it mid-flight and skips that cleanup entirely,
+        // orphaning anything already bound (e.g. NatsMessaging's subscriber
+        // task, spawned detached inside `on_workload_resolved` before the
+        // tracker even records its handle). Spawning instead lets the task
+        // keep running and reach its own cleanup regardless of how long this
+        // caller waits on it; if it later succeeds after we've already
+        // reported the start as failed, we unbind everything ourselves.
+        let plugins = self.plugins.clone();
+        let http_handler = self.http_handler.clone();
+        let mut resolve_task = tokio::spawn(async move {
+            unresolved_workload
+                .resolve(Some(&plugins), http_handler)
+                .await
+        });
+        let mut resolved_workload = match self.config.plugin_lifecycle_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, &mut resolve_task).await {
+                Ok(join_result) => {
+                    join_result.context("workload resolve task panicked or was cancelled")??
+                }
+                Err(_) => {
+                    let workload_id = request.workload_id.clone();
+                    tokio::spawn(async move {
+                        match resolve_task.await {
+                            Ok(Ok(resolved)) => {
+                                warn!(
+                                    workload_id,
+                                    "workload resolved after its start already timed out; unbinding"
+                                );
+                                if let Err(e) = resolved.unbind_all_plugins().await {
+                                    warn!(
+                                        workload_id,
+                                        error = ?e,
+                                        "failed to unbind plugins for a workload that resolved after its start timed out"
+                                    );
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                debug!(
+                                    workload_id,
+                                    error = ?e,
+                                    "workload resolve failed after its start already timed out (already unbound internally)"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(workload_id, error = ?e, "workload resolve task panicked or was cancelled after its start already timed out");
+                            }
+                        }
+                    });
+                    return Err(anyhow!("timed out resolving workload after {timeout:?}"));
+                }
+            },
+            None => resolve_task
+                .await
+                .context("workload resolve task panicked or was cancelled")??,
+        };
 
         // If the service didn't run and we had one, warn
         if service_present && resolved_workload.execute_service().await?.is_none() {
@@ -877,8 +936,19 @@ impl HostApi for Host {
                 // Stop the service if running
                 resolved_workload.stop_service();
 
-                // Unbind all plugins from the workload
-                if let Err(e) = resolved_workload.unbind_all_plugins().await {
+                // Bounded: unbind can make remote calls that hang on a degraded
+                // JetStream API, wedging this stop and every command queued behind it.
+                let unbind_result = match self.config.plugin_lifecycle_timeout {
+                    Some(timeout) => {
+                        tokio::time::timeout(timeout, resolved_workload.unbind_all_plugins())
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(anyhow!("timed out unbinding plugins after {timeout:?}"))
+                            })
+                    }
+                    None => resolved_workload.unbind_all_plugins().await,
+                };
+                if let Err(e) = unbind_result {
                     warn!(
                         workload_id = request.workload_id,
                         error = ?e,
@@ -940,6 +1010,12 @@ pub struct HostConfig {
     pub compiled_cache_dir: Option<PathBuf>,
     /// Bound on fetching a single precompiled component.
     pub precompiled_fetch_timeout: Option<Duration>,
+    /// Bound on a workload's plugin bind/unbind calls (e.g. cancellation-broker's
+    /// JetStream KV setup), which can hang on a degraded JetStream API.
+    pub plugin_lifecycle_timeout: Option<Duration>,
+    /// Bound on publishing a command's reply back to NATS. A degraded NATS server can
+    /// leave the publish pending indefinitely (internal channel/socket backpressure).
+    pub command_reply_timeout: Option<Duration>,
 }
 
 impl Default for HostConfig {
@@ -950,6 +1026,8 @@ impl Default for HostConfig {
             oci_cache_dir: None,
             compiled_cache_dir: None,
             precompiled_fetch_timeout: Duration::from_secs(30).into(),
+            plugin_lifecycle_timeout: Duration::from_secs(30).into(),
+            command_reply_timeout: Duration::from_secs(30).into(),
         }
     }
 }

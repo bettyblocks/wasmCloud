@@ -354,12 +354,19 @@ var _ = Describe("precompile pipeline", func() {
 				To(ContainElement(testArtifactImage))
 		}).Should(Succeed())
 
-		var updated runtimev1alpha1.Artifact
-		Expect(k8sClient.Get(ctx, types.NamespacedName{
-			Namespace: "default", Name: a.Name,
-		}, &updated)).To(Succeed())
-		updated.Spec.Image = "ghcr.io/example/comp:v2"
-		Expect(k8sClient.Update(ctx, &updated)).To(Succeed())
+		// Get-then-Update, retried as a unit: the reconciler can patch this
+		// same Artifact's status between our Get and our Update (e.g.
+		// recording the Precompiled variant), bumping resourceVersion and
+		// turning a stale Update into a 409 conflict. Retrying re-fetches
+		// the latest version each time rather than fighting one snapshot.
+		Eventually(func(g Gomega) {
+			var updated runtimev1alpha1.Artifact
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: "default", Name: a.Name,
+			}, &updated)).To(Succeed())
+			updated.Spec.Image = "ghcr.io/example/comp:v2"
+			g.Expect(k8sClient.Update(ctx, &updated)).To(Succeed())
+		}).Should(Succeed())
 
 		Eventually(func(g Gomega) {
 			var newJob batchv1.Job

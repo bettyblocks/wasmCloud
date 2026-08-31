@@ -66,6 +66,7 @@ func main() {
 	var (
 		metricsAddr                  string
 		natsUrl                      string
+		precompileNatsUrl            string
 		natsCreds                    string
 		natsCa                       string
 		natsClientCert               string
@@ -90,6 +91,9 @@ func main() {
 		precompileInsecureRegistries string
 		precompileGCInterval         time.Duration
 		precompileGCGracePeriod      time.Duration
+		precompileArtifactReplicas   uint
+		workloadConcurrency          int
+		heartbeatTTL                 time.Duration
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
@@ -101,6 +105,16 @@ func main() {
 	flag.StringVar(&natsClientKey, "nats-client-key", "", "Path to TLS client key pem")
 	flag.BoolVar(&natsTLSFirst, "nats-tls-first", false, "Skip NATS Server discovery during TLS")
 	flag.StringVar(&natsUrl, "nats-url", wasmbus.NatsDefaultURL, "The nats server address to connect to.")
+	flag.StringVar(
+		&precompileNatsUrl,
+		"precompile-nats-url",
+		"",
+		"NATS URL the precompile Worker Job connects to (its NATS_URL env var) to write "+
+			"precompiled .cwasm bytes, and that the precompile GC reads/deletes from. This "+
+			"is the Data plane endpoint hosts fetch precompiled components from "+
+			"(wash host --data-nats-url), which may differ from -nats-url (the "+
+			"Scheduler/control-plane endpoint). Defaults to -nats-url when unset.",
+	)
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -158,6 +172,13 @@ func main() {
 		"",
 		"Comma-separated registries the precompile Worker may pull from over plain HTTP.",
 	)
+	flag.UintVar(
+		&precompileArtifactReplicas,
+		"precompile-artifact-replicas",
+		1,
+		"JetStream replica count for the precompiled-artifacts object store bucket. "+
+			"Only takes effect when the bucket doesn't already exist.",
+	)
 	flag.DurationVar(
 		&precompileGCInterval,
 		"precompile-gc-interval",
@@ -171,6 +192,20 @@ func main() {
 		"Minimum age an unreferenced object must reach before precompile GC may "+
 			"delete it (guards the window between a Job writing an object and the "+
 			"operator recording it in Artifact status).",
+	)
+	flag.IntVar(
+		&workloadConcurrency,
+		"workload-concurrency",
+		10,
+		"How many Workloads, WorkloadDeployments, and Hosts each controller reconciles "+
+			"at once.",
+	)
+	flag.DurationVar(
+		&heartbeatTTL,
+		"heartbeat-ttl",
+		runtime_operator.DefaultHeartbeatTTL,
+		"How long a Host may go without a processed heartbeat before it's considered "+
+			"unreachable and deleted (which also deletes every Workload assigned to it). ",
 	)
 	flag.StringVar(
 		&watchNamespaces,
@@ -228,7 +263,8 @@ func main() {
 	operatorCfg := runtime_operator.EmbeddedOperatorConfig{
 		DisableArtifactController:    disableArtifactController,
 		NatsURL:                      natsUrl,
-		HeartbeatTTL:                 60 * time.Second,
+		PrecompileNatsURL:            precompileNatsUrl,
+		HeartbeatTTL:                 heartbeatTTL,
 		HostCPUThreshold:             cpuBackpressureThreshold,
 		HostMemoryThreshold:          memoryBackpressureThreshold,
 		Namespace:                    operatorNamespace,
@@ -242,6 +278,8 @@ func main() {
 		PrecompileInsecureRegistries: precompileInsecureRegistries,
 		PrecompileGCInterval:         precompileGCInterval,
 		PrecompileGCGracePeriod:      precompileGCGracePeriod,
+		PrecompileArtifactReplicas:   precompileArtifactReplicas,
+		WorkloadConcurrency:          workloadConcurrency,
 	}
 
 	if natsCreds != "" {
