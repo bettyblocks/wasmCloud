@@ -2156,44 +2156,37 @@ pub async fn handle_component_request(
     let call = DispatchedCall::new("HTTP (p2 cold store)", crate::timeouts::http_response());
     let watch_guard = store.data().abandoned.watch(call.flag());
 
-    // Run the component in a blocking thread so it does not starve the host's other
-    // async task. The NATS heartbeat keeps going, so the host CRD will not be killed
-    // Tokio's blocking pool defaults to 512 threads, so concurrency is bounded by
-    // that pool
-    let span = tracing::Span::current();
-    let task: JoinHandle<anyhow::Result<()>> = tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current().block_on(
-            async move {
-                // Watched for as long as the store runs guest code.
-                let _abandoned = watch_guard;
-                // Run the http request itself by instantiating and calling the component
-                let proxy = pre.instantiate_async(&mut store).await?;
+    let task: JoinHandle<anyhow::Result<()>> = tokio::task::spawn(
+        async move {
+            // Watched for as long as the store runs guest code.
+            let _abandoned = watch_guard;
+            // Run the http request itself by instantiating and calling the component
+            let proxy = pre.instantiate_async(&mut store).await?;
 
-                guest_meter
-                    .observe(
-                        &[
-                            KeyValue::new("plugin", "wasi-http"),
-                            KeyValue::new("method", method),
-                            KeyValue::new("host", host_header),
-                            KeyValue::new("uri", uri),
-                        ],
-                        &mut store,
-                        async move |store| {
-                            proxy
-                                .wasi_http_incoming_handler()
-                                .call_handle(store, req, out)
-                                .await?;
+            guest_meter
+                .observe(
+                    &[
+                        KeyValue::new("plugin", "wasi-http"),
+                        KeyValue::new("method", method),
+                        KeyValue::new("host", host_header),
+                        KeyValue::new("uri", uri),
+                    ],
+                    &mut store,
+                    async move |store| {
+                        proxy
+                            .wasi_http_incoming_handler()
+                            .call_handle(store, req, out)
+                            .await?;
 
-                            Ok(())
-                        },
-                    )
-                    .await?;
+                        Ok(())
+                    },
+                )
+                .await?;
 
-                Ok(())
-            }
-            .instrument(span),
-        )
-    });
+            Ok(())
+        }
+        .in_current_span(),
+    );
 
     match call.await_head(receiver).await {
         // If the client calls `response-outparam::set` then one of these
