@@ -880,7 +880,12 @@ impl Host {
         // to it is covered by this rollback instead of needing its own.
         if let Err(e) = start_resolved(&workload_id, &mut resolved_workload, service_present).await
         {
-            release(&workload_id, &resolved_workload, self.config.plugin_lifecycle_timeout).await;
+            release(
+                &workload_id,
+                &resolved_workload,
+                self.config.plugin_lifecycle_timeout,
+            )
+            .await;
             return Err(e);
         }
 
@@ -1396,7 +1401,12 @@ impl WorkloadReservation for Host {
         }
 
         if let Some(resolved) = orphaned {
-            release(&workload_id, &resolved, self.config.plugin_lifecycle_timeout).await;
+            release(
+                &workload_id,
+                &resolved,
+                self.config.plugin_lifecycle_timeout,
+            )
+            .await;
             // Only if the `Stopping` marker is still this start's. It may not be
             // — a failure reported mid-start writes `Error` over it — and then
             // the slot is not ours to drop.

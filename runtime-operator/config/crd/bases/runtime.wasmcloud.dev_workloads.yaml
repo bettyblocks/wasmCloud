@@ -275,6 +275,13 @@ spec:
                       format: int32
                       minimum: 0
                       type: integer
+                    precompiledUrl:
+                      description: |-
+                        PrecompiledURL is the URL of a precompiled .cwasm for this component.
+                        Populated by the WorkloadDeployment controller when the component
+                        references an Artifact that has a matching Status.Precompiled variant.
+                        Users should not set this directly — it is overwritten by the controller.
+                      type: string
                     reclaimMinInstances:
                       description: |-
                         ReclaimMinInstances is how many warm instances an idle sweep never
@@ -297,13 +304,6 @@ spec:
                       format: int32
                       minimum: 0
                       type: integer
-                    precompiledUrl:
-                      description: |-
-                        PrecompiledURL is the URL of a precompiled .cwasm for this component.
-                        Populated by the WorkloadDeployment controller when the component
-                        references an Artifact that has a matching Status.Precompiled variant.
-                        Users should not set this directly — it is overwritten by the controller.
-                      type: string
                   required:
                   - image
                   - name

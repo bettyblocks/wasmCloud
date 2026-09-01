@@ -99,7 +99,9 @@ fn sync_echo_request(workload_id: &str, host_header: &str, subject: &str) -> Wor
             components: vec![Component {
                 name: "echo".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(SYNC_ECHO_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    SYNC_ECHO_WASM,
+                )),
                 local_resources: LocalResources {
                     config: HashMap::from([("subscriptions".to_string(), subject.to_string())]),
                     ..Default::default()

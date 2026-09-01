@@ -135,7 +135,9 @@ async fn start_msg_sleeper(
             components: vec![Component {
                 name: "sleeper".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(MSG_SLEEPER_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    MSG_SLEEPER_WASM,
+                )),
                 local_resources: LocalResources {
                     config: HashMap::from([("subscriptions".to_string(), subject.to_string())]),
                     ..Default::default()

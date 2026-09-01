@@ -225,7 +225,9 @@ impl Call {
                 components: vec![Component {
                     name: self.component_name().to_string(),
                     digest: None,
-                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(self.wasm())),
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        self.wasm(),
+                    )),
                     local_resources: LocalResources::default(),
                     pool_size: 0,
                     max_invocations: 0,

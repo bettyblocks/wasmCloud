@@ -76,7 +76,9 @@ async fn start_pair_with_caller_pool(
                 Component {
                     name: "ephemeral-caller".to_string(),
                     digest: None,
-                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(EPHEMERAL_CALLER_P3_WASM)),
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        EPHEMERAL_CALLER_P3_WASM,
+                    )),
                     local_resources: LocalResources::default(),
                     pool_size: caller_pool_size,
                     max_invocations: 0,
@@ -87,7 +89,9 @@ async fn start_pair_with_caller_pool(
                 Component {
                     name: "ephemeral-callee".to_string(),
                     digest: None,
-                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(EPHEMERAL_CALLEE_P3_WASM)),
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        EPHEMERAL_CALLEE_P3_WASM,
+                    )),
                     local_resources: LocalResources::default(),
                     pool_size: callee_pool_size,
                     max_invocations: callee_max_invocations,
@@ -176,7 +180,9 @@ async fn start_http_component_with(
             components: vec![Component {
                 name: "http-counter".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(SVC_NO_RUN_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    SVC_NO_RUN_WASM,
+                )),
                 max_concurrency: 0,
                 reclaim_window_seconds: 0,
                 reclaim_min_instances: 0,

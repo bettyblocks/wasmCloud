@@ -123,7 +123,9 @@ async fn a_fuel_metering_host_runs_guest_code() -> Result<()> {
             components: vec![Component {
                 name: "cron-component".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(CRON_COMPONENT_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    CRON_COMPONENT_WASM,
+                )),
                 local_resources: Default::default(),
                 max_invocations: 1,
                 max_concurrency: 1,

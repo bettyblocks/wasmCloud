@@ -174,7 +174,9 @@ fn egress_workload_with(
             components: vec![Component {
                 name: "http-egress-pool.wasm".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(HTTP_EGRESS_POOL_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_EGRESS_POOL_WASM,
+                )),
                 local_resources: LocalResources {
                     memory_limit_mb: 128,
                     cpu_limit: 1,

@@ -154,7 +154,9 @@ async fn start_sleeper(host: &impl HostApi, name: &str, as_service: bool) -> Res
             vec![Component {
                 name: "sleeper".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(HTTP_SLEEPER_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_SLEEPER_WASM,
+                )),
                 local_resources: LocalResources::default(),
                 pool_size: 1,
                 max_invocations: 0,
@@ -197,7 +199,9 @@ async fn start_linked(host: &impl HostApi, name: &str, callee_pool: i32) -> Resu
                 Component {
                     name: "ephemeral-caller".to_string(),
                     digest: None,
-                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(EPHEMERAL_CALLER_P3_WASM)),
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        EPHEMERAL_CALLER_P3_WASM,
+                    )),
                     local_resources: LocalResources::default(),
                     pool_size: 1,
                     max_invocations: 0,
@@ -208,7 +212,9 @@ async fn start_linked(host: &impl HostApi, name: &str, callee_pool: i32) -> Resu
                 Component {
                     name: "ephemeral-callee".to_string(),
                     digest: None,
-                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(EPHEMERAL_CALLEE_P3_WASM)),
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        EPHEMERAL_CALLEE_P3_WASM,
+                    )),
                     local_resources: LocalResources::default(),
                     pool_size: callee_pool,
                     max_invocations: 0,

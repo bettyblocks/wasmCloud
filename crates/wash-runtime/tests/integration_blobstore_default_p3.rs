@@ -92,7 +92,9 @@ async fn p3_guest_plain_blobstore_uses_default_backend() -> Result<()> {
             components: vec![Component {
                 name: "blobstore-default-p3.wasm".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(BLOBSTORE_DEFAULT_P3_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    BLOBSTORE_DEFAULT_P3_WASM,
+                )),
                 local_resources: LocalResources::default(),
                 pool_size: 1,
                 max_invocations: 100,

@@ -45,7 +45,9 @@ fn echo_workload(host: &str) -> WorkloadStartRequest {
             components: vec![Component {
                 name: "http-loopback-gateway".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(HTTP_LOOPBACK_GATEWAY_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_LOOPBACK_GATEWAY_WASM,
+                )),
                 local_resources: LocalResources::default(),
                 pool_size: 1,
                 max_invocations: 1000,

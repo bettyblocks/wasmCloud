@@ -345,7 +345,9 @@ async fn start_sleeper_host(
             components: vec![Component {
                 name: "sleeper".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(HTTP_SLEEPER_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_SLEEPER_WASM,
+                )),
                 local_resources: LocalResources::default(),
                 pool_size,
                 max_invocations: 0,

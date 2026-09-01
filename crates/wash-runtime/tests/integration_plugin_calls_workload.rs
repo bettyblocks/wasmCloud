@@ -60,7 +60,9 @@ fn events_workload(workload_id: &str, host: &str, tag: &str) -> WorkloadStartReq
             components: vec![Component {
                 name: "events-caller".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(EVENTS_CALLER_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    EVENTS_CALLER_WASM,
+                )),
                 local_resources: LocalResources {
                     environment: HashMap::from([("EVENT_TAG".to_string(), tag.to_string())]),
                     ..LocalResources::default()

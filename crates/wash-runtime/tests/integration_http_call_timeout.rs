@@ -118,7 +118,9 @@ async fn a_wedged_pooled_instance_is_retired_and_replaced() -> Result<()> {
             components: vec![Component {
                 name: "sleeper".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(HTTP_SLEEPER_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_SLEEPER_WASM,
+                )),
                 local_resources: LocalResources::default(),
                 pool_size: 1,
                 max_invocations: 0,

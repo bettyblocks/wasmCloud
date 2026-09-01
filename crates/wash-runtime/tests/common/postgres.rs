@@ -111,7 +111,9 @@ pub async fn start_postgres_workload(
             components: vec![Component {
                 name: "postgres-stream-p3.wasm".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(STREAM_FIXTURE_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    STREAM_FIXTURE_WASM,
+                )),
                 local_resources: LocalResources::default(),
                 pool_size: 1,
                 max_invocations: 100,

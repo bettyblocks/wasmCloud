@@ -205,7 +205,9 @@ fn workload_request_with_limits(
             components: vec![Component {
                 name: "nats-handler".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(NATS_HANDLER_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    NATS_HANDLER_WASM,
+                )),
                 local_resources: LocalResources {
                     memory_limit_mb: 256,
                     cpu_limit: 1,
@@ -1096,7 +1098,9 @@ fn bridge_workload_request(
             components: vec![Component {
                 name: "nats-bridge".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(NATS_BRIDGE_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    NATS_BRIDGE_WASM,
+                )),
                 local_resources: LocalResources {
                     memory_limit_mb: 256,
                     cpu_limit: 1,

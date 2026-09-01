@@ -991,6 +991,7 @@ async fn link_native_imports(
         Vec::new(),
         LocalResources::default(),
         Arc::new(std::sync::Mutex::new(loopback::Network::default())),
+        None,
         InstancePolicy::Ephemeral,
     );
     // `WorkloadComponent::new` always mints its own fresh random component

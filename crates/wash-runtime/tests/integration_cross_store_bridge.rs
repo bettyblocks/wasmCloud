@@ -48,7 +48,9 @@ fn bridge_workload(host: &str) -> WorkloadStartRequest {
             components: vec![Component {
                 name: "bridge-backend".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(BRIDGE_BACKEND_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    BRIDGE_BACKEND_WASM,
+                )),
                 local_resources: LocalResources::default(),
                 pool_size: 0,
                 max_invocations: 0,

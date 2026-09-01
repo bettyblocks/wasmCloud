@@ -66,7 +66,9 @@ async fn start_sleeper_with(
             components: vec![Component {
                 name: "sleeper".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(HTTP_SLEEPER_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_SLEEPER_WASM,
+                )),
                 local_resources: LocalResources::default(),
                 pool_size,
                 max_invocations,
@@ -305,7 +307,9 @@ async fn linked_calls_share_the_warm_instances() -> Result<()> {
                 Component {
                     name: "caller".to_string(),
                     digest: None,
-                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(EPHEMERAL_CALLER_P3_WASM)),
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        EPHEMERAL_CALLER_P3_WASM,
+                    )),
                     local_resources: LocalResources::default(),
                     pool_size: 2,
                     max_invocations: 0,
@@ -316,7 +320,9 @@ async fn linked_calls_share_the_warm_instances() -> Result<()> {
                 Component {
                     name: "callee".to_string(),
                     digest: None,
-                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(EPHEMERAL_CALLEE_P3_WASM)),
+                    source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                        EPHEMERAL_CALLEE_P3_WASM,
+                    )),
                     local_resources: LocalResources::default(),
                     pool_size: 1,
                     max_invocations: 0,

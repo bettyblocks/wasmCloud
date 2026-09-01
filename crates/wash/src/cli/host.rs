@@ -883,6 +883,7 @@ impl CliCommand for HostCommand {
                 insecure: self.allow_insecure_registries,
                 cache_dir: self.oci_cache_dir.clone(),
                 timeout: Some(self.registry_pull_timeout),
+                insecure_registries: std::collections::HashSet::default(),
             };
             let native_plugins = cluster_host_builder.native_plugins();
             let http_handler = cluster_host_builder.http_handler();

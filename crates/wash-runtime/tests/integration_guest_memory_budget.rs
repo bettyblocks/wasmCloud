@@ -89,7 +89,9 @@ fn grow_workload(name: &str) -> WorkloadStartRequest {
             components: vec![Component {
                 name: "http-memory-grow.wasm".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(HTTP_MEMORY_GROW_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_MEMORY_GROW_WASM,
+                )),
                 local_resources: LocalResources {
                     memory_limit_mb: 128,
                     cpu_limit: 1,
