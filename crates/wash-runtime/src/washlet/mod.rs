@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::component_source::{ComponentSource, LoadedComponent};
@@ -34,6 +34,35 @@ const MAX_CONCURRENT_STARTS: usize = 4;
 /// anything. Better to abandon them and stop the host, which unbinds whatever
 /// they had bound anyway.
 const COMMAND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A tokio runtime dedicated to the scheduler NATS connection, the heartbeat
+/// tick, and the command-receive loop — kept off the main runtime so a burst
+/// of `workload.start`s saturating its worker threads (Cranelift compiles on
+/// the blocking pool aside, `instantiate_pre`/`instantiate_async` still run
+/// inline there) can never also starve the tasks that keep this host visible
+/// to the operator. One worker thread is enough: nothing scheduled here does
+/// real CPU work, it only needs a guaranteed turn.
+///
+/// The scheduler `nats_client` must be *connected* through this handle, not
+/// merely have its tasks moved here afterward — `async_nats::connect` spawns
+/// the connection's own read/reconnect loop on whichever runtime is current
+/// at connect time, and that task is what actually delivers subscription
+/// messages and flushes publishes. Connecting it on the main runtime would
+/// leave that background task starvable right alongside `workload.start`,
+/// defeating the isolation even though this loop itself moved.
+pub fn control_plane_handle() -> anyhow::Result<tokio::runtime::Handle> {
+    static RUNTIME: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("wash-control-plane")
+            .enable_all()
+            .build()
+    }) {
+        Ok(rt) => Ok(rt.handle().clone()),
+        Err(e) => Err(anyhow!("failed to build control-plane runtime: {e}")),
+    }
+}
 
 pub mod types {
     pub mod v2 {
@@ -282,6 +311,10 @@ impl ClusterHost {
         let (one_shot_tx, mut one_shot_rx) = oneshot::channel();
         let nats_client = self.nats_client.clone();
         let data_nats_client = self.data_nats_client.clone();
+        // Captured here, on the main runtime that's driving `start()` — this
+        // is where command handling (the heavy half: compiles, instantiates)
+        // is dispatched to, kept apart from the control-plane loop below.
+        let main_handle = tokio::runtime::Handle::current();
         let host = self
             .prepared_host
             .start()
@@ -307,7 +340,14 @@ impl ClusterHost {
 
         host.log_interfaces();
 
-        let task = tokio::task::spawn({
+        // Everything in this task — the heartbeat tick, the cache-sweep
+        // timers, and `api_subscription` itself — runs on the isolated
+        // control-plane runtime (see `control_plane_handle`), never on the
+        // main one. Only the actual command handling, spawned into
+        // `commands` below via `spawn_on(&main_handle)`, does real work on
+        // the main runtime.
+        let control_handle = control_plane_handle()?;
+        let task = control_handle.spawn({
             let host = host.clone();
             async move {
                 let host_subject = host_subject(host_id.as_ref());
@@ -435,7 +475,11 @@ impl ClusterHost {
                             let data_nats_client = data_nats_client.clone();
                             let starts = Arc::clone(&starts);
                             let command = msg.subject.split('.').skip(3).collect::<Vec<_>>().join(".");
-                            commands.spawn(async move {
+                            // Dispatched onto the main runtime, not spawned here on the
+                            // control-plane one: this is where compiles and instantiations
+                            // actually happen, and it has the thread budget to absorb a
+                            // burst of them without taking the heartbeat down with it.
+                            commands.spawn_on(async move {
                                 let response = handle_command(host.as_ref(), &msg, &command, host.config(), &data_nats_client, &starts).await;
                                 match response {
                                     Ok(resp_bytes) => {
@@ -464,7 +508,7 @@ impl ClusterHost {
                                         error!("error handling command: {e}");
                                     }
                                 }
-                            });
+                            }, &main_handle);
                         }
                     }
                 }
