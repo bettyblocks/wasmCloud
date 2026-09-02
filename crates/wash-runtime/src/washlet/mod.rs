@@ -347,7 +347,7 @@ impl ClusterHost {
         // `commands` below via `spawn_on(&main_handle)`, does real work on
         // the main runtime.
         let control_handle = control_plane_handle()?;
-        let task = control_handle.spawn({
+        let task = control_handle.clone().spawn({
             let host = host.clone();
             async move {
                 let host_subject = host_subject(host_id.as_ref());
@@ -475,10 +475,22 @@ impl ClusterHost {
                             let data_nats_client = data_nats_client.clone();
                             let starts = Arc::clone(&starts);
                             let command = msg.subject.split('.').skip(3).collect::<Vec<_>>().join(".");
-                            // Dispatched onto the main runtime, not spawned here on the
-                            // control-plane one: this is where compiles and instantiations
-                            // actually happen, and it has the thread budget to absorb a
-                            // burst of them without taking the heartbeat down with it.
+                            // The operator's own liveness verdict for this host comes from
+                            // this RPC, not from the periodic self-push above — reconcileReporting
+                            // calls it fresh every reconcile and treats a failure as "not
+                            // reporting" outright, regardless of how recent the last self-pushed
+                            // heartbeat was. Dispatching it to the main runtime like every other
+                            // command would reopen exactly the starvation this split exists to
+                            // avoid, just one hop later — so it stays on the control-plane runtime
+                            // instead. Every other command still goes to `main_handle`: that's
+                            // where compiles and instantiations happen, and it has the thread
+                            // budget to absorb a burst of them without taking the heartbeat (or
+                            // this) down with it.
+                            let spawn_handle = if command == "heartbeat" {
+                                &control_handle
+                            } else {
+                                &main_handle
+                            };
                             commands.spawn_on(async move {
                                 let response = handle_command(host.as_ref(), &msg, &command, host.config(), &data_nats_client, &starts).await;
                                 match response {
@@ -508,7 +520,7 @@ impl ClusterHost {
                                         error!("error handling command: {e}");
                                     }
                                 }
-                            }, &main_handle);
+                            }, spawn_handle);
                         }
                     }
                 }

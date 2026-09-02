@@ -462,7 +462,7 @@ async fn new_ephemeral_store(
             linked.push(template_of(&component.metadata));
             linked_instances.push((
                 component_id.clone(),
-                component.pre_instantiate_ref().map_err(|e| {
+                component.pre_instantiate_ref().await.map_err(|e| {
                     anyhow::anyhow!(
                         "failed to pre-instantiate linked components for ephemeral call: {e}"
                     )
