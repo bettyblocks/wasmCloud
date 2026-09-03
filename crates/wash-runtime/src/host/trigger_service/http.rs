@@ -88,6 +88,16 @@ impl AccessorTask<SharedCtx> for HttpTask {
             crate::engine::abandon::rearm_for_call(&mut access);
             std::sync::Arc::clone(&access.get().abandoned)
         });
+        // Named from the store this runs on, which was stamped with whose
+        // execution it is when it was built — a service's ingress has no
+        // workload handle to look one up from. Whether the sample is recorded
+        // is `InvocationSample`'s call, not this one's: a service shares its
+        // store, so its samples are dropped in favour of the store's own
+        // counter, and a pooled instance's are kept when it ran alone.
+        let attributes = accessor.with(|mut access| {
+            crate::host::http::stored_http_attributes(&access.get().executed, req.method())
+        });
+        let _sample = crate::engine::instance_driver::InvocationSample::start(attributes);
 
         let (parts, body) = req.into_parts();
         let body = body

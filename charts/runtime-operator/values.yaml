@@ -97,6 +97,11 @@ nats:
     name: ""
     # -- Annotations to add to the service account
     annotations: {}
+  # -- How long a terminating NATS pod has to shut down before it is killed.
+  # On `SIGTERM` the server closes its client connections and its JetStream
+  # store, so the hosts connected to it see a disconnect rather than a stalled
+  # socket. It exits as soon as that is done; this is only the ceiling.
+  terminationGracePeriodSeconds: 30
 
 operator:
   enabled: true
@@ -208,6 +213,14 @@ operator:
   #   extraArgs:
   #     - "-cpu-backpressure-threshold=75"
   extraArgs: []
+  # -- How long a terminating operator pod has to shut down before it is
+  # killed. On `SIGTERM` the manager stops its controllers and lets the
+  # reconciles already running finish, waiting up to controller-runtime's 30s
+  # for them, so anything at or below that is SIGKILL at the moment it gives
+  # up. It does not release its leader election lease
+  # (`LeaderElectionReleaseOnCancel` is off), so the replacement waits out
+  # `LeaseDuration` either way.
+  terminationGracePeriodSeconds: 45
 
   precompile:
     # -- When false, no precompile Jobs are emitted and Artifact-backed
@@ -314,6 +327,12 @@ gateway:
     name: ""
     # -- Annotations to add to the service account
     annotations: {}
+  # -- How long a terminating gateway pod has to shut down before it is killed.
+  # On `SIGTERM` the gateway stops accepting connections and gives the requests
+  # already in flight up to 15s to finish, so anything below that hangs up on a
+  # caller mid-response. It runs that drain inside a controller-runtime manager,
+  # which waits up to 30s for it, so the grace clears the longer of the two.
+  terminationGracePeriodSeconds: 45
 
 runtime:
   # -- Extra CA certificate bundles (paths inside the host container) trusted
@@ -373,10 +392,11 @@ runtime:
   # host: size `limits.memory` for your expected per-host workload density, or
   # remove it to leave host memory uncapped.
   #
-  # `defaultHeapMemory`, `coreInstances` and `guestMemoryMode` are host knobs
-  # rather than Kubernetes resource fields; the chart strips them out of the
-  # container's `resources` block and sets them as `WASH_DEFAULT_HEAP_MEMORY` /
-  # `WASH_CORE_INSTANCES` / `WASH_GUEST_MEMORY_MODE` for the host.
+  # `defaultHeapMemory`, `coreInstances`, `guestMemoryMode` and
+  # `maxConcurrentStarts` are host knobs rather than Kubernetes resource fields;
+  # the chart strips them out of the container's `resources` block and sets them
+  # as `WASH_DEFAULT_HEAP_MEMORY` / `WASH_CORE_INSTANCES` /
+  # `WASH_GUEST_MEMORY_MODE` / `WASH_MAX_CONCURRENT_STARTS` for the host.
   # Leaving them empty uses the host's own defaults.
   #
   # The simplest way to change host sizing for the whole release:
@@ -411,6 +431,58 @@ runtime:
     # headroom by setting `limits.memory` above the guest budget you want, or
     # by overriding `WASH_HOST_MAX_GUEST_MEMORY` below it via `runtime.env`.
     guestMemoryMode: ""
+    # -- How many workloads a host pulls and compiles at once. Each start it
+    # admits ends in a compile that spreads over every core the host can see,
+    # so this is a floor on what a burst of starts takes from the cores serving
+    # HTTP and NATS, not a ceiling — a host that stops accepting connections
+    # for long enough fails its liveness probe and is restarted, taking every
+    # workload on it with it. Set it to `1` on a host that must keep serving
+    # through a large redeploy, bearing in mind that the same permit covers the
+    # image pull, so a lower number serializes network waiting along with the
+    # compiling. To bound the compiles themselves, set `RAYON_NUM_THREADS` (how
+    # wide one compile goes) or `WASMTIME_PARALLEL_COMPILATION=false` (one
+    # thread per compile) under `runtime.env`.
+    #
+    # Empty leaves the host to size itself: one fewer than the cores it can
+    # see, at most 4. Note what it sees — the count comes from the cgroup, so
+    # it follows `limits.cpu`, and a host with no cpu limit sizes itself
+    # against the whole node however small its `requests.cpu` is. Set this
+    # explicitly on a host group that is requested far below the node it lands
+    # on.
+    maxConcurrentStarts: ""
+  # -- Probes for host containers, rendered only for a host group that serves
+  # HTTP (`hostGroups[].http.enabled`); both connect to its `http` port. A host
+  # group sets its own with `hostGroups[].probes`, and any field left out of
+  # that falls back to the value here.
+  #
+  # Readiness and liveness are deliberately not tuned alike. Both connect to
+  # the port the host serves workload routes on, which the kernel answers from
+  # the listener's accept queue whether or not the host is polling it — so what
+  # a failure reports is a host busy enough to have let that queue fill.
+  # Leaving the Service over that is cheap, which is readiness' job. Restarting
+  # is a different trade: the pod loses every workload running on it, and the
+  # scheduler places them all again at once, which is the burst that stalled it
+  # in the first place. So liveness waits a good deal longer before calling a
+  # host dead.
+  #
+  # `liveness.enabled: false` leaves nothing to recycle a wedged host: the
+  # operator deletes the *Host* of a host it stops hearing from, and its
+  # workloads move, but the pod is not the operator's to delete and keeps
+  # running whatever it still holds. Disable it only where something else
+  # takes that job.
+  probes:
+    readiness:
+      enabled: true
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 1
+      failureThreshold: 3
+    liveness:
+      enabled: true
+      initialDelaySeconds: 10
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 5
   # -- Additional environment variables applied to every host group container,
   # appended after the chart-managed vars and before any per-host-group `env`.
   # Standard Kubernetes env shape (supports `valueFrom`).
@@ -422,6 +494,13 @@ runtime:
   # -- Additional CLI args appended to every host group container, for host
   # flags the chart does not template. Merged with per-host-group `extraArgs`.
   extraArgs: []
+  # -- How long a terminating host pod has to shut down before it is killed.
+  # On `SIGTERM` the host stops taking work, waits up to 5s for the commands
+  # already running to finish, then stops itself — unbinding every plugin the
+  # workloads it holds are bound to. Kubernetes sends `SIGKILL` when this
+  # expires, so anything below that 5s drain cuts the shutdown short and leaves
+  # the unbinding to the operator's unreachable-host path instead.
+  terminationGracePeriodSeconds: 15
   hostGroups:
     - name: default
       # -- Namespace to deploy this host group's Deployment, Service, generated
@@ -754,6 +833,13 @@ runtime:
       #   defaultHeapMemory: "512MiB"
       #   coreInstances: "200"
       #   guestMemoryMode: "enforce"
+      #   maxConcurrentStarts: "1"
+      # -- Per-host-group probes. Merged field by field over
+      # `runtime.probes`, so a group can retune one timing and inherit the
+      # rest:
+      # probes:
+      #   liveness:
+      #     enabled: false
       # -- Extra CA bundles trusted when this group pulls images, added to the
       # chart-wide `runtime.ociCaPaths` rather than replacing it:
       # ociCaPaths:

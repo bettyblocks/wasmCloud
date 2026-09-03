@@ -40,10 +40,11 @@ use hyper_util::{
     rt::{TokioExecutor, TokioTimer},
     server::conn::auto,
 };
-use opentelemetry::{KeyValue, context::FutureExt};
+use opentelemetry::KeyValue;
+use opentelemetry::context::FutureExt;
 use opentelemetry_semantic_conventions::attribute::{
-    HTTP_REQUEST_METHOD, HTTP_RESPONSE_BODY_SIZE, HTTP_RESPONSE_STATUS_CODE, OTEL_STATUS_CODE,
-    RPC_GRPC_STATUS_CODE, SERVER_ADDRESS, SERVER_PORT, URL_FULL, URL_PATH,
+    ERROR_TYPE, HTTP_REQUEST_METHOD, HTTP_RESPONSE_BODY_SIZE, HTTP_RESPONSE_STATUS_CODE,
+    OTEL_STATUS_CODE, RPC_GRPC_STATUS_CODE, SERVER_ADDRESS, SERVER_PORT, URL_FULL, URL_PATH,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -63,7 +64,7 @@ use wasmtime_wasi_http::{
 
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use tokio_rustls::TlsAcceptor;
 
 /// Validates a hostname according to RFC 1123.
@@ -804,7 +805,7 @@ pub trait HostHandler: Send + Sync + 'static {
         &self,
         _workload_id: &str,
         _msg: BrokerMessage,
-        _attributes: Vec<opentelemetry::KeyValue>,
+        _attributes: std::sync::Arc<[opentelemetry::KeyValue]>,
     ) -> anyhow::Result<Result<(), String>> {
         anyhow::bail!("this host does not support trigger service messaging delivery")
     }
@@ -995,9 +996,21 @@ fn watch_body(
     })
 }
 
-/// A map from host header to resolved workload handles and their associated component id
-pub type WorkloadHandles =
-    Arc<RwLock<HashMap<String, (ResolvedWorkload, InstancePre<SharedCtx>, String)>>>;
+/// A map from host header to resolved workload handles, their associated
+/// component id, and the identity that component's calls are measured under.
+pub type WorkloadHandles = Arc<
+    RwLock<
+        HashMap<
+            String,
+            (
+                ResolvedWorkload,
+                InstancePre<SharedCtx>,
+                String,
+                crate::observability::WorkloadIdentity,
+            ),
+        >,
+    >,
+>;
 
 /// An inbound HTTP request routed to a long-lived service instance, paired with
 /// a oneshot for its response and the abandonment flag of the [`DispatchedCall`]
@@ -1007,6 +1020,83 @@ pub struct ServiceHttpJob {
     pub resp_tx: tokio::sync::oneshot::Sender<anyhow::Result<hyper::Response<HyperOutgoingBody>>>,
     pub abandoned: Arc<AbandonFlag>,
 }
+
+/// The attribute set an inbound HTTP call is measured under: the shared scheme
+/// plus the request method, which is bounded by the HTTP spec. The URI and Host
+/// header are deliberately absent — a caller invents those, and a label a
+/// caller can invent mints a permanent time series per distinct value.
+pub(crate) fn http_attributes(
+    identity: &crate::observability::WorkloadIdentity,
+    method: &hyper::Method,
+    operation: &'static str,
+) -> Arc<[opentelemetry::KeyValue]> {
+    identity.attributes_with(
+        "wasi-http",
+        operation,
+        opentelemetry::KeyValue::new(HTTP_REQUEST_METHOD, known_method(method)),
+    )
+}
+
+/// What a call on an already-built store is measured under, taken from the
+/// store rather than from whoever dispatched to it.
+///
+/// A service's HTTP ingress has no workload handle to resolve an identity from
+/// — `workload_handles` holds only components that export `wasi:http` — and it
+/// does not need one: the store it runs on was stamped when it was built.
+///
+/// Empty when nothing will record it. Only `ExecutionSample` reads this, and
+/// nothing reads that unless the host chose the epoch meter, so on every other
+/// host building it is a `Vec`, an `Arc` and four `String`s per request for a
+/// value that is dropped.
+pub(crate) fn stored_http_attributes(
+    executed: &crate::engine::abandon::GuestExecution,
+    method: &hyper::Method,
+) -> Arc<[opentelemetry::KeyValue]> {
+    if crate::observability::invocation_meter().is_none() {
+        return Arc::from([]);
+    }
+    let Some(identity) = executed.identity() else {
+        return Arc::from([]);
+    };
+    identity.attributes_with(
+        "wasi-http",
+        HTTP_OPERATION_P3,
+        opentelemetry::KeyValue::new(HTTP_REQUEST_METHOD, known_method(method)),
+    )
+}
+
+/// The request method, or `_OTHER` for anything outside the registered set.
+///
+/// `hyper::Method` accepts an arbitrary extension token, so the method a client
+/// sends is caller-invented like the URI is. Folding the unregistered ones into
+/// one bucket is what keeps it usable as an attribute; the exact token stays on
+/// the span. This is the treatment the OTel HTTP semconv prescribes, and it is
+/// recorded under the semconv's own key — the same `http.request.method` the
+/// spans here carry, so a histogram and a trace join on it without a relabel,
+/// and so `_OTHER` means what a reader of that convention expects.
+fn known_method(method: &hyper::Method) -> &'static str {
+    match *method {
+        hyper::Method::GET => "GET",
+        hyper::Method::HEAD => "HEAD",
+        hyper::Method::POST => "POST",
+        hyper::Method::PUT => "PUT",
+        hyper::Method::DELETE => "DELETE",
+        hyper::Method::CONNECT => "CONNECT",
+        hyper::Method::OPTIONS => "OPTIONS",
+        hyper::Method::TRACE => "TRACE",
+        hyper::Method::PATCH => "PATCH",
+        _ => "_OTHER",
+    }
+}
+
+/// The WIT exports an inbound request can invoke, and what its measurements
+/// are grouped by. Bounded by the interface, unlike the request's URI.
+///
+/// Two of them, because the p2 per-request path and the p3 pooled path call
+/// different exports; merging them would group calls under an export one of the
+/// two never invokes.
+pub(crate) const HTTP_OPERATION_P2: &str = "wasi:http/incoming-handler#handle";
+pub(crate) const HTTP_OPERATION_P3: &str = "wasi:http/handler#handle";
 
 /// A map from workload id to the channel of its HTTP-serving service instance.
 /// Empty unless a workload's service opts into HTTP ingress (a p3 feature).
@@ -1050,6 +1140,11 @@ pub struct Ingress<T: Router, O: OutgoingHandler = DefaultOutgoingHandler> {
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
     tls_acceptor: Option<TlsAcceptor>,
     listener: Arc<tokio::sync::Mutex<Option<TcpListener>>>,
+    /// Ceiling on the TCP connections this ingress holds at once, and the
+    /// permits enforcing it. Sized from the process's descriptor budget unless
+    /// the operator names a number: see
+    /// [`crate::host::quota::default_max_http_ingress_connections`].
+    connections: ConnectionLimit,
     meters: RwLock<Meters>,
     /// h2 (ALPN) variant of the outgoing handler's client TLS configuration,
     /// derived once on the first gRPC request; see [`Ingress::grpc_tls`].
@@ -1116,6 +1211,7 @@ pub struct IngressBuilder<T: Router, O: OutgoingHandler = DefaultOutgoingHandler
     outgoing_handler: O,
     addr: SocketAddr,
     tls: Option<TlsConfig>,
+    max_connections: Option<usize>,
 }
 
 impl<T: Router> IngressBuilder<T, DefaultOutgoingHandler> {
@@ -1125,6 +1221,7 @@ impl<T: Router> IngressBuilder<T, DefaultOutgoingHandler> {
             outgoing_handler: DefaultOutgoingHandler::default(),
             addr,
             tls: None,
+            max_connections: None,
         }
     }
 }
@@ -1138,12 +1235,20 @@ impl<T: Router, O: OutgoingHandler> IngressBuilder<T, O> {
             outgoing_handler: handler,
             addr: self.addr,
             tls: self.tls,
+            max_connections: self.max_connections,
         }
     }
 
     /// Enable TLS using the given [`TlsConfig`].
     pub fn tls(mut self, tls: TlsConfig) -> Self {
         self.tls = Some(tls);
+        self
+    }
+
+    /// Cap the TCP connections this ingress holds at once, in place of the
+    /// ceiling derived from the process's descriptor budget.
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = Some(max.clamp(1, Semaphore::MAX_PERMITS));
         self
     }
 
@@ -1161,6 +1266,9 @@ impl<T: Router, O: OutgoingHandler> IngressBuilder<T, O> {
 
         let listener = TcpListener::bind(self.addr).await?;
         let addr = listener.local_addr()?;
+        let max_connections = self
+            .max_connections
+            .unwrap_or_else(crate::host::quota::default_max_http_ingress_connections);
 
         Ok(Ingress {
             router: Arc::new(self.router),
@@ -1172,6 +1280,7 @@ impl<T: Router, O: OutgoingHandler> IngressBuilder<T, O> {
             shutdown_tx: Arc::new(RwLock::new(None)),
             tls_acceptor,
             listener: Arc::new(tokio::sync::Mutex::new(Some(listener))),
+            connections: ConnectionLimit::new(max_connections),
             meters: Default::default(),
             grpc_tls: OnceLock::new(),
         })
@@ -1259,6 +1368,7 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         // to the workload based on host header.
         let handler = self.router.clone();
         let guest_meter = self.meters.read().await.guest();
+        let connections = self.connections.clone();
         tokio::spawn(async move {
             if let Err(e) = run_http_server(
                 listener,
@@ -1268,6 +1378,7 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
                 &mut shutdown_rx,
                 tls_acceptor,
                 guest_meter,
+                connections,
             )
             .await
             {
@@ -1312,12 +1423,17 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         // Only components that export wasi:http are routable HTTP entrypoints.
         // Anything else stays unregistered and routes to a 404.
         if crate::engine::exports_wasi_http(instance_pre.component()) {
+            // Resolved before the write lock is taken: it awaits a read of the
+            // component map, and holding the handles' writer across that stalls
+            // every inbound request, which reads the same lock to route.
+            let identity = resolved_handle.component_identity(component_id).await;
             self.workload_handles.write().await.insert(
                 resolved_handle.id().to_string(),
                 (
                     resolved_handle.clone(),
                     instance_pre,
                     component_id.to_string(),
+                    identity,
                 ),
             );
         }
@@ -1394,7 +1510,7 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         &self,
         workload_id: &str,
         msg: BrokerMessage,
-        attributes: Vec<opentelemetry::KeyValue>,
+        attributes: std::sync::Arc<[opentelemetry::KeyValue]>,
     ) -> anyhow::Result<Result<(), String>> {
         let sender = self
             .messaging_handlers
@@ -1521,6 +1637,80 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
     }
 }
 
+/// How many `accept` failures within [`ACCEPT_FAILURE_WINDOW`] mean the loop is
+/// spinning rather than meeting the occasional bad connection.
+///
+/// Counted per window rather than consecutively: descriptor exhaustion under
+/// churn lets the odd `accept` succeed, and a consecutive count resets on each
+/// one and never notices. A busy server sheds a handful of half-open
+/// connections a second; a spinning one reaches this in milliseconds.
+const ACCEPT_FAILURES_PER_WINDOW: u32 = 1024;
+const ACCEPT_FAILURE_WINDOW: Duration = Duration::from_secs(1);
+
+/// How long the loop pauses once `accept` is failing persistently, and how far
+/// that grows. The cap bounds how long the listener leaves its backlog alone.
+const ACCEPT_RETRY_MIN: Duration = Duration::from_millis(5);
+const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(1);
+
+/// How often a saturated ingress says so. Reporting each shed connection would
+/// make the log the load problem.
+const SHED_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a peer has to finish a TLS handshake before its connection slot is
+/// taken back.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The ingress connection ceiling, the permits enforcing it, and the counter
+/// reporting it.
+///
+/// Together rather than separately because a refusal has to be counted where it
+/// is decided: the accept loop is the only place that knows a connection was
+/// offered and turned away.
+#[derive(Clone)]
+pub(crate) struct ConnectionLimit {
+    max: usize,
+    permits: Arc<Semaphore>,
+    offered: opentelemetry::metrics::Counter<u64>,
+    /// Built once. `error.type` marks the refusals inside the one series, so a
+    /// shed rate is a filter on it rather than a second counter to keep in step.
+    shed: Arc<[KeyValue]>,
+}
+
+impl ConnectionLimit {
+    pub(crate) fn new(max: usize) -> Self {
+        Self {
+            max,
+            permits: Arc::new(Semaphore::new(max)),
+            offered: opentelemetry::global::meter("wash-runtime")
+                .u64_counter("http.ingress.connections")
+                .with_description(
+                    "Connections offered to the host's HTTP ingress, whether held or shed",
+                )
+                .build(),
+            shed: Arc::from(vec![KeyValue::new(ERROR_TYPE, "no_capacity")]),
+        }
+    }
+
+    /// Take a slot for an accepted connection, or `None` at the ceiling.
+    ///
+    /// Counted either way, and with no attribute naming who was refused: a
+    /// connection is turned away before its first request names a workload, and
+    /// its peer address is invented by traffic — so there is nothing bounded to
+    /// split the series by.
+    fn take(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match Arc::clone(&self.permits).try_acquire_owned() {
+            Ok(permit) => {
+                self.offered.add(1, &[]);
+                Some(permit)
+            }
+            Err(_) => {
+                self.offered.add(1, &self.shed);
+                None
+            }
+        }
+    }
+}
+
 /// Configure a freshly accepted connection before it is served.
 ///
 /// Disables Nagle's algorithm. Responses are written as a head segment followed
@@ -1535,6 +1725,7 @@ fn prepare_accepted_conn(stream: &TcpStream) {
 }
 
 /// HTTP server implementation that routes to workload components
+#[allow(clippy::too_many_arguments)]
 async fn run_http_server<T: Router>(
     listener: TcpListener,
     handler: Arc<T>,
@@ -1543,8 +1734,29 @@ async fn run_http_server<T: Router>(
     shutdown_rx: &mut mpsc::Receiver<()>,
     tls_acceptor: Option<TlsAcceptor>,
     guest_meter: GuestMeter,
+    connections: ConnectionLimit,
 ) -> anyhow::Result<()> {
+    let mut failures: u32 = 0;
+    let mut window = std::time::Instant::now();
+    let mut retry_delay = ACCEPT_RETRY_MIN;
+    let mut shed = 0u64;
+    let mut shed_reported: Option<std::time::Instant> = None;
     loop {
+        // A window that ends without tripping the threshold is the loop working
+        // again, and is the only thing that clears the pause.
+        if window.elapsed() >= ACCEPT_FAILURE_WINDOW {
+            window = std::time::Instant::now();
+            failures = 0;
+            retry_delay = ACCEPT_RETRY_MIN;
+        }
+        // Taken before the select rather than inside it, so the pause races the
+        // shutdown branch instead of needing a second copy of it. Doubling here
+        // rather than on the failure is what makes the first pause the minimum.
+        let pause = (failures > ACCEPT_FAILURES_PER_WINDOW).then(|| {
+            let taken = retry_delay;
+            retry_delay = (retry_delay * 2).min(ACCEPT_RETRY_MAX);
+            taken
+        });
         tokio::select! {
             // Handle shutdown signal
             _ = shutdown_rx.recv() => {
@@ -1552,9 +1764,33 @@ async fn run_http_server<T: Router>(
                 break;
             }
             // Accept new connections
-            result = listener.accept() => {
+            result = async {
+                if let Some(pause) = pause {
+                    tokio::time::sleep(pause).await;
+                }
+                listener.accept().await
+            } => {
                 match result {
                     Ok((client, client_addr)) => {
+                        // A connection there is no descriptor budget to hold is
+                        // closed now, while closing it is cheap. Holding it
+                        // instead is what exhausts the process's descriptors,
+                        // and a host that cannot accept is a host nothing can
+                        // reach — including its own liveness probe.
+                        let Some(slot) = connections.take() else {
+                            shed += 1;
+                            if shed_reported.is_none_or(|at| at.elapsed() >= SHED_LOG_INTERVAL) {
+                                warn!(
+                                    max_connections = connections.max, shed,
+                                    "HTTP ingress is at its connection ceiling; shedding new connections"
+                                );
+                                shed_reported = Some(std::time::Instant::now());
+                                shed = 0;
+                            }
+                            drop(client);
+                            continue;
+                        };
+
                         debug!(addr = ?client_addr, "new HTTP client connection");
 
                         prepare_accepted_conn(&client);
@@ -1565,6 +1801,9 @@ async fn run_http_server<T: Router>(
                         let handler_clone = handler.clone();
                         let guest_meter = guest_meter.clone();
                         tokio::spawn(async move {
+                            // Held for the connection's life: its descriptor is
+                            // only given back once hyper is done with it.
+                            let _slot = slot;
                             let service = hyper::service::service_fn(move |req| {
                                 let handles = handles_clone.clone();
                                 let service_handlers = service_handlers_clone.clone();
@@ -1580,8 +1819,13 @@ async fn run_http_server<T: Router>(
                             });
 
                             let mut builder = auto::Builder::new(TokioExecutor::new());
+                            // The timer is what arms hyper's header-read
+                            // timeout; without one a peer that opens a
+                            // connection and sends nothing holds its slot for
+                            // as long as it likes.
                             builder
                                 .http1()
+                                .timer(TokioTimer::new())
                                 .keep_alive(true);
                             builder
                                 .http2()
@@ -1589,14 +1833,24 @@ async fn run_http_server<T: Router>(
                                 .keep_alive_interval(Some(Duration::from_secs(20)));
 
                             let result = if let Some(acceptor) = tls_acceptor_clone {
-                                // Handle HTTPS connection
-                                match acceptor.accept(client).await {
-                                    Ok(tls_stream) => {
+                                // Handle HTTPS connection. Bounded, because a
+                                // handshake nobody finishes holds a connection
+                                // slot that no request will ever release.
+                                let handshake = tokio::time::timeout(
+                                    TLS_HANDSHAKE_TIMEOUT,
+                                    acceptor.accept(client),
+                                );
+                                match handshake.await {
+                                    Err(_) => {
+                                        warn!(addr = ?client_addr, "TLS handshake timed out");
+                                        return;
+                                    }
+                                    Ok(Ok(tls_stream)) => {
                                         builder
                                             .serve_connection_with_upgrades(TokioIo::new(tls_stream), service)
                                             .await
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         error!(addr = ?client_addr, err = ?e, "TLS handshake failed");
                                         return;
                                     }
@@ -1614,7 +1868,12 @@ async fn run_http_server<T: Router>(
                         });
                     }
                     Err(e) => {
-                        error!(err = ?e, "failed to accept HTTP connection");
+                        failures = failures.saturating_add(1);
+                        if failures <= ACCEPT_FAILURES_PER_WINDOW {
+                            debug!(err = ?e, "failed to accept HTTP connection");
+                        } else {
+                            error!(err = ?e, failures, "HTTP ingress cannot accept connections");
+                        }
                     }
                 }
             }
@@ -1777,7 +2036,7 @@ async fn handle_http_request<T: Router>(
     };
 
     let response = match workload_handle {
-        Some((handle, instance_pre, component_id)) => {
+        Some((handle, instance_pre, component_id, identity)) => {
             let req_span = tracing::span!(
                 tracing::Level::INFO,
                 "invoke_component_handler",
@@ -1786,9 +2045,16 @@ async fn handle_http_request<T: Router>(
                 workload.namespace = handle.namespace(),
                 workload.id = handle.id(),
             );
-            match invoke_component_handler(&handle, instance_pre, &component_id, req, guest_meter)
-                .instrument(req_span)
-                .await
+            match invoke_component_handler(
+                &handle,
+                instance_pre,
+                &component_id,
+                req,
+                guest_meter,
+                &identity,
+            )
+            .instrument(req_span)
+            .await
             {
                 Ok(mut resp) => {
                     if let Ok(trace_header) = hyper::header::HeaderValue::from_str(&trace_id) {
@@ -2021,6 +2287,8 @@ async fn invoke_component_handler(
     component_id: &str,
     req: hyper::Request<hyper::body::Incoming>,
     guest_meter: GuestMeter,
+    // Resolved once when the route was registered: this runs per request.
+    identity: &crate::observability::WorkloadIdentity,
 ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
     if crate::engine::targets_wasip3_http(instance_pre.component()) {
         let pool = workload_handle
@@ -2094,10 +2362,7 @@ async fn invoke_component_handler(
         let flag = call.flag();
         let (resp, watch) = call
             .await_head(crate::host::http_p3::handle_component_request_p3(
-                cold,
-                req,
-                flag,
-                guest_meter,
+                cold, req, flag,
             ))
             .await
             .ok_or_else(|| anyhow::anyhow!("cold instance produced no response"))?;
@@ -2117,7 +2382,7 @@ async fn invoke_component_handler(
     // owned by a detached task that outlives the response head, so recovering
     // it for reuse needs a restructure the p3 path did not.
     let store = workload_handle.new_store(component_id).await?;
-    handle_component_request(store, instance_pre, req, guest_meter).await
+    handle_component_request(store, instance_pre, req, guest_meter, identity).await
 }
 
 /// Handle a component request using WASI HTTP (copied from wash/crates/src/cli/dev.rs)
@@ -2126,6 +2391,7 @@ pub async fn handle_component_request(
     pre: InstancePre<SharedCtx>,
     req: hyper::Request<hyper::body::Incoming>,
     guest_meter: GuestMeter,
+    identity: &crate::observability::WorkloadIdentity,
 ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let scheme = match req.uri().scheme() {
@@ -2136,14 +2402,7 @@ pub async fn handle_component_request(
         None => Scheme::Http,
     };
 
-    let method = req.method().to_string();
-    let host_header = req
-        .headers()
-        .get(hyper::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .map(|h| h.to_string())
-        .unwrap_or_default();
-    let uri = req.uri().to_string();
+    let attributes = http_attributes(identity, req.method(), HTTP_OPERATION_P2);
 
     let req = store.data_mut().http().new_incoming_request(scheme, req)?;
     let out = store.data_mut().http().new_response_outparam(sender)?;
@@ -2164,23 +2423,14 @@ pub async fn handle_component_request(
             let proxy = pre.instantiate_async(&mut store).await?;
 
             guest_meter
-                .observe(
-                    &[
-                        KeyValue::new("plugin", "wasi-http"),
-                        KeyValue::new("method", method),
-                        KeyValue::new("host", host_header),
-                        KeyValue::new("uri", uri),
-                    ],
-                    &mut store,
-                    async move |store| {
-                        proxy
-                            .wasi_http_incoming_handler()
-                            .call_handle(store, req, out)
-                            .await?;
+                .observe(&attributes, &mut store, async move |store| {
+                    proxy
+                        .wasi_http_incoming_handler()
+                        .call_handle(store, req, out)
+                        .await?;
 
-                        Ok(())
-                    },
-                )
+                    Ok(())
+                })
                 .await?;
 
             Ok(())
@@ -2825,6 +3075,82 @@ mod tests {
             server.nodelay().unwrap(),
             "run_http_server must set TCP_NODELAY on accepted connections"
         );
+    }
+
+    /// The backoff triggers on a rate of failure, not on a kind of failure and
+    /// not on a run of them.
+    ///
+    /// `accept` also reports errors belonging to the single connection it
+    /// dequeued, so pausing the listener for one would be the bug in reverse —
+    /// and descriptor exhaustion under churn lets the odd call through, which a
+    /// consecutive count would keep resetting on.
+    #[test]
+    fn the_pause_is_paced_by_the_failure_rate() {
+        // The sequence the loop walks: the pause is taken, then doubled, so the
+        // first one it sleeps is the minimum rather than twice it.
+        let mut delay = ACCEPT_RETRY_MIN;
+        let mut steps = 0;
+        while delay < ACCEPT_RETRY_MAX && steps < 64 {
+            delay = (delay * 2).min(ACCEPT_RETRY_MAX);
+            steps += 1;
+        }
+        assert_eq!(
+            delay, ACCEPT_RETRY_MAX,
+            "the delay has to reach its cap and stop there"
+        );
+        assert!(
+            ACCEPT_FAILURES_PER_WINDOW > 1,
+            "one dequeued-connection error must not pause the listener"
+        );
+    }
+
+    /// A host at its ingress ceiling has to keep accepting and close what it
+    /// cannot serve. Leaving the connections queued instead fills the listen
+    /// backlog, and once that is full the kernel drops new handshakes — so a TCP
+    /// liveness probe times out and a running host is killed as unreachable.
+    #[tokio::test]
+    async fn a_saturated_ingress_keeps_accepting() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+
+        let server = tokio::spawn(async move {
+            run_http_server(
+                listener,
+                Arc::new(DevRouter::default()),
+                WorkloadHandles::default(),
+                ServiceHandlers::default(),
+                &mut shutdown_rx,
+                None,
+                Meters::default().guest(),
+                ConnectionLimit::new(1),
+            )
+            .await
+        });
+
+        // Takes the only permit and holds it: nothing reads or writes, so the
+        // server keeps the connection open.
+        let _held = TcpStream::connect(addr).await.unwrap();
+
+        // A real client has its request in flight by the time the ceiling is
+        // checked, so the shed path has to survive unread bytes.
+        let mut shed = TcpStream::connect(addr).await.unwrap();
+        let _ = shed.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let closed = tokio::time::timeout(Duration::from_secs(5), shed.read(&mut [0u8; 64])).await;
+        match closed.expect("a connection past the ceiling must be closed, not left hanging") {
+            Ok(0) => {}
+            // The kernel answers unread bytes with an RST rather than a FIN.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Ok(n) => {
+                panic!("the ceiling was not enforced: the shed connection was served {n} bytes")
+            }
+            Err(e) => panic!("expected the server to close the shed connection, got {e:?}"),
+        }
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
     }
 
     // --- check_allowed_hosts tests ---

@@ -76,7 +76,7 @@ pub struct MessagingJob {
     /// What this call is measured under. Built by the dispatcher, which is the
     /// layer that knows the workload's manifest identity — see
     /// [`crate::observability::WorkloadIdentity`].
-    pub attributes: Vec<opentelemetry::KeyValue>,
+    pub attributes: std::sync::Arc<[opentelemetry::KeyValue]>,
 }
 
 /// The messaging handler export a trigger service must provide.
@@ -147,7 +147,7 @@ pub(crate) struct MessagingTask {
     pub(crate) abandoned: Arc<AbandonFlag>,
     /// What this call is measured under; see
     /// [`crate::observability::WorkloadIdentity`].
-    pub(crate) attributes: Vec<opentelemetry::KeyValue>,
+    pub(crate) attributes: std::sync::Arc<[opentelemetry::KeyValue]>,
     /// This delivery's tether to a pooled instance: holds its in-flight slot
     /// and can retire the instance. `None` for the two shapes with no instance
     /// to retire — a service, whose singleton is not the pool's, and a cold
@@ -174,7 +174,7 @@ impl AccessorTask<SharedCtx> for MessagingTask {
         });
         // Both delivery shapes — a pooled instance and a long-lived service —
         // land here, so one sample covers both.
-        let _sample = crate::engine::instance_driver::ExecutionSample::start(accessor, attributes);
+        let _sample = crate::engine::instance_driver::InvocationSample::start(attributes);
 
         let deliver = async {
             // The `@0.3.0` body is a native `stream<u8>`; mint one carrying the

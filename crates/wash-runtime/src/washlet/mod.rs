@@ -16,15 +16,9 @@ use tracing::{debug, error, info, instrument, warn};
 pub const HOST_API_PREFIX: &str = "runtime.host";
 pub const OPERATOR_API_PREFIX: &str = "runtime.operator";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-/// How many `workload.start` requests a host pulls and compiles at once.
-///
-/// This is not a tuning knob: it bounds how many images are held in memory and
-/// compiled at once. The compile is the half that sets it — each permitted
-/// start ends in a Cranelift compile on the blocking pool, and a host pod with
-/// a couple of cores oversubscribed several times over starves the runtime
-/// threads it shares that CPU with, which is the stall this path exists to
-/// avoid. Sized to what a small pod can compile at once, not to what its
-/// network could pull.
+/// Most `workload.start` requests a host pulls and compiles at once, however
+/// many cores it has. Past this the images held in memory cost more than the
+/// extra parallelism buys.
 const MAX_CONCURRENT_STARTS: usize = 4;
 /// How long shutdown waits for in-flight commands before abandoning them.
 ///
@@ -33,7 +27,25 @@ const MAX_CONCURRENT_STARTS: usize = 4;
 /// period a terminating pod gets, so it is killed before `host.stop()` unbinds
 /// anything. Better to abandon them and stop the host, which unbinds whatever
 /// they had bound anyway.
-const COMMAND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+pub const COMMAND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many starts a host runs at once when nothing sets it.
+///
+/// Each permitted start ends in a Cranelift compile, and one compile spreads
+/// itself over rayon's pool, so a permit is a floor on the cores it takes for
+/// as long as it runs, not a ceiling — the pool's own size is what bounds the
+/// rest. `available_parallelism` reads the cgroup quota a container is limited to,
+/// and one core is left out of the count: a host that cannot poll its HTTP
+/// accept loop or drain its NATS socket while it compiles is one Kubernetes
+/// restarts out from under its workloads.
+fn default_max_concurrent_starts() -> usize {
+    std::thread::available_parallelism().map_or(1, |cores| starts_for_cores(cores.get()))
+}
+
+/// [`default_max_concurrent_starts`] against a known core count.
+fn starts_for_cores(cores: usize) -> usize {
+    cores.saturating_sub(1).clamp(1, MAX_CONCURRENT_STARTS)
+}
 
 /// A tokio runtime dedicated to the scheduler NATS connection, the heartbeat
 /// tick, and the command-receive loop — kept off the main runtime so a burst
@@ -217,7 +229,8 @@ impl ClusterHostBuilder {
         self
     }
 
-    /// Caps how many `workload.start` requests this host serves at once.
+    /// Caps how many `workload.start` requests this host serves at once,
+    /// overriding [`default_max_concurrent_starts`].
     /// Zero is raised to one: a host that cannot start anything is not a host.
     pub fn with_max_concurrent_starts(mut self, starts: usize) -> Self {
         self.max_concurrent_starts = Some(starts.max(1));
@@ -282,7 +295,9 @@ impl ClusterHostBuilder {
             compiled_cleanup_grace: self
                 .compiled_cleanup_grace
                 .unwrap_or(Duration::from_secs(3600)),
-            max_concurrent_starts: self.max_concurrent_starts.unwrap_or(MAX_CONCURRENT_STARTS),
+            max_concurrent_starts: self
+                .max_concurrent_starts
+                .unwrap_or_else(default_max_concurrent_starts),
         })
     }
 }
@@ -336,6 +351,7 @@ impl ClusterHost {
         host_name=?host.hostname(),
         labels=?host.labels(),
         version=?host.version(),
+        max_concurrent_starts,
         "Host started");
 
         host.log_interfaces();
@@ -1229,6 +1245,17 @@ mod tests {
     use super::*;
     use crate::host::allowed_hosts::AllowedHost;
     use crate::host::allowed_ip_name::AllowedIpName;
+
+    /// A host always keeps a start it can run and a core it can serve on.
+    #[test]
+    fn starts_leave_a_core_to_serve_with() {
+        assert_eq!(starts_for_cores(0), 1);
+        assert_eq!(starts_for_cores(1), 1);
+        assert_eq!(starts_for_cores(2), 1);
+        assert_eq!(starts_for_cores(4), 3);
+        assert_eq!(starts_for_cores(5), MAX_CONCURRENT_STARTS);
+        assert_eq!(starts_for_cores(64), MAX_CONCURRENT_STARTS);
+    }
 
     /// Every instance limit a component declares on the wire has to reach the
     /// runtime. An in-process test builds `types::Component` directly and so
