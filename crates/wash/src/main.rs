@@ -51,16 +51,39 @@ struct Cli {
     #[arg(short = 'C', default_value = find_project_root().into_os_string())]
     project_path: PathBuf,
 
-    /// Which guest-execution meter to run: `off`, `epoch`, or `fuel`.
+    /// What to measure about guests: `off`, `duration`, or `fuel`.
     ///
-    /// `epoch` samples the clock the host already arms, so guests pay nothing
-    /// for it. `fuel` counts exactly, at the price of a counter compiled into
-    /// every block of guest code.
-    #[arg(long = "meters", global = true, default_value = "off")]
+    /// `duration` reports how many invocations there were, how many failed and
+    /// how long they took, for two clock reads a call — the default, because it
+    /// is what an operator needs first and costs the guest nothing. `fuel` adds
+    /// an exact count of the operations a guest executed, at the price of a
+    /// counter compiled into every block of its code.
+    #[arg(long = "meters", global = true, default_value = "duration")]
     meters: wash_runtime::observability::MeterKind,
+
+    /// Deprecated spelling of `--meters fuel`.
+    #[arg(
+        long = "enable-meters",
+        global = true,
+        hide = true,
+        conflicts_with = "meters"
+    )]
+    enable_meters: bool,
 
     #[command(subcommand)]
     command: Option<WashCliCommand>,
+}
+
+impl Cli {
+    /// The meter to run, honoring the deprecated `--enable-meters`, which turned
+    /// on the fuel counter.
+    fn meters(&self) -> wash_runtime::observability::MeterKind {
+        if self.enable_meters {
+            wash_runtime::observability::MeterKind::Fuel
+        } else {
+            self.meters
+        }
+    }
 }
 
 /// The main CLI commands for wash
@@ -140,6 +163,7 @@ async fn main() {
         user_config: None,
         project_path: find_project_root(),
         meters: wash_runtime::observability::MeterKind::Off,
+        enable_meters: false,
         command: None,
     });
 
@@ -176,6 +200,10 @@ async fn main() {
                 .with_output_kind(global_args.output),
         );
     });
+
+    if global_args.enable_meters {
+        warn!("`--enable-meters` is deprecated, use `--meters fuel` instead");
+    }
 
     // Check if project path exists
     if !global_args.project_path.exists() {
@@ -215,7 +243,7 @@ async fn main() {
     let mut ctx_builder = CliContext::builder()
         .non_interactive(non_interactive)
         .project_dir(project_absolute_path)
-        .meters(global_args.meters);
+        .meters(global_args.meters());
 
     // Load custom config if provided, otherwise will default to XDG config path
     if let Some(config_path) = global_args.user_config {
@@ -269,17 +297,6 @@ async fn main() {
             ),
             Err(e) => trace!(error = ?e, "version check"),
         }
-    }
-
-    // Since some interactive commands may hide the cursor, we need to ensure it is shown again on exit
-    if let Err(e) = ctrlc::set_handler(move || {
-        let term = dialoguer::console::Term::stdout();
-        let _ = term.show_cursor();
-
-        // Exit with standard SIGINT code (128 + 2)
-        std::process::exit(130);
-    }) {
-        warn!(err = ?e, "failed to set ctrl_c handler, interactive prompts may not restore cursor visibility");
     }
 
     let command_output = if let Some(command) = cli.command {
@@ -349,4 +366,44 @@ fn find_project_root() -> PathBuf {
     }
 
     fallback
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wash_runtime::observability::MeterKind;
+
+    #[test]
+    fn enable_meters_selects_fuel() {
+        let cli = Cli::try_parse_from(["wash", "--enable-meters", "inspect", "component.wasm"])
+            .expect("--enable-meters should parse");
+        assert_eq!(cli.meters(), MeterKind::Fuel);
+    }
+
+    #[test]
+    fn meters_flag_stands_alone() {
+        let cli = Cli::try_parse_from(["wash", "--meters", "off", "inspect", "component.wasm"])
+            .expect("--meters should parse");
+        assert_eq!(cli.meters(), MeterKind::Off);
+
+        // Rate, errors and duration without being asked: they cost the guest
+        // two clock reads, and a host nobody can see is worse than one that is
+        // marginally slower.
+        let cli = Cli::try_parse_from(["wash", "inspect", "component.wasm"])
+            .expect("no meter flag should parse");
+        assert_eq!(cli.meters(), MeterKind::Duration);
+    }
+
+    #[test]
+    fn both_meter_flags_conflict() {
+        Cli::try_parse_from([
+            "wash",
+            "--enable-meters",
+            "--meters",
+            "epoch",
+            "inspect",
+            "component.wasm",
+        ])
+        .expect_err("the deprecated flag and its replacement should conflict");
+    }
 }

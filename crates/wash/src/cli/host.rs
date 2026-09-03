@@ -9,7 +9,7 @@ use wash_runtime::{
     plugin::{self},
 };
 
-use crate::cli::{CliCommand, CliContext, CommandOutput};
+use crate::cli::{CliCommand, CliContext, CommandOutput, signal};
 use crate::config::{HttpClientTrustRoots, load_config};
 
 const COMPILED_CACHE_SUBDIR: &str = "cwasm";
@@ -125,6 +125,25 @@ pub struct HostCommand {
     /// concurrency, kept inside the process's file-descriptor limit.
     #[arg(long = "max-connections", env = "WASH_MAX_CONNECTIONS")]
     pub max_connections: Option<usize>,
+
+    /// Cap on the TCP connections accepted on `--http-addr` at once.
+    ///
+    /// Connections, not requests: a keep-alive connection counts while it sits
+    /// idle, and one HTTP/2 connection counts once however many streams it
+    /// carries. Separate from `--max-connections`, which is what workloads may
+    /// hold, because which workload an inbound connection belongs to is unknown
+    /// until its first request names one; and from
+    /// `--max-inbound-socket-connections-per-workload`, which is a workload's
+    /// own published ports rather than this listener.
+    ///
+    /// Connections past this are closed as soon as they are accepted, so the
+    /// host keeps answering rather than going silent. Defaults to a quarter of
+    /// the process's descriptor limit.
+    #[arg(
+        long = "max-http-ingress-connections",
+        env = "WASH_MAX_HTTP_INGRESS_CONNECTIONS"
+    )]
+    pub max_http_ingress_connections: Option<usize>,
 
     /// Cap on live pooled HTTP and gRPC connections a single workload may
     /// hold, across all authorities it talks to. Idle keep-alive connections
@@ -355,6 +374,15 @@ pub struct HostCommand {
     #[clap(long = "compiled-cache-cleanup-grace", value_parser = humantime::parse_duration, env = "WASH_COMPILED_CACHE_CLEANUP_GRACE")]
     pub compiled_cache_cleanup_grace: Option<Duration>,
 
+    /// How many workloads this host pulls and compiles at once.
+    ///
+    /// Each start it admits ends in a single-threaded compile, so this is how
+    /// many cores a burst of starts can take from the ones serving HTTP and
+    /// NATS. Defaults to one fewer than the host can see, at most 4; lower it
+    /// on a host that must stay responsive while it starts things.
+    #[arg(long = "max-concurrent-starts", env = "WASH_MAX_CONCURRENT_STARTS")]
+    pub max_concurrent_starts: Option<usize>,
+
     /// Enable WASI OpenTelemetry plugin
     #[arg(long = "wasi-otel", default_value_t = false)]
     pub wasi_otel: bool,
@@ -565,10 +593,18 @@ impl CliCommand for HostCommand {
             self.core_instances,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(
+            self.max_http_ingress_connections != Some(0),
+            "max_http_ingress_connections must be at least 1"
+        );
 
         // Installed before connect_nats so TLS-enabled NATS clusters have a
         // crypto provider available. Idempotent; also called by Ingress::new.
         wash_runtime::init_crypto();
+
+        // Armed before the plugin pulls below, so a signal during them stops
+        // this process rather than being ignored until the host is up.
+        let shutdown = signal::arm()?;
 
         // Picked up the same way `wash dev` reads its own config file: global
         // config merged with the project-local one, if any. `wash host` has
@@ -627,6 +663,13 @@ impl CliCommand for HostCommand {
         // bundles a second time are a no-op — and fail now if any is invalid.
         wash_runtime::oci::set_extra_ca_certificates(&host_config.oci_ca_paths)
             .context("failed to load --oci-ca-path CA certificates")?;
+
+        // Before any ceiling below is derived: each is a share of the soft
+        // descriptor limit, and this is what that limit ends up being.
+        match wash_runtime::host::quota::raise_descriptor_limit() {
+            Some(limit) => tracing::debug!(descriptors = limit, "descriptor limit"),
+            None => tracing::debug!("descriptor limit is not known on this platform"),
+        }
 
         let mut engine_builder = Engine::builder()
             .with_pooling_allocator(true)
@@ -811,6 +854,10 @@ impl CliCommand for HostCommand {
             cluster_host_builder = cluster_host_builder.with_environment(environment);
         }
 
+        if let Some(starts) = self.max_concurrent_starts {
+            cluster_host_builder = cluster_host_builder.with_max_concurrent_starts(starts);
+        }
+
         // One publishing context for the whole host: workloads and plugins
         // reserve from the same table, so a collision between them is a start
         // failure naming both rather than two listeners that each think they
@@ -836,6 +883,9 @@ impl CliCommand for HostCommand {
 
             let mut ingress_builder = wash_runtime::host::http::Ingress::builder(http_router, addr)
                 .outgoing_handler(outgoing_handler);
+            if let Some(max) = self.max_http_ingress_connections {
+                ingress_builder = ingress_builder.max_connections(max);
+            }
             if let (Some(cert_path), Some(key_path)) = (&self.tls_cert_path, &self.tls_key_path) {
                 let mut tls = wash_runtime::host::http::TlsConfig::new(cert_path, key_path);
                 if let Some(ca) = self.tls_ca_path.as_deref() {
@@ -934,13 +984,15 @@ impl CliCommand for HostCommand {
         let cluster_host = cluster_host_builder
             .build()
             .context("failed to build cluster host")?;
+
+        // The host is about to start taking work, so from here a signal runs
+        // the shutdown below rather than ending the process.
+        let shutdown = shutdown.ready();
         let host_cleanup = wash_runtime::washlet::run_cluster_host(cluster_host)
             .await
             .context("failed to start cluster node")?;
 
-        tokio::signal::ctrl_c()
-            .await
-            .context("failed to listen for shutdown signal")?;
+        shutdown.await;
 
         info!("Stopping host...");
 

@@ -554,7 +554,7 @@ async fn deliver(
                 body: b"hi".to_vec(),
                 reply_to: None,
             },
-            Vec::new(),
+            std::sync::Arc::from([]),
         )
         .await
 }

@@ -70,6 +70,9 @@ pub(crate) struct LinkedJob {
     /// The abandonment flag of the dispatched call enforcing this job's
     /// deadline (see [`crate::engine::abandon`]).
     pub(crate) abandoned: Arc<crate::engine::abandon::AbandonFlag>,
+    /// What this call is measured under, built where the link is prepared —
+    /// the manifest identity a linked call needs is not reachable from here.
+    pub(crate) attributes: Arc<[opentelemetry::KeyValue]>,
 }
 
 /// Work an instance can be given. Every shape runs as a concurrent task on the
@@ -95,6 +98,7 @@ pub(crate) enum InstanceJob {
     /// plugin keeps its own payload and makes its own typed call. That is what
     /// lets a delivery carry, say, a NATS message's bytes rather than the one
     /// 48-byte [`Val`] per byte a store-independent lowering would cost.
+    #[cfg_attr(not(feature = "wasmcloud-nats"), allow(dead_code))]
     Plugin(Box<dyn PluginJob>),
 }
 
@@ -107,6 +111,7 @@ pub(crate) enum InstanceJob {
 /// `max_concurrency`.
 pub(crate) trait PluginJob: Send + 'static {
     /// Names this job in a driver log line.
+    #[cfg_attr(not(feature = "wasmcloud-nats"), allow(dead_code))]
     fn describe(&self) -> &str;
 
     /// Runs the call. Owns replying to whoever is waiting for it, and may
@@ -120,54 +125,51 @@ pub(crate) trait PluginJob: Send + 'static {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
-/// Measures the guest execution one pooled call adds, and records it when
-/// dropped.
+/// Times one guest invocation, and records it when dropped.
 ///
-/// Every pooled call is metered, not just the ones a plugin remembered to wrap:
-/// `guest.execution.time` is the only signal an operator has for what a warm
-/// instance is spending, and a histogram whose population depends on which
-/// call site opted in cannot be read as a distribution.
+/// Wall clock, which is what a caller waited and what a latency dashboard is
+/// asking for. It is exact per call, unlike a delta of the store-wide execution
+/// counter, which is only this call's when no other call shared the store —
+/// see [`crate::engine::abandon::GuestExecution`], which answers the separate
+/// question of how much CPU a workload burned.
 ///
 /// Recording on drop is what makes it cover a call that ends by trapping or
-/// timing out — the two an operator most wants in the histogram, and the two an
-/// early return would otherwise skip.
+/// timing out — the two an operator most wants, and the two an early return
+/// would otherwise skip. `error` names what went wrong for the ones that can
+/// say; a call that ends without setting it is recorded as a success.
 ///
-/// Started once the export has resolved, not before: a call that never reached
-/// guest code has no execution to report, and recording it anyway would put a
-/// 0ms observation in the same bucket as a genuinely fast call.
-///
-/// A plugin serving a call from a store of its own — because the component
-/// declared no pool, or because every instance was busy — starts one of these
-/// too, so a component's measurements do not depend on whether it opted into
-/// pooling.
-pub(crate) struct ExecutionSample {
-    executed: Arc<crate::engine::abandon::GuestExecution>,
-    before: u64,
-    attributes: Vec<opentelemetry::KeyValue>,
+/// Costs nothing on a host that is not metering: the meter is looked up once at
+/// the start, and finding none skips the clock as well as the record.
+pub(crate) struct InvocationSample {
+    /// `None` when nothing will record this, which is the default host.
+    started: Option<std::time::Instant>,
+    attributes: Arc<[opentelemetry::KeyValue]>,
+    error: Option<&'static str>,
 }
 
-impl ExecutionSample {
-    pub(crate) fn start(
-        accessor: &Accessor<SharedCtx>,
-        attributes: Vec<opentelemetry::KeyValue>,
-    ) -> Self {
-        let executed = accessor.with(|mut access| Arc::clone(&access.get().executed));
-        let before = executed.millis();
+impl InvocationSample {
+    pub(crate) fn start(attributes: Arc<[opentelemetry::KeyValue]>) -> Self {
         Self {
-            executed,
-            before,
+            started: crate::observability::invocation_meter().map(|_| std::time::Instant::now()),
             attributes,
+            error: None,
         }
+    }
+
+    /// Mark what went wrong, for a call site that knows. The value is a short
+    /// bounded name — `trap`, `timeout` — never anything a caller supplies.
+    pub(crate) fn failed(&mut self, error: &'static str) {
+        self.error = Some(error);
     }
 }
 
-impl Drop for ExecutionSample {
+impl Drop for InvocationSample {
     fn drop(&mut self) {
-        if let Some(meter) = crate::observability::execution_time_meter() {
-            meter.record(
-                &self.attributes,
-                self.executed.millis().saturating_sub(self.before),
-            );
+        let Some(started) = self.started else {
+            return;
+        };
+        if let Some(meter) = crate::observability::invocation_meter() {
+            meter.record(&self.attributes, started.elapsed(), self.error);
         }
     }
 }
@@ -260,6 +262,7 @@ impl AccessorTask<SharedCtx> for LinkedTask {
             export_name,
             reply,
             abandoned,
+            attributes,
         } = *self.job;
         let instance = self.instance;
 
@@ -281,6 +284,7 @@ impl AccessorTask<SharedCtx> for LinkedTask {
                 return Ok(());
             }
         };
+        let _sample = InvocationSample::start(attributes);
 
         let mut results = vec![Val::Bool(false); results_len];
         let call_timeout = crate::timeouts::ephemeral_call();

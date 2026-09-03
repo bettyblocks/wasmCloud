@@ -59,8 +59,8 @@ const QUOTA_IDLE: Duration = Duration::from_secs(300);
 /// classifiable connect timeout instead of a long hang.
 const DEFAULT_HTTP_WAIT: Duration = Duration::from_secs(5);
 
-/// What the host-wide ceiling falls back to when the real descriptor limit
-/// cannot be read. Half of the 1024 soft limit common on Linux.
+/// What the host-wide ceiling falls back to on a platform with no descriptor
+/// limit to read — Windows. Half of the 1024 soft limit common on Linux.
 const ASSUMED_MAX_CONNECTIONS: usize = 512;
 
 /// Share of the process's file-descriptor budget guest connections may hold.
@@ -77,6 +77,29 @@ const FD_BUDGET_DENOMINATOR: usize = 2;
 const MIN_DERIVED_MAX_CONNECTIONS: usize = 64;
 const MAX_DERIVED_MAX_CONNECTIONS: usize = 32_768;
 
+/// Share of the descriptor budget the host's own HTTP ingress may hold in
+/// accepted connections.
+///
+/// Its own share rather than the guest one above, because the two fail
+/// differently: a guest refused a connection gets an error it can report, while
+/// ingress out of descriptors cannot accept at all — and an accept loop with
+/// nothing to accept is what makes a live host look dead to a TCP probe.
+const INGRESS_BUDGET_NUMERATOR: usize = 1;
+const INGRESS_BUDGET_DENOMINATOR: usize = 4;
+
+/// Floor under the ingress share, above the one guests get. A share of a small
+/// desktop limit lands near 64, and a server that can hold 64 connections is
+/// not usefully a server — a `wash dev` or a benchmark would sit at the ceiling.
+const MIN_INGRESS_CONNECTIONS: usize = 256;
+
+/// Ceiling on the raise [`raise_descriptor_limit`] performs.
+///
+/// Linux's own default `fs.nr_open`, and the point past which more descriptors
+/// buy nothing. An unlimited soft limit is worse than a large one: it leaves no
+/// number for the ceilings below to take a share of.
+#[cfg(any(unix, test))]
+const MAX_RAISED_DESCRIPTORS: u64 = 1_048_576;
+
 /// Host-wide ceiling on live connections when the operator names none.
 ///
 /// Derived from `RLIMIT_NOFILE` rather than assumed, because the number that
@@ -89,20 +112,53 @@ const MAX_DERIVED_MAX_CONNECTIONS: usize = 32_768;
 /// This is a *bound*, not a reservation: nothing is preallocated, so a generous
 /// limit costs nothing until connections are actually opened.
 pub fn default_max_connections() -> usize {
-    let Some(soft) = descriptor_soft_limit() else {
+    descriptor_share(FD_BUDGET_NUMERATOR, FD_BUDGET_DENOMINATOR)
+}
+
+/// Host-wide ceiling on the TCP connections the HTTP ingress holds, when the
+/// operator names none.
+///
+/// Counted where they are accepted, before TLS and before a protocol is known,
+/// so this bounds sockets rather than requests: an idle keep-alive connection
+/// holds a slot, and an HTTP/2 connection holds one however many streams it
+/// carries. They are not a guest's to account for — which workload a connection
+/// belongs to is unknown until its first request names one — so they draw on
+/// their own share rather than on [`default_max_connections`].
+pub fn default_max_http_ingress_connections() -> usize {
+    descriptor_share(INGRESS_BUDGET_NUMERATOR, INGRESS_BUDGET_DENOMINATOR)
+        .max(MIN_INGRESS_CONNECTIONS)
+}
+
+/// `numerator/denominator` of the process's descriptor budget, bounded.
+fn descriptor_share(numerator: usize, denominator: usize) -> usize {
+    share_of(descriptor_soft_limit(), numerator, denominator)
+}
+
+/// The share arithmetic on its own, so the ceilings can be checked against a
+/// limit this process does not have to be running under.
+fn share_of(soft: Option<usize>, numerator: usize, denominator: usize) -> usize {
+    let Some(soft) = soft else {
         return ASSUMED_MAX_CONNECTIONS;
     };
-    soft.saturating_mul(FD_BUDGET_NUMERATOR)
-        .saturating_div(FD_BUDGET_DENOMINATOR)
+    soft.saturating_mul(numerator)
+        .saturating_div(denominator)
         .clamp(MIN_DERIVED_MAX_CONNECTIONS, MAX_DERIVED_MAX_CONNECTIONS)
 }
 
-/// The process's soft `RLIMIT_NOFILE`, or `None` if it cannot be read or is
-/// unlimited — in which case there is no budget to take a share of.
+/// A soft `RLIMIT_NOFILE` as a budget, given what `getrlimit` reported.
+///
+/// `None` there means unlimited, which reads as [`MAX_RAISED_DESCRIPTORS`]
+/// rather than as no answer: no bound at all is a larger budget than any finite
+/// one, and calling it unknown would hand out the smallest share of all.
+#[cfg(any(unix, test))]
+fn soft_limit_as_budget(reported: Option<u64>) -> Option<usize> {
+    usize::try_from(reported.unwrap_or(MAX_RAISED_DESCRIPTORS)).ok()
+}
+
+/// The process's soft `RLIMIT_NOFILE` as a budget.
 #[cfg(unix)]
 fn descriptor_soft_limit() -> Option<usize> {
-    let limits = rustix::process::getrlimit(rustix::process::Resource::Nofile);
-    usize::try_from(limits.current?).ok()
+    soft_limit_as_budget(rustix::process::getrlimit(rustix::process::Resource::Nofile).current)
 }
 
 /// Windows has no `RLIMIT_NOFILE` to derive from: sockets are handles bounded
@@ -111,6 +167,64 @@ fn descriptor_soft_limit() -> Option<usize> {
 /// [`ASSUMED_MAX_CONNECTIONS`].
 #[cfg(not(unix))]
 fn descriptor_soft_limit() -> Option<usize> {
+    None
+}
+
+/// The soft descriptor limits worth asking for, largest first, for a process
+/// currently at `soft` with a ceiling of `hard`. Empty when there is nothing
+/// worth asking for.
+///
+/// A hard limit of "unlimited" (`None`) is not a number any kernel will take —
+/// Linux refuses anything over `fs.nr_open`, macOS over `kern.maxfilesperproc`
+/// — and neither reports what it *would* take. So this is a sequence to try
+/// rather than one number, halving until the ask is one the process already
+/// has.
+#[cfg(any(unix, test))]
+fn raise_plan(soft: Option<u64>, hard: Option<u64>) -> Vec<u64> {
+    let have = soft.unwrap_or(u64::MAX);
+    let mut target = hard
+        .unwrap_or(MAX_RAISED_DESCRIPTORS)
+        .min(MAX_RAISED_DESCRIPTORS);
+    let mut plan = Vec::new();
+    while target > have {
+        plan.push(target);
+        target /= 2;
+    }
+    plan
+}
+
+/// Raise the process's soft descriptor limit as far as the kernel allows, and
+/// report the limit in force afterwards.
+///
+/// **An embedder's to call, never the runtime's.** The soft limit is
+/// process-global: a library that moved it would be reaching outside the host
+/// it was handed, and an embedder with its own opinion could not opt out. What
+/// lives here is the policy — how high is worth asking for, and what to do when
+/// the kernel says no ([`raise_plan`]); a `wash host`, a `wash dev` or a
+/// third-party embedder decides whether to apply it.
+///
+/// Apply it before deriving any ceiling above, since each is a share of
+/// whatever this leaves in place.
+#[cfg(unix)]
+pub fn raise_descriptor_limit() -> Option<usize> {
+    let limits = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    for target in raise_plan(limits.current, limits.maximum) {
+        let ask = rustix::process::Rlimit {
+            current: Some(target),
+            maximum: limits.maximum,
+        };
+        if rustix::process::setrlimit(rustix::process::Resource::Nofile, ask).is_ok() {
+            return descriptor_soft_limit();
+        }
+    }
+    // Not fatal: the host runs on whatever it was given, and every derived
+    // ceiling is sized from that same number.
+    tracing::debug!(soft = ?limits.current, "left the descriptor limit where it was");
+    descriptor_soft_limit()
+}
+
+#[cfg(not(unix))]
+pub fn raise_descriptor_limit() -> Option<usize> {
     None
 }
 
@@ -439,6 +553,99 @@ mod tests {
                 "half the budget is left for listeners, pulls, and open files"
             );
         }
+    }
+
+    /// Guests and ingress take their shares of one budget, and both fit inside
+    /// it with room left for the listeners, pulls and open files that are
+    /// neither. Checked against limits this process need not be running under,
+    /// because the interesting ones are not the ones a test machine has.
+    #[test]
+    fn ingress_and_guests_fit_inside_one_descriptor_budget() {
+        for soft in [4096usize, 65_536, 1_048_576] {
+            let guests = super::share_of(
+                Some(soft),
+                super::FD_BUDGET_NUMERATOR,
+                super::FD_BUDGET_DENOMINATOR,
+            );
+            let ingress = super::share_of(
+                Some(soft),
+                super::INGRESS_BUDGET_NUMERATOR,
+                super::INGRESS_BUDGET_DENOMINATOR,
+            )
+            .max(super::MIN_INGRESS_CONNECTIONS);
+            assert!(
+                guests + ingress < soft,
+                "{guests} guest and {ingress} ingress connections must fit in {soft}"
+            );
+            assert!(ingress <= guests, "ingress takes the smaller share");
+        }
+    }
+
+    /// Under a limit too small to divide, the floors win and together promise
+    /// more than the budget holds. That is the deliberate trade — a host this
+    /// constrained is unusable at a proportional ceiling — and it is recorded
+    /// here so it stays a choice rather than becoming a surprise.
+    #[test]
+    fn a_tiny_descriptor_limit_gets_the_floors_not_a_share() {
+        let soft = 128;
+        assert_eq!(
+            super::share_of(
+                Some(soft),
+                super::FD_BUDGET_NUMERATOR,
+                super::FD_BUDGET_DENOMINATOR
+            ),
+            super::MIN_DERIVED_MAX_CONNECTIONS
+        );
+        assert!(super::MIN_DERIVED_MAX_CONNECTIONS + super::MIN_INGRESS_CONNECTIONS > soft);
+    }
+
+    /// What the raise asks for, without asking the kernel for anything.
+    ///
+    /// The step-down exists because an unlimited hard limit is not a number any
+    /// kernel takes, and none reports what it would take — so a single ask that
+    /// is refused must not be the end of it, or the raise silently does nothing
+    /// on exactly the hosts it was written for.
+    #[test]
+    fn the_raise_asks_lower_until_it_reaches_what_it_already_has() {
+        // Nothing to ask for: already at the ceiling, or above what is useful.
+        assert!(super::raise_plan(Some(1_048_576), Some(1_048_576)).is_empty());
+        assert!(super::raise_plan(None, None).is_empty());
+
+        // The ordinary container: soft 1024, hard far above it.
+        let plan = super::raise_plan(Some(1024), Some(1_048_576));
+        assert_eq!(plan.first(), Some(&1_048_576), "ask for the most first");
+        assert!(
+            plan.last().is_some_and(|last| *last > 1024),
+            "never ask for less than the process already has"
+        );
+        assert!(
+            plan.windows(2).all(|w| w[0] > w[1]),
+            "each ask is smaller than the last"
+        );
+
+        // An unlimited hard limit is capped, not taken literally.
+        assert_eq!(
+            super::raise_plan(Some(256), None).first(),
+            Some(&super::MAX_RAISED_DESCRIPTORS)
+        );
+    }
+
+    /// An unlimited `RLIMIT_NOFILE` is the largest budget there is, so it must
+    /// not read as the smallest. Reported as no answer it would hand out the
+    /// fallback share — a *sixty-fourth* of what the same host gets when its
+    /// limit is a large number rather than "no limit".
+    #[test]
+    fn an_unlimited_descriptor_limit_is_a_generous_budget() {
+        let unlimited = super::share_of(super::soft_limit_as_budget(None), 1, 2);
+        assert!(
+            unlimited > super::ASSUMED_MAX_CONNECTIONS,
+            "an unlimited limit gave {unlimited}, no better than not reading it at all"
+        );
+        assert_eq!(
+            unlimited,
+            super::share_of(super::soft_limit_as_budget(Some(1_048_576)), 1, 2),
+            "unlimited and the largest finite limit are the same budget"
+        );
     }
     use super::*;
 

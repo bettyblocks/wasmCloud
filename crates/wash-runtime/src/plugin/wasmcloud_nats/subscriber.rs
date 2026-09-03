@@ -16,9 +16,7 @@ use tracing::{Instrument, debug, error, warn};
 use crate::engine::instance_driver::InstanceJob;
 use crate::engine::instance_pool::{ComponentInstance, Dispatch};
 use crate::engine::workload::ResolvedWorkload;
-use crate::observability::ExecutionTimeMeter;
 use crate::wasmtime::component::{Accessor, InstancePre, Resource};
-use opentelemetry::KeyValue;
 
 use super::config::{AckMode, CoreSubscriptionConfig, JetStreamSubscriptionConfig, KvWatchConfig};
 use super::conn::ConnHandle;
@@ -38,7 +36,8 @@ macro_rules! handler_pre {
     ($name:ident, $proxy:ident, $pre:ty, $instance:ty) => {
         struct $name($pre);
 
-        struct $proxy($instance);
+        // As visible as the warm set that names it in its type.
+        pub(super) struct $proxy($instance);
 
         impl Clone for $name {
             fn clone(&self) -> Self {
@@ -126,6 +125,12 @@ fn kv_entry_to_kv_handler_wit(e: &jetstream::kv::Entry) -> kv_bindings::wasmclou
 struct HandlerTarget {
     component_id: Arc<str>,
     pre: InstancePre<SharedCtx>,
+    /// What every delivery through this target is measured under, built once
+    /// per subscription rather than per delivery: neither the identity nor the
+    /// operation can change under a resolved workload, and resolving the
+    /// identity costs a read lock. Whichever spawner built the target filled
+    /// this with its own operation.
+    attributes: Arc<[opentelemetry::KeyValue]>,
 }
 
 /// The outcome channel every delivery job replies on: the handler's own
@@ -142,9 +147,11 @@ fn call_guard(accessor: &Accessor<SharedCtx>) -> Arc<crate::engine::abandon::Aba
     })
 }
 
-/// How each delivery flavour names itself in a driver log line.
+/// The WIT export each delivery flavour invokes, and what its measurements are
+/// grouped by. Bounded by the interface set, so it is safe as an attribute.
 const CORE_OPERATION: &str = "wasmcloud:nats/core-handler#handle-message";
 const KV_OPERATION: &str = "wasmcloud:nats/kv-handler#handle-event";
+const JETSTREAM_OPERATION: &str = "wasmcloud:nats/jetstream-handler#handle-message";
 
 /// One core NATS delivery, run on whichever instance the pool picks.
 ///
@@ -156,7 +163,7 @@ struct CoreDeliveryJob {
     msg: core_bindings::wasmcloud::nats::types::NatsMessage,
     abandoned: Arc<crate::engine::abandon::AbandonFlag>,
     reply: DeliveryReply,
-    attributes: Vec<opentelemetry::KeyValue>,
+    attributes: Arc<[opentelemetry::KeyValue]>,
 }
 
 impl crate::engine::instance_driver::PluginJob for CoreDeliveryJob {
@@ -198,8 +205,7 @@ impl crate::engine::instance_driver::PluginJob for CoreDeliveryJob {
             // the workload. Retiring is what ends it — the driver stops
             // admitting, drains, and the store's teardown takes the stalled
             // work with it. The same contract [`LinkedTask`] follows.
-            let _sample =
-                crate::engine::instance_driver::ExecutionSample::start(accessor, attributes);
+            let mut sample = crate::engine::instance_driver::InvocationSample::start(attributes);
             let outcome = tokio::time::timeout(
                 crate::timeouts::ephemeral_call(),
                 crate::engine::abandon::watch_until_abandoned(
@@ -212,15 +218,24 @@ impl crate::engine::instance_driver::PluginJob for CoreDeliveryJob {
             )
             .await;
             let _ = reply.send(match outcome {
-                Ok(Ok(inner)) => Ok(inner),
+                Ok(Ok(inner)) => {
+                    // The guest's own `result<_, string>`: it ran and said no,
+                    // which is a failed delivery even though nothing trapped.
+                    if inner.is_err() {
+                        sample.failed("handler");
+                    }
+                    Ok(inner)
+                }
                 // A host failure mid-call leaves guest state indeterminate.
                 Ok(Err(e)) => {
+                    sample.failed("trap");
                     if let Some(slot) = slot {
                         slot.retire_instance();
                     }
                     Err(anyhow::anyhow!("{e:#}"))
                 }
                 Err(e) => {
+                    sample.failed("timeout");
                     if let Some(slot) = slot {
                         slot.retire_instance();
                     }
@@ -238,7 +253,7 @@ struct KvDeliveryJob {
     entry: kv_bindings::wasmcloud::nats::kv::Entry,
     abandoned: Arc<crate::engine::abandon::AbandonFlag>,
     reply: DeliveryReply,
-    attributes: Vec<opentelemetry::KeyValue>,
+    attributes: Arc<[opentelemetry::KeyValue]>,
 }
 
 impl crate::engine::instance_driver::PluginJob for KvDeliveryJob {
@@ -281,8 +296,7 @@ impl crate::engine::instance_driver::PluginJob for KvDeliveryJob {
             // the workload. Retiring is what ends it — the driver stops
             // admitting, drains, and the store's teardown takes the stalled
             // work with it. The same contract [`LinkedTask`] follows.
-            let _sample =
-                crate::engine::instance_driver::ExecutionSample::start(accessor, attributes);
+            let mut sample = crate::engine::instance_driver::InvocationSample::start(attributes);
             let outcome = tokio::time::timeout(
                 crate::timeouts::ephemeral_call(),
                 crate::engine::abandon::watch_until_abandoned(
@@ -295,15 +309,24 @@ impl crate::engine::instance_driver::PluginJob for KvDeliveryJob {
             )
             .await;
             let _ = reply.send(match outcome {
-                Ok(Ok(inner)) => Ok(inner),
+                Ok(Ok(inner)) => {
+                    // The guest's own `result<_, string>`: it ran and said no,
+                    // which is a failed delivery even though nothing trapped.
+                    if inner.is_err() {
+                        sample.failed("handler");
+                    }
+                    Ok(inner)
+                }
                 // A host failure mid-call leaves guest state indeterminate.
                 Ok(Err(e)) => {
+                    sample.failed("trap");
                     if let Some(slot) = slot {
                         slot.retire_instance();
                     }
                     Err(anyhow::anyhow!("{e:#}"))
                 }
                 Err(e) => {
+                    sample.failed("timeout");
                     if let Some(slot) = slot {
                         slot.retire_instance();
                     }
@@ -437,47 +460,34 @@ async fn run_delivery(
         .map_err(|_| anyhow::anyhow!("delivery task dropped the reply"))?
 }
 
-/// The warm sets a component's handlers serve their deliveries from, built from
-/// the instance policy the component declared.
+/// The warm instances a component's JetStream deliveries are served from,
+/// built from the instance policy the component declared.
 ///
 /// The same `poolSize` / `maxInvocations` knobs that feed the engine's
-/// [`InstanceJob`] pool, honoured here because a *JetStream* delivery cannot
-/// take that path — its call carries a typed resource that must live in the very
+/// [`InstanceJob`] pool, honoured here because a JetStream delivery cannot take
+/// that path — its call carries a typed resource that must live in the very
 /// store that runs it, and its ack ownership lives in the subscription loop.
-/// See [`super::warm`] for what is and is not honoured.
+/// Core and KV deliveries do take the pool. See [`super::warm`] for what is and
+/// is not honoured.
 ///
-/// One set per handler flavour, built once per *component* rather than once per
-/// binding: `poolSize` is the component's, and the stores are interchangeable
-/// across the bindings it serves. Per binding, a component bridging two
-/// clusters with `(implements hub)` and `(implements leaf)` at `poolSize: 8`
-/// parked up to 16 live stores on a host sized for 8.
+/// Built once per *component* rather than once per binding: `poolSize` is the
+/// component's, and the stores are interchangeable across the bindings it
+/// serves. Per binding, a component bridging two clusters with
+/// `(implements hub)` and `(implements leaf)` at `poolSize: 8` parked up to 16
+/// live stores on a host sized for 8.
 ///
 /// [`InstanceJob`]: crate::engine::instance_driver::InstanceJob
-pub(super) struct WarmSets {
-    jetstream: Arc<super::warm::WarmSet<(crate::wasmtime::Store<SharedCtx>, JsProxy)>>,
-}
+pub(super) type JetStreamWarmSet =
+    super::warm::WarmSet<(crate::wasmtime::Store<SharedCtx>, JsProxy)>;
 
-impl WarmSets {
-    pub(super) async fn for_component(
-        workload: &ResolvedWorkload,
-        component_id: &str,
-    ) -> Arc<Self> {
-        let policy = workload.warm_instance_policy(component_id).await;
-        let sets = Self {
-            jetstream: Arc::new(super::warm::WarmSet::new(policy)),
-        };
-        if sets.jetstream.keeps_instances() {
-            debug!(
-                component_id,
-                ?policy,
-                "wasmcloud:nats JetStream deliveries will reuse warm instances; note \
-                 that on this path `maxConcurrency` above 1 is served by additional \
-                 one-shot stores rather than by concurrent calls on one instance. Core \
-                 and KV deliveries go through the engine's pool and do honour it."
-            );
-        }
-        Arc::new(sets)
-    }
+/// The warm set a component's JetStream deliveries share.
+pub(super) async fn jetstream_warm_set(
+    workload: &ResolvedWorkload,
+    component_id: &str,
+) -> Arc<JetStreamWarmSet> {
+    Arc::new(super::warm::WarmSet::new(
+        workload.warm_instance_policy(component_id).await,
+    ))
 }
 
 /// How long an unsettled sequence holds a rebuild back before the loop stops
@@ -719,14 +729,19 @@ pub(super) async fn spawn_jetstream_subscriptions(
     conn: Arc<ConnHandle>,
     subs: Vec<JetStreamSubscriptionConfig>,
     cancel_token: CancellationToken,
-    execution_meter: ExecutionTimeMeter,
+    guest_meter: crate::observability::GuestMeter,
     failure_sink: Option<crate::plugin::WorkloadFailureSink>,
     workload_id: impl Into<String>,
-    warm_sets: Arc<WarmSets>,
+    warm_set: Arc<JetStreamWarmSet>,
 ) -> anyhow::Result<()> {
     let instance_pre = workload.instantiate_pre(component_id).await?;
     let pre = JsHandlerPre::new(instance_pre)?;
-    let warm_set = warm_sets.jetstream.clone();
+    // Built once for the whole subscription set: the same attributes every
+    // JetStream delivery on this component is measured under.
+    let attributes = workload
+        .component_identity(component_id)
+        .await
+        .attributes(PLUGIN_NATS_ID, JETSTREAM_OPERATION);
     let workload_id = workload_id.into();
     // Namespace only: both the workload id and the workload *name* are
     // per-replica, and replicas must converge on one durable. See
@@ -742,11 +757,12 @@ pub(super) async fn spawn_jetstream_subscriptions(
         let component_id = component_id.to_string();
         let pre = pre.clone();
         let cancel_token = cancel_token.clone();
-        let execution_meter = execution_meter.clone();
+        let guest_meter = guest_meter.clone();
         let failure_sink = failure_sink.clone();
         let workload_id = workload_id.clone();
         let scope = scope.clone();
         let warm_set = warm_set.clone();
+        let attributes = Arc::clone(&attributes);
 
         tokio::spawn(async move {
             // Mark the current generation as seen, so the connect that opened
@@ -1418,19 +1434,16 @@ pub(super) async fn spawn_jetstream_subscriptions(
                             // Kept so the handle can be cleared before the
                             // store is parked; see the delete below.
                             let handle_rep = resource.rep();
-                            let execution_meter = execution_meter.clone();
-                            let subject_label = subject_str.clone();
+                            let guest_meter = guest_meter.clone();
+                            let attributes = Arc::clone(&attributes);
                             let warm_set = warm_set.clone();
                             tokio::spawn(async move {
                                 // Split borrows: the call takes the store
                                 // mutably while the proxy that drives it is
                                 // read from the same struct.
                                 let (store, proxy) = (&mut warmed.handler.0, &warmed.handler.1);
-                                let result = execution_meter.observe(
-                                    &[
-                                        KeyValue::new("plugin", PLUGIN_NATS_ID),
-                                        KeyValue::new("subject", subject_label),
-                                    ],
+                                let result = guest_meter.observe(
+                                    &attributes,
                                     store,
                                     async move |store| {
                                         proxy
@@ -1985,9 +1998,11 @@ pub(super) async fn spawn_core_subscriptions(
     host_budget: Arc<HostBacklogBudget>,
 ) -> anyhow::Result<()> {
     let instance_pre = workload.instantiate_pre(component_id).await?;
+    let identity = workload.component_identity(component_id).await;
     let target = HandlerTarget {
         component_id: Arc::from(component_id),
         pre: instance_pre,
+        attributes: identity.attributes(PLUGIN_NATS_ID, CORE_OPERATION),
     };
     let workload_id = workload_id.into();
 
@@ -2102,10 +2117,7 @@ pub(super) async fn spawn_core_subscriptions(
                                 msg,
                                 abandoned: call.flag(),
                                 reply,
-                                attributes: vec![
-                                    KeyValue::new("plugin", PLUGIN_NATS_ID),
-                                    KeyValue::new("subject", subject_label.clone()),
-                                ],
+                                attributes: Arc::clone(&target.attributes),
                             });
                         let span = tracing::span!(
                             tracing::Level::INFO,
@@ -2183,9 +2195,11 @@ pub(super) async fn spawn_kv_watches(
     _workload_id: impl Into<String>,
 ) -> anyhow::Result<()> {
     let instance_pre = workload.instantiate_pre(component_id).await?;
+    let identity = workload.component_identity(component_id).await;
     let target = HandlerTarget {
         component_id: Arc::from(component_id),
         pre: instance_pre,
+        attributes: identity.attributes(PLUGIN_NATS_ID, KV_OPERATION),
     };
 
     for watch in watches {
@@ -2386,10 +2400,7 @@ pub(super) async fn spawn_kv_watches(
                                     entry: kv_entry_to_kv_handler_wit(&entry),
                                     abandoned: call.flag(),
                                     reply,
-                                    attributes: vec![
-                                        KeyValue::new("plugin", PLUGIN_NATS_ID),
-                                        KeyValue::new("bucket", bucket_for_label.clone()),
-                                    ],
+                                    attributes: Arc::clone(&target.attributes),
                                 });
                             let span = tracing::span!(
                                 tracing::Level::INFO,
