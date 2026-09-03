@@ -57,10 +57,13 @@ async fn test_cron_service_integration() -> Result<()> {
                 digest: None,
                 local_resources: Default::default(),
                 max_invocations: 1,
+                max_concurrency: 1,
                 pool_size: 0,
                 source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
                     CRON_COMPONENT_WASM,
                 )),
+                reclaim_window_seconds: 0,
+                reclaim_min_instances: 0,
             }],
             host_interfaces: vec![],
             volumes: vec![],

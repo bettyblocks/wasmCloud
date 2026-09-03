@@ -6,8 +6,13 @@ pub mod host;
 pub mod observability;
 pub mod plugin;
 pub mod sockets;
+mod timeouts;
 pub mod types;
 pub mod wit;
+
+#[cfg(feature = "oci")]
+pub mod component_source;
+pub mod config_source;
 
 #[cfg(feature = "oci")]
 pub mod oci;
@@ -24,9 +29,9 @@ pub use wasmtime;
 /// any number of threads. The install happens at most once per process. If
 /// another crate already installed a provider we leave it in place.
 ///
-/// Called automatically by [`host::http::HttpServer::new`] and
-/// [`host::http::HttpServer::new_with_tls`]; call it directly from binaries
-/// that touch TLS before constructing an `HttpServer` (for example, CLIs that
+/// Called automatically by [`host::http::Ingress::new`] and
+/// [`host::http::Ingress::new_with_tls`]; call it directly from binaries
+/// that touch TLS before constructing an `Ingress` (for example, CLIs that
 /// connect to a TLS NATS cluster during startup).
 pub fn init_crypto() {
     use std::sync::Once;
@@ -44,12 +49,14 @@ pub fn init_crypto() {
     });
 }
 
-#[cfg(test)]
+// The one test here starts a host around the `wasi:config` plugin, so it only
+// exists in a build that has one.
+#[cfg(all(test, feature = "wasi-config"))]
 mod test {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::host::http::HttpServer;
+    use crate::host::http::Ingress;
     use crate::plugin::wasi_config::DynamicConfig;
     use crate::{
         host::HostApi,
@@ -62,12 +69,12 @@ mod test {
     async fn can_run_engine() -> anyhow::Result<()> {
         let engine = Engine::builder().build()?;
         let http_handler = crate::host::http::DevRouter::default();
-        let http_plugin = HttpServer::new(http_handler, "127.0.0.1:0".parse()?).await?;
+        let ingress = Ingress::new(http_handler, "127.0.0.1:0".parse()?).await?;
         let wasi_config_plugin = DynamicConfig::default();
 
         let host = HostBuilder::new()
             .with_engine(engine)
-            .with_http_handler(Arc::new(http_plugin))
+            .with_http_handler(Arc::new(ingress))
             .with_plugin(Arc::new(wasi_config_plugin))?
             .build()?;
 

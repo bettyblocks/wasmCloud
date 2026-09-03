@@ -136,7 +136,7 @@ The wasmCloud platform has three primary parts, all developed in this repository
 The runtime exposes capabilities through three mechanisms:
 
 - **Built-in via `wasmtime-wasi`** — `wasi:filesystem`, `wasi:clocks`, `wasi:random`, `wasi:io`, `wasi:sockets`, `wasi:cli`.
-- **HTTP handler** (`HttpServer`) — `wasi:http` (client and server).
+- **Ingress** (`Ingress`) — `wasi:http` (client and server).
 - **Host plugins** (`with_plugin()`, feature-flagged in-memory and NATS-backed variants) — `wasi:keyvalue`, `wasi:blobstore`, `wasi:config`, `wasi:logging`, `wasmcloud:messaging`.
 
 Hosts can be extended with additional custom plugins at build time. See [Creating Host Plugins](https://wasmcloud.com/docs/runtime/creating-host-plugins).
@@ -216,12 +216,34 @@ cargo build
 cargo build --workspace
 ```
 
-The `wash-runtime` integration tests and benchmarks load precompiled wasm fixtures. Build them once with the `xtask` runner, and re-run whenever you change a fixture under `crates/wash-runtime/tests/fixtures/`:
+The `wash-runtime` integration tests and benchmarks load precompiled wasm fixtures. You can build the
+fixtures with the  `xtask` runner.
+
+> [!WARNING]
+> As the current version of `wasm-component-ld` that is in use in upstream Rust is
+> older and does not support certain Component Model features that wasmCloud does,
+> `cargo xtask build-fixtures` can fail with `decoding custom section ... invalid
+> leading byte`. In that case, install `wasm-component-ld`:
+>
+> ```console
+> cargo install wasm-component-ld
+> ```
+> (consider also using `cargo binstall` if you have it installed)
+>
+> Once you have `wasm-component-ld` installed (any version greater than 0.5.24),
+> you can convince `cargo` to use it by settting the following environment variable
+> ```console
+> export CARGO_TARGET_WASM32_WASIP2_LINKER=$HOME/.cargo/bin/wasm-component-ld
+> ```
 
 ```bash
+# export CARGO_TARGET_WASM32_WASIP2_LINKER=$HOME/.cargo/bin/wasm-component-ld
 cargo xtask build-fixtures
 cargo test
 ```
+(NOTE: you do not have to use a modified linker for anything other than building fixtures)
+
+Remember to rebuild the fixtures if you change any code `crates/wash-runtime/tests/fixtures/`.
 
 For Go components (operator, gateway), see their respective `README.md` files and `make` targets.
 

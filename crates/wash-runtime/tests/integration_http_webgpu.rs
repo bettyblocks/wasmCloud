@@ -23,7 +23,7 @@ use wash_runtime::{
     engine::Engine,
     host::{
         HostApi, HostBuilder,
-        http::{DevRouter, HttpServer},
+        http::{DevRouter, Ingress},
     },
     plugin::wasi_webgpu::{WebGpu, WebGpuBackend},
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
@@ -44,13 +44,13 @@ async fn test_http_webgpu_integration() -> Result<()> {
     let engine = Engine::builder().build()?;
 
     // Create HTTP server plugin on a dynamically allocated port
-    let http_plugin = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
-    let addr = http_plugin.addr();
+    let ingress = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
+    let addr = ingress.addr();
 
     // Build host with plugins following the existing pattern from lib.rs test
     let host = HostBuilder::new()
         .with_engine(engine.clone())
-        .with_http_handler(Arc::new(http_plugin))
+        .with_http_handler(Arc::new(ingress))
         .with_plugin(Arc::new(WebGpu::new(WebGpuBackend::Noop)))?
         .build()?;
 
@@ -79,12 +79,17 @@ async fn test_http_webgpu_integration() -> Result<()> {
                     environment: HashMap::new(),
                     volume_mounts: vec![],
                     allowed_hosts: Default::default(),
+                    allowed_ip_name_lookups: Default::default(),
+                    allowed_host_loopback_ports: Default::default(),
                 },
                 source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
                     HTTP_WEBGPU_WASM,
                 )),
                 pool_size: 1,
                 max_invocations: 100,
+                max_concurrency: 1,
+                reclaim_window_seconds: 0,
+                reclaim_min_instances: 0,
             }],
             host_interfaces: vec![
                 WitInterface {
@@ -101,17 +106,9 @@ async fn test_http_webgpu_integration() -> Result<()> {
                 },
                 WitInterface {
                     namespace: "wasi".to_string(),
-                    package: "graphics-context".to_string(),
-                    interfaces: ["graphics-context".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.0.1").unwrap()),
-                    config: HashMap::new(),
-                    name: None,
-                },
-                WitInterface {
-                    namespace: "wasi".to_string(),
                     package: "webgpu".to_string(),
                     interfaces: ["webgpu".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.0.1").unwrap()),
+                    version: Some(semver::Version::parse("0.3.0-rc.2").unwrap()),
                     config: HashMap::new(),
                     name: None,
                 },

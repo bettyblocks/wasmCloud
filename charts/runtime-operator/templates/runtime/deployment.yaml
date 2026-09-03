@@ -1,7 +1,33 @@
-{{- $registry := .Values.runtime.image.registry | default .Values.global.image.registry -}}
 {{- $top := . }}
 {{- range .Values.runtime.hostGroups }}
 {{- $ns := default $top.Release.Namespace .namespace }}
+{{- /* Per-hostgroup image: `.image.{registry,repository,tag}` override the
+       chart-wide runtime.image, so one release can mix host versions (e.g. an
+       all-features host for one group and the shipped image for another). */}}
+{{- $hi := default (dict) .image }}
+{{- $imgRegistry := $hi.registry | default $top.Values.runtime.image.registry | default $top.Values.global.image.registry }}
+{{- $imgRepo := $hi.repository | default $top.Values.runtime.image.repository }}
+{{- $imgTag := $hi.tag | default $top.Values.runtime.image.tag | default $top.Chart.AppVersion }}
+{{- /* hostPlugins entries needing a `wash host` config file (--config) —
+       config/configFrom/secretFrom/allowedHosts/allowedIpNameLookups have no
+       `--host-plugin` CLI-arg equivalent (deliberately: a secret must never
+       land on the command line). See host-plugin-config.yaml, which renders
+       the ConfigMap this deployment mounts. */}}
+{{- /* A host group's own `resources` replaces the chart-wide block wholesale
+       (no merge), and carries the host knobs `defaultHeapMemory`,
+       `coreInstances`, `guestMemoryMode` and `maxConcurrentStarts` alongside
+       the Kubernetes requests/limits. */}}
+{{- $resources := .resources | default $top.Values.runtime.resources | default dict }}
+{{- /* Probes, unlike `resources`, merge per field: a group naming one timing
+       keeps the chart-wide values for the rest. */}}
+{{- $probeArgs := dict "group" .probes "chart" $top.Values.runtime.probes }}
+{{- $liveness := include "runtime-operator.hostProbe" (merge (dict "name" "liveness") $probeArgs) | fromJson }}
+{{- $readiness := include "runtime-operator.hostProbe" (merge (dict "name" "readiness") $probeArgs) | fromJson }}
+{{- $partition := include "runtime-operator.hostPluginPartition" . | fromJson }}
+{{- $cliPlugins := $partition.cli }}
+{{- $needsConfigFile := $partition.needsConfigFile }}
+{{- $configFromNames := $partition.configFromNames }}
+{{- $secretFromNames := $partition.secretFromNames }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,7 +49,32 @@ spec:
         wasmcloud.com/name: hostgroup
         wasmcloud.com/hostgroup: {{ .name }}
         {{- include "runtime.podLabels" $top | nindent 8 }}
+      {{- /* The pod spec below is otherwise byte-identical across a
+             hostPlugins config/configFrom/secretFrom edit — only the
+             ConfigMap host-plugin-config.yaml renders changes — so without
+             this checksum a `helm upgrade` re-renders the ConfigMap but
+             never rolls the Deployment, and the host keeps serving the old
+             config it read once at startup until an unrelated restart.
+
+             Hashes the config file helper directly, for this group only:
+             host-plugin-config.yaml ranges over every group, so hashing THAT
+             template's output would give every group the same checksum and
+             one group's edit would roll every host in the cluster.
+
+             The reloader annotations cover what a checksum structurally
+             cannot — the contents of the ConfigMaps/Secrets this file only
+             references by name. See the helper. */}}
+      {{- $annotations := dict }}
+      {{- if $needsConfigFile }}
+      {{- $configFile := include "runtime-operator.hostPluginConfigFile" $partition }}
+      {{- $_ := set $annotations "checksum/host-plugin-config" ($configFile | sha256sum) }}
+      {{- $reloader := include "runtime-operator.hostPluginReloaderAnnotations" $partition | fromYaml }}
+      {{- $annotations = merge $annotations $reloader }}
+      {{- end }}
       {{- with $top.Values.runtime.podAnnotations }}
+      {{- $annotations = merge $annotations . }}
+      {{- end }}
+      {{- with $annotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -58,11 +109,29 @@ spec:
         {{- with .volumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        {{- if $needsConfigFile }}
+        - name: host-plugin-config
+          configMap:
+            name: hostgroup-{{ .name }}-host-config
+        {{- range $configFromNames }}
+        - name: host-plugin-config-{{ . }}
+          configMap:
+            name: {{ . }}
+        {{- end }}
+        {{- range $secretFromNames }}
+        - name: host-plugin-secret-{{ . }}
+          secret:
+            secretName: {{ . }}
+            # Matches the Kubernetes Secret volume `defaultMode: 0400` posture
+            # `crate::workload`'s own `file:` secret handling documents.
+            defaultMode: 0400
+        {{- end }}
+        {{- end }}
       serviceAccountName: {{ include "runtime.serviceAccountName" $top }}
       {{- include "runtime-operator.imagePullSecrets" $top | nindent 6 }}
       containers:
         - name: host
-          image: {{ if $registry }}{{ printf "%s/%s" $registry $top.Values.runtime.image.repository }}{{ else }}{{ $top.Values.runtime.image.repository }}{{ end }}:{{ $top.Values.runtime.image.tag | default $top.Chart.AppVersion }}
+          image: {{ if $imgRegistry }}{{ printf "%s/%s" $imgRegistry $imgRepo }}{{ else }}{{ $imgRepo }}{{ end }}:{{ $imgTag }}
           env:
             # wash resolves its XDG data/config/cache dirs under $HOME; point it
             # at the writable /tmp emptyDir so the host runs with a read-only root
@@ -77,6 +146,44 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- /* Host memory budgets, from the effective `resources`:
+                   `limits.memory` is the host's total guest memory budget,
+                   guestMemoryMode says whether that budget is enforced or only
+                   counted, and defaultHeapMemory/coreInstances are wasmtime
+                   knobs parked alongside them (all three stripped back out of
+                   the `resources:` block below). Unset means unset — the host
+                   then derives its budget from its cgroup, counts against it
+                   rather than enforcing it, and leaves the pool knobs at
+                   wasmtime's defaults.
+
+                   These go through the flags' `WASH_*` env fallbacks rather
+                   than `args` on purpose. The chart is routinely paired with a
+                   host image it does not ship (`runtime.image.tag`), and an
+                   older host aborts on an argument it does not recognise —
+                   whereas it simply ignores an env var it has never heard of.
+                   Keep any new host knob on this side of that line. */}}
+            {{- with $resources.limits }}
+            {{- with .memory }}
+            - name: WASH_HOST_MAX_GUEST_MEMORY
+              value: "{{ . }}"
+            {{- end }}
+            {{- end }}
+            {{- with $resources.defaultHeapMemory }}
+            - name: WASH_DEFAULT_HEAP_MEMORY
+              value: "{{ . }}"
+            {{- end }}
+            {{- with $resources.coreInstances }}
+            - name: WASH_CORE_INSTANCES
+              value: "{{ . }}"
+            {{- end }}
+            {{- with $resources.guestMemoryMode }}
+            - name: WASH_GUEST_MEMORY_MODE
+              value: "{{ . }}"
+            {{- end }}
+            {{- with $resources.maxConcurrentStarts }}
+            - name: WASH_MAX_CONCURRENT_STARTS
+              value: "{{ . }}"
+            {{- end }}
             {{- with $top.Values.runtime.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -113,6 +220,16 @@ spec:
             - "--data-nats-tls-cert=/data-cert/tls.crt"
             - "--data-nats-tls-key=/data-cert/tls.key"
             {{- end }}
+            {{- /* The `wasmcloud:nats` plugin's own address. Defaults to the
+                   host's data plane — and carries that data plane's TLS
+                   material with it as one bundle. Set
+                   `wasmcloudNatsUrl` when the NATS workloads talk to is not
+                   the one backing the data plane. Whether a
+                   manifest may describe a binding at all is
+                   `plugins[].workloadConfig` — see values.yaml. */}}
+            {{- with .wasmcloudNatsUrl }}
+            - "--wasmcloud-nats-url={{ . }}"
+            {{- end }}
             - "--oci-cache-dir=/oci-cache"
             {{- if and (.http) (.http.enabled) }}
             - "--http-addr=0.0.0.0:{{ .http.port }}"
@@ -120,6 +237,15 @@ spec:
             - "--tls-cert-path=/tls-cert/tls.crt"
             - "--tls-key-path=/tls-cert/tls.key"
             {{- end }}
+            {{- end }}
+            {{- /* Extra CA bundles this host trusts when pulling images. The
+                   chart's own CA is mounted at /runtime-cert/ca.crt whenever
+                   global.tls is on, so a registry running in this cluster
+                   behind a hostGroup's http.tls needs only that path here,
+                   with no bundle to distribute. Chart-wide entries first,
+                   then per-host-group ones. */}}
+            {{- range concat ($top.Values.runtime.ociCaPaths | default list) (.ociCaPaths | default list) }}
+            - "--oci-ca-path={{ . }}"
             {{- end }}
             {{- if and (.webgpu) (.webgpu.enabled) }}
             - "--wasi-webgpu"
@@ -129,6 +255,17 @@ spec:
             {{- end }}
             {{- range .wasmProposals }}
             - "--wasm-proposal={{ . }}"
+            {{- end }}
+            {{- /* Host component plugins with no config/secretFrom/allowedHosts:
+                   one --host-plugin flag per entry, rendered into the CLI's
+                   `key=value` grammar (unchanged). Entries that DO set any of
+                   those render into the mounted config file instead — see
+                   $needsConfigFile / --config below. */}}
+            {{- range $cliPlugins }}
+            - "--host-plugin=id={{ .id }}{{ if .image }},image={{ .image }}{{ if .pullPolicy }},pull={{ .pullPolicy }}{{ end }}{{ if .digest }},digest={{ .digest }}{{ end }}{{ else if .file }},file={{ .file }}{{ end }}{{ if .maxRestarts }},max-restarts={{ .maxRestarts }}{{ end }}"
+            {{- end }}
+            {{- if $needsConfigFile }}
+            - "--user-config=/etc/wasmcloud/host-config/config.yaml"
             {{- end }}
             {{- /* Chart-wide runtime.extraArgs applies to every host group; per-host-group
                    .extraArgs is appended after it. */}}
@@ -163,7 +300,22 @@ spec:
             {{- with .volumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- with (.resources | default $top.Values.runtime.resources) }}
+            {{- if $needsConfigFile }}
+            - name: host-plugin-config
+              mountPath: /etc/wasmcloud/host-config
+              readOnly: true
+            {{- range $configFromNames }}
+            - name: host-plugin-config-{{ . }}
+              mountPath: /etc/wasmcloud/host-plugin-config/{{ . }}
+              readOnly: true
+            {{- end }}
+            {{- range $secretFromNames }}
+            - name: host-plugin-secret-{{ . }}
+              mountPath: /etc/wasmcloud/host-plugin-secrets/{{ . }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
+          {{- with omit $resources "defaultHeapMemory" "coreInstances" "guestMemoryMode" "maxConcurrentStarts" }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -181,22 +333,34 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- if and (.http) (.http.enabled) }}
+          {{- /* A host serves workload routes on this port and nothing else,
+                 so both probes can only ask whether it still accepts
+                 connections. What each one does about that answer, and why
+                 they are timed apart, is documented on `runtime.probes`. */}}
+          {{- /* Every field but `enabled` is passed through as given, so a `0`
+                 reaches the manifest and `runtime.probes` stays the one place
+                 the timings are written down. */}}
+          {{- if $liveness.enabled }}
           livenessProbe:
             tcpSocket:
               port: http
-            initialDelaySeconds: 10
-            periodSeconds: 20
-            failureThreshold: 3
+            {{- range $field, $value := omit $liveness "enabled" }}
+            {{ $field }}: {{ $value }}
+            {{- end }}
+          {{- end }}
+          {{- if $readiness.enabled }}
           readinessProbe:
             tcpSocket:
               port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            {{- range $field, $value := omit $readiness "enabled" }}
+            {{ $field }}: {{ $value }}
+            {{- end }}
+          {{- end }}
           {{- end }}
           securityContext:
             {{- toYaml $top.Values.runtime.securityContext | nindent 12 }}
       dnsPolicy: ClusterFirst
       restartPolicy: Always
-      terminationGracePeriodSeconds: 0
+      terminationGracePeriodSeconds: {{ $top.Values.runtime.terminationGracePeriodSeconds }}
 ---
 {{- end }}

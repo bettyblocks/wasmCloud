@@ -1,120 +1,185 @@
 package main
 
 import (
-	"context"
 	"net/http"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/types"
 )
 
-// stubFallback records which fallback method was called and with what hostname.
-type stubFallback struct {
-	calledMethod string
-	calledHost   string
+const fallbackEndpoint = "127.0.0.1:1"
+
+type testFallback struct{}
+
+func (testFallback) InvalidHostname(string) (string, string) { return "http", fallbackEndpoint }
+func (testFallback) NoWorkloads(string) (string, string)     { return "http", fallbackEndpoint }
+
+func resolve(t *testing.T, ht *HostTracker, hostname string) LookupResult {
+	t.Helper()
+	return ht.Resolve(t.Context(), &http.Request{Host: hostname})
 }
 
-func (f *stubFallback) InvalidHostname(hostname string) (string, string) {
-	f.calledMethod = "InvalidHostname"
-	f.calledHost = hostname
-	return "http", "fallback:9999"
-}
+func TestHostTrackerRoutesRegisteredWorkload(t *testing.T) {
+	ctx := t.Context()
+	ht := newHostTracker(testFallback{})
 
-func (f *stubFallback) NoWorkloads(hostname string) (string, string) {
-	f.calledMethod = "NoWorkloads"
-	f.calledHost = hostname
-	return "http", "fallback:9999"
-}
+	hostKey := types.NamespacedName{Namespace: "ns", Name: "host-a"}
+	workloadKey := types.NamespacedName{Namespace: "ns", Name: "workload-a"}
 
-// newTestTracker creates a HostTracker pre-populated with a single host+workload.
-func newTestTracker(fb Fallback) *HostTracker {
-	ht := &HostTracker{
-		Fallback:  fb,
-		hosts:     map[string]string{"host-1": "10.0.0.1:8080"},
-		hostnames: map[string]sets.Set[string]{"app.example.com": sets.New("workload-1")},
-		workloads: map[string]string{"workload-1": "host-1"},
+	if err := ht.RegisterHost(ctx, hostKey, "host-id", "10.0.0.1", 8080); err != nil {
+		t.Fatalf("RegisterHost() = %v", err)
 	}
-	return ht
-}
-
-func TestResolve_XRouteHostRoutesToCorrectWorkload(t *testing.T) {
-	fb := &stubFallback{}
-	ht := newTestTracker(fb)
-
-	req, _ := http.NewRequest("GET", "http://gateway.local/path", nil)
-	req.Host = "gateway.local" // original host — not registered
-	req.Header.Set("X-Route-Host", "app.example.com")
-
-	result := ht.Resolve(context.Background(), req)
-
-	if result.Hostname != "10.0.0.1:8080" {
-		t.Errorf("expected hostname 10.0.0.1:8080, got %s", result.Hostname)
+	if err := ht.RegisterWorkload(ctx, workloadKey, "host-id", "workload-id", "a.example"); err != nil {
+		t.Fatalf("RegisterWorkload() = %v", err)
 	}
-	if result.WorkloadID != "workload-1" {
-		t.Errorf("expected workload-1, got %s", result.WorkloadID)
-	}
-	if result.Scheme != "http" {
-		t.Errorf("expected scheme http, got %s", result.Scheme)
+
+	got := resolve(t, ht, "a.example")
+	if got.Hostname != "10.0.0.1:8080" || got.WorkloadID != "workload-id" {
+		t.Errorf("Resolve() = %+v, want the registered host and workload", got)
 	}
 }
 
-func TestResolve_NormalHostRoutingWithoutXRouteHost(t *testing.T) {
-	fb := &stubFallback{}
-	ht := newTestTracker(fb)
+// Deregistration is keyed by the object key alone, because the reconciler that
+// observes a deletion no longer has the object it was registered from.
+func TestHostTrackerDeregisterWorkloadByKey(t *testing.T) {
+	ctx := t.Context()
+	ht := newHostTracker(testFallback{})
 
-	req, _ := http.NewRequest("GET", "http://app.example.com/path", nil)
-	req.Host = "app.example.com"
+	hostKey := types.NamespacedName{Namespace: "ns", Name: "host-a"}
+	workloadKey := types.NamespacedName{Namespace: "ns", Name: "workload-a"}
 
-	result := ht.Resolve(context.Background(), req)
-
-	if result.Hostname != "10.0.0.1:8080" {
-		t.Errorf("expected hostname 10.0.0.1:8080, got %s", result.Hostname)
+	if err := ht.RegisterHost(ctx, hostKey, "host-id", "10.0.0.1", 8080); err != nil {
+		t.Fatalf("RegisterHost() = %v", err)
 	}
-	if result.WorkloadID != "workload-1" {
-		t.Errorf("expected workload-1, got %s", result.WorkloadID)
+	if err := ht.RegisterWorkload(ctx, workloadKey, "host-id", "workload-id", "a.example"); err != nil {
+		t.Fatalf("RegisterWorkload() = %v", err)
 	}
-}
-
-func TestResolve_XRouteHostTakesPrecedenceOverHost(t *testing.T) {
-	fb := &stubFallback{}
-	ht := newTestTracker(fb)
-
-	// Register a second workload on a different hostname
-	ht.hosts["host-2"] = "10.0.0.2:8080"
-	ht.hostnames["other.example.com"] = sets.New("workload-2")
-	ht.workloads["workload-2"] = "host-2"
-
-	req, _ := http.NewRequest("GET", "http://app.example.com/path", nil)
-	req.Host = "app.example.com"
-	req.Header.Set("X-Route-Host", "other.example.com")
-
-	result := ht.Resolve(context.Background(), req)
-
-	if result.Hostname != "10.0.0.2:8080" {
-		t.Errorf("expected hostname 10.0.0.2:8080, got %s", result.Hostname)
+	if err := ht.DeregisterWorkload(ctx, workloadKey); err != nil {
+		t.Fatalf("DeregisterWorkload() = %v", err)
 	}
-	if result.WorkloadID != "workload-2" {
-		t.Errorf("expected workload-2, got %s", result.WorkloadID)
+
+	if got := resolve(t, ht, "a.example"); got.Hostname != fallbackEndpoint {
+		t.Errorf("Resolve() = %+v, want the fallback endpoint", got)
+	}
+	// An unknown key is a no-op, not an error: a Workload the gateway never
+	// routed still reaches the reconciler when it is deleted.
+	if err := ht.DeregisterWorkload(ctx, types.NamespacedName{Namespace: "ns", Name: "unknown"}); err != nil {
+		t.Errorf("DeregisterWorkload(unknown) = %v", err)
 	}
 }
 
-func TestResolve_UnknownXRouteHostTriggersFallback(t *testing.T) {
-	fb := &stubFallback{}
-	ht := newTestTracker(fb)
+func TestHostTrackerReregisterWorkloadDropsPreviousHostname(t *testing.T) {
+	ctx := t.Context()
+	ht := newHostTracker(testFallback{})
 
-	req, _ := http.NewRequest("GET", "http://gateway.local/path", nil)
-	req.Host = "gateway.local"
-	req.Header.Set("X-Route-Host", "unknown.example.com")
+	hostKey := types.NamespacedName{Namespace: "ns", Name: "host-a"}
+	workloadKey := types.NamespacedName{Namespace: "ns", Name: "workload-a"}
 
-	result := ht.Resolve(context.Background(), req)
-
-	if fb.calledMethod != "InvalidHostname" {
-		t.Errorf("expected InvalidHostname fallback, got %s", fb.calledMethod)
+	if err := ht.RegisterHost(ctx, hostKey, "host-id", "10.0.0.1", 8080); err != nil {
+		t.Fatalf("RegisterHost() = %v", err)
 	}
-	if fb.calledHost != "unknown.example.com" {
-		t.Errorf("expected fallback called with unknown.example.com, got %s", fb.calledHost)
+	if err := ht.RegisterWorkload(ctx, workloadKey, "host-id", "workload-id", "a.example"); err != nil {
+		t.Fatalf("RegisterWorkload() = %v", err)
 	}
-	if result.Hostname != "fallback:9999" {
-		t.Errorf("expected fallback hostname, got %s", result.Hostname)
+	if err := ht.RegisterWorkload(ctx, workloadKey, "host-id", "workload-id", "b.example"); err != nil {
+		t.Fatalf("RegisterWorkload() = %v", err)
+	}
+
+	if got := resolve(t, ht, "a.example"); got.Hostname != fallbackEndpoint {
+		t.Errorf("Resolve(a.example) = %+v, want the fallback endpoint", got)
+	}
+	if got := resolve(t, ht, "b.example"); got.Hostname != "10.0.0.1:8080" {
+		t.Errorf("Resolve(b.example) = %+v, want the registered host", got)
+	}
+}
+
+func TestHostTrackerDeregisterHostDropsItsWorkloads(t *testing.T) {
+	ctx := t.Context()
+	ht := newHostTracker(testFallback{})
+
+	hostKey := types.NamespacedName{Namespace: "ns", Name: "host-a"}
+	workloadKey := types.NamespacedName{Namespace: "ns", Name: "workload-a"}
+
+	if err := ht.RegisterHost(ctx, hostKey, "host-id", "10.0.0.1", 8080); err != nil {
+		t.Fatalf("RegisterHost() = %v", err)
+	}
+	if err := ht.RegisterWorkload(ctx, workloadKey, "host-id", "workload-id", "a.example"); err != nil {
+		t.Fatalf("RegisterWorkload() = %v", err)
+	}
+	if err := ht.DeregisterHost(ctx, hostKey); err != nil {
+		t.Fatalf("DeregisterHost() = %v", err)
+	}
+
+	if got := resolve(t, ht, "a.example"); got.Hostname != fallbackEndpoint {
+		t.Errorf("Resolve() = %+v, want the fallback endpoint", got)
+	}
+	if len(ht.workloadKeys) != 0 {
+		t.Errorf("workloadKeys = %v, want the host's workloads dropped", ht.workloadKeys)
+	}
+}
+
+// A host pod that restarts re-registers under the same object name with a new
+// host ID; the entry for the old ID must not keep taking traffic.
+func TestHostTrackerReregisterHostReplacesPreviousID(t *testing.T) {
+	ctx := t.Context()
+	ht := newHostTracker(testFallback{})
+
+	hostKey := types.NamespacedName{Namespace: "ns", Name: "host-a"}
+
+	if err := ht.RegisterHost(ctx, hostKey, "host-id-1", "10.0.0.1", 8080); err != nil {
+		t.Fatalf("RegisterHost() = %v", err)
+	}
+	if err := ht.RegisterHost(ctx, hostKey, "host-id-2", "10.0.0.2", 8080); err != nil {
+		t.Fatalf("RegisterHost() = %v", err)
+	}
+
+	if _, ok := ht.hosts["host-id-1"]; ok {
+		t.Error("hosts still contains the replaced host ID")
+	}
+	if got := ht.hosts["host-id-2"]; got != "10.0.0.2:8080" {
+		t.Errorf("hosts[host-id-2] = %q, want %q", got, "10.0.0.2:8080")
+	}
+}
+
+// X-Route-Host lets WASM components route cross-workload HTTP requests despite
+// WASI HTTP forbidding explicit Host header manipulation.
+func resolveWithRouteHost(t *testing.T, ht *HostTracker, host, routeHost string) LookupResult {
+	t.Helper()
+	req := &http.Request{Host: host, Header: http.Header{}}
+	if routeHost != "" {
+		req.Header.Set("X-Route-Host", routeHost)
+	}
+	return ht.Resolve(t.Context(), req)
+}
+
+func TestHostTrackerXRouteHostTakesPrecedenceOverHost(t *testing.T) {
+	ctx := t.Context()
+	ht := newHostTracker(testFallback{})
+
+	if err := ht.RegisterHost(ctx, types.NamespacedName{Namespace: "ns", Name: "host-a"}, "host-id-a", "10.0.0.1", 8080); err != nil {
+		t.Fatalf("RegisterHost() = %v", err)
+	}
+	if err := ht.RegisterWorkload(ctx, types.NamespacedName{Namespace: "ns", Name: "workload-a"}, "host-id-a", "workload-a", "a.example"); err != nil {
+		t.Fatalf("RegisterWorkload() = %v", err)
+	}
+	if err := ht.RegisterHost(ctx, types.NamespacedName{Namespace: "ns", Name: "host-b"}, "host-id-b", "10.0.0.2", 8080); err != nil {
+		t.Fatalf("RegisterHost() = %v", err)
+	}
+	if err := ht.RegisterWorkload(ctx, types.NamespacedName{Namespace: "ns", Name: "workload-b"}, "host-id-b", "workload-b", "b.example"); err != nil {
+		t.Fatalf("RegisterWorkload() = %v", err)
+	}
+
+	got := resolveWithRouteHost(t, ht, "a.example", "b.example")
+	if got.Hostname != "10.0.0.2:8080" || got.WorkloadID != "workload-b" {
+		t.Errorf("Resolve() = %+v, want the X-Route-Host target", got)
+	}
+}
+
+func TestHostTrackerUnknownXRouteHostTriggersFallback(t *testing.T) {
+	ht := newHostTracker(testFallback{})
+
+	got := resolveWithRouteHost(t, ht, "gateway.local", "unknown.example.com")
+	if got.Hostname != fallbackEndpoint {
+		t.Errorf("Resolve() = %+v, want the fallback endpoint", got)
 	}
 }

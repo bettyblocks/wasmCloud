@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY --exclude=rust-toolchain.toml . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --target x86_64-unknown-linux-musl -p wash-precompile --bin wash-precompile && \
+    cargo build --release --features epoch-interruption --target x86_64-unknown-linux-musl -p wash-precompile --bin wash-precompile && \
     cp target/x86_64-unknown-linux-musl/release/wash-precompile /tmp/wash-precompile
 
 # Release image — minimal base. wash-precompile is a one-shot worker so we

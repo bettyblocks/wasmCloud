@@ -22,6 +22,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -252,11 +254,7 @@ var _ = Describe("Manager", Ordered, func() {
 
 			By("waiting for Workload CRs to be cleaned up")
 			verifyCleanup := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "workloads.runtime.wasmcloud.dev",
-					"-n", namespace, "-o", "jsonpath={.items}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("[]"))
+				expectNoTestWorkloads(g, namespace)
 			}
 			Eventually(verifyCleanup).WithTimeout(1 * time.Minute).Should(Succeed())
 		})
@@ -353,29 +351,29 @@ var _ = Describe("Manager", Ordered, func() {
 
 			By("waiting for Workload CRs to be cleaned up")
 			verifyCleanup := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "workloads.runtime.wasmcloud.dev",
-					"-n", namespace, "-o", "jsonpath={.items}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("[]"))
+				expectNoTestWorkloads(g, namespace)
 			}
 			Eventually(verifyCleanup).WithTimeout(1 * time.Minute).Should(Succeed())
 		})
 	})
 
 	Context("Finalizer", func() {
-		It("should terminate all hostgroup pods when scaled to zero to test finalizer", func() {
-			By("scaling the hostgroup deployment to zero")
+		It("should terminate the default hostgroup pods when scaled to zero to test finalizer", func() {
+			// Scale only the `default` hostgroup, not every hostgroup. On the
+			// all-features leg the `registry` hostgroup runs the in-cluster
+			// oci-registry, whose in-memory contents the later Tenant/Scoped
+			// specs (and the randomized messaging/implements specs) still pull.
+			By("scaling the default hostgroup deployment to zero")
 			cmd := exec.Command("kubectl", "scale", "deployment",
-				"-l", "wasmcloud.com/name=hostgroup",
+				"-l", "wasmcloud.com/hostgroup=default",
 				"--replicas=0", "-n", namespace)
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("waiting for all hostgroup pods to be removed")
+			By("waiting for the default hostgroup pods to be removed")
 			verifyNoPods := func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "pods",
-					"-l", "wasmcloud.com/name=hostgroup",
+					"-l", "wasmcloud.com/hostgroup=default",
 					"-n", namespace, "-o", "jsonpath={.items}")
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
@@ -430,28 +428,40 @@ var _ = Describe("Manager", Ordered, func() {
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(),
 				"failed to create tenant namespace %q", tenantNamespace)
+
+			// The tenant host group runs here, and mounts these credentials.
+			createRegistryPullSecret(tenantNamespace)
 		})
 
 		It("performs a helm upgrade adding a hostGroup in the tenant namespace", func() {
-			// Append a second hostGroup pinned to the tenant namespace.
-			// We deliberately do NOT set `operator.hostNamespaces` here
-			// — the chart's `runtime-operator.hostNamespaces` helper
-			// should auto-derive it from the hostGroup's namespace
-			// override, and we assert that below.
+			// Append a hostGroup pinned to the tenant namespace, at the index
+			// after buildBaseHelmSets's groups (extraHostGroupIndex: [2] when the
+			// registry occupies [1], else [1]). When the registry flow is active
+			// this host pulls the http fixture from the in-cluster registry over
+			// HTTPS; it needs no extra configuration for that, because
+			// buildBaseHelmSets sets runtime.ociCaPaths chart-wide and this host
+			// mounts the same CA every host does. We deliberately do NOT set
+			// `operator.hostNamespaces` here — the chart's
+			// `runtime-operator.hostNamespaces` helper should auto-derive it from
+			// the hostGroup's namespace override, and we assert that below.
+			hg := fmt.Sprintf("runtime.hostGroups[%d]", extraHostGroupIndex())
 			sets := append(buildBaseHelmSets(),
-				fmt.Sprintf("runtime.hostGroups[1].name=%s", tenantHostGroup),
-				fmt.Sprintf("runtime.hostGroups[1].namespace=%s", tenantNamespace),
-				"runtime.hostGroups[1].replicas=1",
-				"runtime.hostGroups[1].service.type=ClusterIP",
-				"runtime.hostGroups[1].http.enabled=true",
-				"runtime.hostGroups[1].http.port=80",
-				"runtime.hostGroups[1].webgpu.enabled=false",
-				"runtime.hostGroups[1].resources.requests.memory=64Mi",
-				"runtime.hostGroups[1].resources.requests.cpu=250m",
-				"runtime.hostGroups[1].resources.limits.memory=512Mi",
-				"runtime.hostGroups[1].resources.limits.cpu=500m",
-				fmt.Sprintf("runtime.hostGroups[1].logLevel=%s", runtimeLogLevel),
+				fmt.Sprintf("%s.name=%s", hg, tenantHostGroup),
+				fmt.Sprintf("%s.namespace=%s", hg, tenantNamespace),
+				fmt.Sprintf("%s.replicas=1", hg),
+				fmt.Sprintf("%s.service.type=ClusterIP", hg),
+				fmt.Sprintf("%s.http.enabled=true", hg),
+				fmt.Sprintf("%s.http.port=80", hg),
+				fmt.Sprintf("%s.webgpu.enabled=false", hg),
+				fmt.Sprintf("%s.resources.requests.memory=64Mi", hg),
+				fmt.Sprintf("%s.resources.requests.cpu=250m", hg),
+				fmt.Sprintf("%s.resources.limits.memory=512Mi", hg),
+				fmt.Sprintf("%s.resources.limits.cpu=500m", hg),
+				fmt.Sprintf("%s.logLevel=%s", hg, runtimeLogLevel),
 			)
+			// This group pulls the http fixture from the in-cluster registry,
+			// so it mounts the credentials like the groups in buildBaseHelmSets.
+			sets = append(sets, registryCredentialSets(hg)...)
 
 			helmArgs := make([]string, 0, 5+2*len(sets)+4)
 			helmArgs = append(helmArgs, "upgrade", "--install", "-n", namespace)
@@ -564,8 +574,9 @@ spec:
             host: hello.localhost.direct
       components:
         - name: hello-world
-          image: ghcr.io/wasmcloud/components/http-hello-world-rust:0.1.0
-`, tenantWorkloadName, tenantNamespace, tenantNamespace, tenantHostGroup)
+          image: %s
+`, tenantWorkloadName, tenantNamespace, tenantNamespace, tenantHostGroup,
+				httpWorkloadImage())
 
 			f, err := os.CreateTemp("", "tenant-workload-*.yaml")
 			Expect(err).NotTo(HaveOccurred())
@@ -671,8 +682,8 @@ spec:
             host: hello.localhost.direct
       components:
         - name: hello-world
-          image: ghcr.io/wasmcloud/components/http-hello-world-rust:0.1.0
-`, name, ns, ns, hostgroup)
+          image: %s
+`, name, ns, ns, hostgroup, httpWorkloadImage())
 
 			f, err := os.CreateTemp("", "scoped-workload-*.yaml")
 			Expect(err).NotTo(HaveOccurred())
@@ -752,31 +763,43 @@ spec:
 				_, err := utils.Run(cmd)
 				Expect(err).NotTo(HaveOccurred(),
 					"failed to create namespace %q", ns)
+				// The scoped host group runs in the watched namespace and
+				// mounts these; the unwatched one gets them for symmetry.
+				createRegistryPullSecret(ns)
 			}
 		})
 
 		It("helm upgrades the release into scoped mode", func() {
-			helmUpgrade([]string{
+			// Run a host inside the watched namespace so a workload applied there
+			// has something to schedule onto, at the index after buildBaseHelmSets's
+			// groups (extraHostGroupIndex: [2] when the registry occupies [1], else
+			// [1]). When the registry flow is active it pulls the http fixture from
+			// the in-cluster registry over HTTPS, trusting it through the
+			// chart-wide runtime.ociCaPaths buildBaseHelmSets sets. The chart's
+			// `runtime-operator.hostNamespaces` helper auto-derives -host-namespaces
+			// from runtime.hostGroups[].namespace, so we don't set
+			// operator.hostNamespaces directly.
+			hg := fmt.Sprintf("runtime.hostGroups[%d]", extraHostGroupIndex())
+			// Built in one expression, credentials included, so the slice is
+			// sized once rather than declared and grown.
+			scopedSets := append([]string{
 				fmt.Sprintf("operator.watchNamespaces[0]=%s", watchedNamespace),
-				// Run a host inside the watched namespace so a workload
-				// applied there has something to schedule onto. The
-				// chart's `runtime-operator.hostNamespaces` helper
-				// auto-derives -host-namespaces from
-				// runtime.hostGroups[].namespace, so we don't set
-				// operator.hostNamespaces directly.
-				fmt.Sprintf("runtime.hostGroups[1].name=%s", scopedHostGroup),
-				fmt.Sprintf("runtime.hostGroups[1].namespace=%s", watchedNamespace),
-				"runtime.hostGroups[1].replicas=1",
-				"runtime.hostGroups[1].service.type=ClusterIP",
-				"runtime.hostGroups[1].http.enabled=true",
-				"runtime.hostGroups[1].http.port=80",
-				"runtime.hostGroups[1].webgpu.enabled=false",
-				"runtime.hostGroups[1].resources.requests.memory=64Mi",
-				"runtime.hostGroups[1].resources.requests.cpu=250m",
-				"runtime.hostGroups[1].resources.limits.memory=512Mi",
-				"runtime.hostGroups[1].resources.limits.cpu=500m",
-				fmt.Sprintf("runtime.hostGroups[1].logLevel=%s", runtimeLogLevel),
-			}, "helm upgrade into scoped mode failed")
+				fmt.Sprintf("%s.name=%s", hg, scopedHostGroup),
+				fmt.Sprintf("%s.namespace=%s", hg, watchedNamespace),
+				fmt.Sprintf("%s.replicas=1", hg),
+				fmt.Sprintf("%s.service.type=ClusterIP", hg),
+				fmt.Sprintf("%s.http.enabled=true", hg),
+				fmt.Sprintf("%s.http.port=80", hg),
+				fmt.Sprintf("%s.webgpu.enabled=false", hg),
+				fmt.Sprintf("%s.resources.requests.memory=64Mi", hg),
+				fmt.Sprintf("%s.resources.requests.cpu=250m", hg),
+				fmt.Sprintf("%s.resources.limits.memory=512Mi", hg),
+				fmt.Sprintf("%s.resources.limits.cpu=500m", hg),
+				fmt.Sprintf("%s.logLevel=%s", hg, runtimeLogLevel),
+				// Same as the tenant group: it pulls fixtures, so it mounts the
+				// registry credentials.
+			}, registryCredentialSets(hg)...)
+			helmUpgrade(scopedSets, "helm upgrade into scoped mode failed")
 		})
 
 		It("removes the cluster-scoped operator RBAC", func() {
@@ -962,6 +985,86 @@ spec:
 	})
 })
 
+// httpHelloWorldImage is the published component the http-serving sample
+// manifests (config/samples) reference. On the all-features leg the suite serves
+// an equivalent in-tree fixture (http-handler-p2) from the in-cluster registry
+// instead; other legs keep pulling this published ref.
+const httpHelloWorldImage = "ghcr.io/wasmcloud/components/http-hello-world-rust:0.1.0"
+
+// httpWorkloadImage is the image the http-serving specs deploy: the in-cluster
+// http-handler-p2 fixture on the all-features leg, else the published
+// http-hello-world component.
+// createRegistryPullSecret puts the registry's docker config in ns, for a host
+// group that runs there to mount. A Secret is namespace-scoped and a pod can
+// only mount from its own namespace, so a host group outside wasmcloud-system
+// cannot reach the copy `cargo xtask e2e-images` makes there. No-op off the
+// registry flow.
+func createRegistryPullSecret(ns string) {
+	if !inClusterRegistry {
+		return
+	}
+	By("copying the registry credentials into " + ns)
+	// Upsert rather than create: a host group mounts this, so it has to exist
+	// before the install that starts one, and a rerun against a live cluster
+	// would otherwise fail on a Secret that is already there.
+	create := exec.Command("kubectl", "create", "secret", "docker-registry",
+		registryPullSecret, "-n", ns,
+		fmt.Sprintf("--docker-server=oci-registry.%s.svc", namespace),
+		"--docker-username="+registryUser,
+		"--docker-password="+registryPassword,
+		"--dry-run=client", "-o", "yaml")
+	manifest, err := utils.Run(create)
+	Expect(err).NotTo(HaveOccurred())
+	apply := exec.Command("kubectl", "apply", "-n", ns, "-f", "-")
+	apply.Stdin = strings.NewReader(manifest)
+	_, err = utils.Run(apply)
+	Expect(err).NotTo(HaveOccurred())
+}
+
+func httpWorkloadImage() string {
+	if inClusterRegistry {
+		return registryRef("http-handler-p2")
+	}
+	return httpHelloWorldImage
+}
+
+// rewriteWorkloadImages swaps the published http image in a sample manifest for
+// its in-cluster registry equivalent when the registry flow is active; a no-op
+// otherwise (the release/canary legs deploy the published component as-is).
+//
+// No credentials travel with the image: the host groups mount the registry's
+// docker config (see buildBaseHelmSets), so a pull that names no secret of its
+// own authenticates from there.
+func rewriteWorkloadImages(manifest string) string {
+	if !inClusterRegistry {
+		return manifest
+	}
+	replacement := "${1}image: " + registryRef("http-handler-p2")
+	return regexp.MustCompile(`(?m)^([ \t]*)image: `+regexp.QuoteMeta(httpHelloWorldImage)+`[ \t]*$`).
+		ReplaceAllString(manifest, replacement)
+}
+
+// expectNoTestWorkloads asserts that no Workload CRs remain in ns once the
+// in-cluster oci-registry infrastructure workload is excluded. The registry runs
+// as a long-lived Workload in this namespace for the whole suite (serving every
+// fixture image), so a bare "the items list is empty" check no longer holds on
+// the legs that run it. When the registry flow is off, nothing is filtered and
+// this is equivalent to asserting the list is empty.
+func expectNoTestWorkloads(g Gomega, ns string) {
+	cmd := exec.Command("kubectl", "get", "workloads.runtime.wasmcloud.dev",
+		"-n", ns, "-o", "jsonpath={.items[*].metadata.name}")
+	output, err := utils.Run(cmd)
+	g.Expect(err).NotTo(HaveOccurred())
+	var remaining []string
+	for _, name := range strings.Fields(output) {
+		if strings.HasPrefix(name, "oci-registry") {
+			continue
+		}
+		remaining = append(remaining, name)
+	}
+	g.Expect(remaining).To(BeEmpty(), "test Workload CRs were not cleaned up")
+}
+
 // verifyWorkloadDeploy applies a WorkloadDeployment manifest and verifies the
 // deployment becomes ready, along with its ReplicaSet and Workload CRs.
 // deploymentName is the metadata.name of the WorkloadDeployment in the sample
@@ -970,8 +1073,14 @@ spec:
 // with `-n ns` regardless of any metadata.namespace it carries.
 func verifyWorkloadDeploy(sampleDeployment, deploymentName, ns string) {
 	By("applying the sample WorkloadDeployment")
-	cmd := exec.Command("kubectl", "apply", "-n", ns, "-f", sampleDeployment)
-	_, err := utils.Run(cmd)
+	// Rewrite any published workload image to its in-cluster registry
+	// equivalent so the (insecure) hostgroups pull from the registry rather
+	// than ghcr. No-op for manifests already built with registryRef.
+	manifest, err := os.ReadFile(sampleDeployment)
+	Expect(err).NotTo(HaveOccurred())
+	cmd := exec.Command("kubectl", "apply", "-n", ns, "-f", "-")
+	cmd.Stdin = strings.NewReader(rewriteWorkloadImages(string(manifest)))
+	_, err = utils.Run(cmd)
 	Expect(err).NotTo(HaveOccurred())
 
 	By("waiting for WorkloadDeployment to become Ready")

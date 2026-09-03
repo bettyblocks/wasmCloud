@@ -55,16 +55,26 @@ use wasmtime::component::Component;
 use crate::engine::workload::ResolvedWorkload;
 use crate::engine::{Engine, uses_wasi_http};
 use crate::observability::Meters;
-use crate::plugin::HostPlugin;
+use crate::plugin::{HostPlugin, WorkloadFailure, WorkloadFailureSink};
 use crate::types::*;
 use crate::wit::{WitInterface, WitWorld};
 
-mod sysinfo;
+pub mod allowed_loopback;
+pub mod declared_port;
+pub mod egress_policy;
+pub mod ports;
+pub mod quota;
+pub(crate) mod sysinfo;
 use sysinfo::SystemMonitor;
 
 pub mod allowed_hosts;
+pub mod allowed_ip_name;
 pub mod http;
+pub mod http_client;
 pub mod http_p3;
+#[cfg(feature = "host-component-plugins")]
+pub(crate) mod job_registry;
+pub mod trigger_service;
 
 /// The API for interacting with a wasmcloud host.
 ///
@@ -149,25 +159,133 @@ impl<T: HostApi> HostApi for Arc<T> {
     }
 }
 
+/// The claim-then-start protocol a caller needs when it has work to do between
+/// deciding to start a workload and having something the host can run.
+///
+/// Kept off [`HostApi`] deliberately. Its three calls only make sense together,
+/// every reservation has to reach [`WorkloadReservation::workload_start_reserved`]
+/// or [`WorkloadReservation::workload_release`], or the id sits in `Starting`
+/// with nothing on the way to fill it — and that is bookkeeping to keep inside
+/// this crate rather than an obligation to hand to everyone who implements the
+/// host's API.
+pub(crate) trait WorkloadReservation {
+    /// Claim a workload id before doing the work a start needs.
+    ///
+    /// A caller that has to fetch images first would otherwise leave the id in
+    /// no map for as long as that takes: `workload_status` reports it missing
+    /// and `workload_stop` reports it already gone, so a stop arriving in that
+    /// window tells its caller the teardown is done while the start goes on to
+    /// run the workload. Reserving first puts the id in `Starting` for the
+    /// whole window, where both of those read it correctly and a stop hands the
+    /// teardown back to the start.
+    ///
+    /// `Err` carries the refusal to report, and reserves nothing.
+    fn workload_reserve(
+        &self,
+        workload_id: &str,
+    ) -> impl Future<Output = Result<Reservation, String>>;
+
+    /// Give back an id claimed by [`WorkloadReservation::workload_reserve`]
+    /// whose start never began. Does nothing if the id has moved on to another
+    /// owner.
+    #[cfg_attr(not(feature = "washlet"), allow(dead_code))]
+    fn workload_release(
+        &self,
+        workload_id: &str,
+        reservation: Reservation,
+    ) -> impl Future<Output = ()>;
+
+    /// Start a workload under an id already claimed by
+    /// [`WorkloadReservation::workload_reserve`].
+    fn workload_start_reserved(
+        &self,
+        reservation: Reservation,
+        request: WorkloadStartRequest,
+    ) -> impl Future<Output = anyhow::Result<WorkloadStartResponse>>;
+}
+
+/// A claim on one workload id, minted whenever a task takes responsibility for
+/// that id and never reused within a host.
+///
+/// Both states a task has to leave behind while it works outside the map's lock
+/// carry one, so the task can tell its own slot from a slot a *later* workload
+/// claimed under the same id: a start reserves the id before building anything,
+/// and a teardown marks the id while it releases. Every write back into the map
+/// is conditional on the slot still holding the writer's own reservation.
+pub type Reservation = u64;
+
 /// Internal representation of a workload's state within the host.
 ///
 /// This enum tracks the lifecycle stages of a workload from starting
 /// through running to stopping or error states.
 #[derive(Debug, Clone)]
 pub enum HostWorkload {
-    Starting,
+    /// A start holds the id and is building the workload. The [`Reservation`]
+    /// is that start's.
+    Starting(Reservation),
     // Boxed to reduce size of the enum
     Running(Box<ResolvedWorkload>),
-    Stopping,
+    /// The workload is being torn down, and the id stays reserved until whoever
+    /// owns that teardown finishes it. The [`Reservation`] names the owner: the
+    /// stop or failure that took the workload out of the map, or — when a stop
+    /// arrived while the workload was still starting — the start that has yet
+    /// to hand its work over.
+    Stopping(Reservation),
     Error(String),
+}
+
+/// Give back everything binding a workload allocated: its service, then its
+/// plugins.
+///
+/// Every path that lets go of a bound workload goes through here — a start that
+/// failed after binding, a start that lost its slot to a concurrent stop, a
+/// plugin failing a running workload, and an ordinary stop. Tolerates a
+/// workload that never fully started: both steps have nothing to do when there
+/// is nothing to undo.
+///
+/// Which slot in the workload map may be written, and by whom, is what keeps
+/// this safe to run outside the map's lock: `unbind_all_plugins` is keyed by
+/// workload id, so the id must stay reserved until this returns or a new
+/// workload could claim it and be torn down by someone else's teardown. Every
+/// caller therefore leaves a [`HostWorkload::Stopping`] carrying its own
+/// [`Reservation`] over the whole call. See [`HostApi::workload_stop`] for the
+/// ownership rules that guarantee it.
+async fn release(workload_id: &str, resolved: &ResolvedWorkload, timeout: Option<Duration>) {
+    resolved.stop_service();
+    // Bounded: unbind can make remote calls that hang on a degraded JetStream
+    // API, wedging this teardown and every command queued behind it.
+    let unbind_result = match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, resolved.unbind_all_plugins())
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("timed out unbinding plugins after {timeout:?}"))),
+        None => resolved.unbind_all_plugins().await,
+    };
+    if let Err(e) = unbind_result {
+        warn!(
+            workload_id,
+            error = ?e,
+            "error unbinding plugins during teardown, continuing"
+        );
+    }
+}
+
+/// What a stop does to the slot it found, decided before anything is written.
+enum StopAction {
+    /// Mark the id `Stopping` under this reservation, holding it for the
+    /// teardown that follows.
+    Mark(Reservation),
+    /// Leave the slot to whoever already owns it.
+    Leave,
+    /// Drop the id: there is nothing bound behind it.
+    Drop,
 }
 
 impl std::fmt::Display for HostWorkload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HostWorkload::Starting => write!(f, "Starting"),
+            HostWorkload::Starting(_) => write!(f, "Starting"),
             HostWorkload::Running(_) => write!(f, "Running"),
-            HostWorkload::Stopping => write!(f, "Stopping"),
+            HostWorkload::Stopping(_) => write!(f, "Stopping"),
             HostWorkload::Error(err) => write!(f, "Error: {err}"),
         }
     }
@@ -176,9 +294,9 @@ impl std::fmt::Display for HostWorkload {
 impl From<&HostWorkload> for WorkloadState {
     fn from(hw: &HostWorkload) -> Self {
         match hw {
-            HostWorkload::Starting => WorkloadState::Starting,
+            HostWorkload::Starting(_) => WorkloadState::Starting,
             HostWorkload::Running(_) => WorkloadState::Running,
-            HostWorkload::Stopping => WorkloadState::Stopping,
+            HostWorkload::Stopping(_) => WorkloadState::Stopping,
             HostWorkload::Error(_) => WorkloadState::Error,
         }
     }
@@ -195,8 +313,16 @@ pub struct Host {
     engine: Engine,
     /// Workloads mapped from ID to the workload and its current state
     workloads: Arc<RwLock<HashMap<String, HostWorkload>>>,
+    /// Source of the [`Reservation`] a start or a teardown stamps on the slot it
+    /// owns. Monotonic for the life of the host, so a reservation identifies one
+    /// occupant of a workload id and never a later one.
+    reservations: std::sync::atomic::AtomicU64,
     /// Plugins in a map from their ID to the plugin itself
     plugins: HashMap<&'static str, Arc<dyn HostPlugin>>,
+    /// What the operator declared about each plugin's bindings — the host layer
+    /// under every workload's own `interface-binding` config, and who is
+    /// allowed to write it.
+    plugin_bindings: Arc<crate::plugin::PluginBindings>,
     /// Host metadata
     id: String,
     hostname: String,
@@ -327,9 +453,19 @@ impl Host {
             .await
             .context("failed to start HTTP handler")?;
 
-        // Start all plugins, any errors means the host fails to start.
+        // A plugin can fail a workload out of band (a host component plugin
+        // evicting one whose lifecycle bind crash-loops). Give each plugin a
+        // sink to report that on, drained by a background task that transitions
+        // the workload to a failed state.
+        let (failure_tx, failure_rx) = tokio::sync::mpsc::unbounded_channel();
+        let failure_sink = WorkloadFailureSink::new(failure_tx);
+
+        // Start all plugins, any errors means the host fails to start. The
+        // failure sink is injected before `start` so a plugin that evicts a
+        // workload immediately still has somewhere to report it.
         for (id, plugin) in &self.plugins {
             plugin.inject_meters(&self.meters).await;
+            plugin.set_workload_failure_sink(failure_sink.clone());
 
             if let Err(e) = plugin.start().await {
                 tracing::error!(id = id, err = ?e, "failed to start plugin");
@@ -337,14 +473,110 @@ impl Host {
             }
         }
 
-        Ok(Arc::new(self))
+        let host = Arc::new(self);
+        // Weak, not strong: the sinks handed to the plugins live inside
+        // `host.plugins`, so the channel stays open for as long as the host
+        // does. A strong handle here would therefore be a cycle — the drain
+        // would keep the host alive, and the host would keep the drain's
+        // channel open — leaking the host, its engine, and every compiled
+        // component. `Host::stop` cannot break it either: it stops the plugins
+        // but never drops them.
+        tokio::spawn(consume_workload_failures(Arc::downgrade(&host), failure_rx));
+        Ok(host)
+    }
+
+    /// Mint a fresh [`Reservation`] for a slot this host is about to claim.
+    fn reserve(&self) -> Reservation {
+        self.reservations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Close out a teardown that marked `workload_id` as
+    /// `Stopping(reservation)`: drop the id, or leave `Some(reason)` behind as
+    /// the workload's `Error` for a later stop to collect.
+    ///
+    /// Conditional on the marker still being this teardown's, because a
+    /// teardown runs outside the map's lock. If the slot holds anything else —
+    /// most of all a *different* workload that claimed the id in the meantime —
+    /// it is not this teardown's to write, and removing it would leave that
+    /// workload running with nothing tracking it.
+    async fn finish_teardown(
+        &self,
+        workload_id: &str,
+        reservation: Reservation,
+        reason: Option<String>,
+    ) {
+        let mut workloads = self.workloads.write().await;
+        if !matches!(workloads.get(workload_id), Some(HostWorkload::Stopping(held)) if *held == reservation)
+        {
+            return;
+        }
+        match reason {
+            Some(reason) => {
+                workloads.insert(workload_id.to_string(), HostWorkload::Error(reason));
+            }
+            None => {
+                workloads.remove(workload_id);
+            }
+        }
+    }
+
+    /// Transition a running workload to a failed state on a plugin's report
+    /// (e.g. an evicted crash-looping bind): swap it to `Error`, so its status
+    /// reports failed, and tear down its resources like a stop would. A workload
+    /// that is already gone or not running is left as-is.
+    async fn fail_workload(&self, workload_id: &str, reason: String) {
+        // Mark `Stopping` under a reservation of this failure's own rather than
+        // writing `Error` straight away. `Error` is a state a stop frees the id
+        // from, and freeing it here would let a redeploy claim the same id while
+        // `release` — keyed by workload id — is still unbinding, tearing down
+        // the new workload's bindings instead. The reservation is what makes the
+        // marker this failure's: nobody else writes over it, and the `Error`
+        // below lands only if it is still there.
+        let reservation = self.reserve();
+        let resolved = {
+            let mut workloads = self.workloads.write().await;
+            match workloads.get_mut(workload_id) {
+                Some(slot @ HostWorkload::Running(_)) => {
+                    match std::mem::replace(slot, HostWorkload::Stopping(reservation)) {
+                        HostWorkload::Running(rw) => Some(*rw),
+                        // Just matched on it.
+                        _ => None,
+                    }
+                }
+                // Still starting: no teardown follows here, because the start
+                // owns everything it has built. Recording the failure now is
+                // what tells it its slot is gone, so it releases what it bound
+                // and leaves this `Error` for a stop to collect.
+                Some(slot @ HostWorkload::Starting(_)) => {
+                    *slot = HostWorkload::Error(reason.clone());
+                    None
+                }
+                // Already being torn down, already failed, or gone: the workload
+                // is on its way out either way, and the slot belongs to whoever
+                // is finishing it.
+                Some(HostWorkload::Stopping(_) | HostWorkload::Error(_)) | None => None,
+            }
+        };
+        if let Some(resolved) = resolved {
+            release(workload_id, &resolved, self.config.plugin_lifecycle_timeout).await;
+            // The id was held as `Stopping` for the teardown; publish the
+            // failure now that letting a stop free it is safe.
+            self.finish_teardown(workload_id, reservation, Some(reason.clone()))
+                .await;
+        }
+        warn!(
+            workload_id,
+            reason, "workload failed by a plugin; marked as errored"
+        );
     }
 
     /// Stop the host and shut down all plugins.
     ///
-    /// Attempts to gracefully stop all plugins with a 3-second timeout
-    /// for each. Errors are logged but don't prevent other plugins from
-    /// being stopped.
+    /// Attempts to gracefully stop all plugins, allowing each the
+    /// `WASH_PLUGIN_STOP_TIMEOUT_SECS` budget plus a one-second grace.
+    /// Errors are logged but don't prevent other plugins from being
+    /// stopped.
     ///
     /// # Returns
     /// Ok if the shutdown process completes (even with plugin errors).
@@ -354,15 +586,29 @@ impl Host {
             .await
             .context("failed to stop HTTP handler")?;
 
-        // Stop all plugins, log errors but continue stopping others
+        // Stop all plugins, log errors but continue stopping others. The cap
+        // must outlast the plugin-stop budget: a host component plugin's
+        // `stop()` waits the full budget for its supervisor and only then
+        // aborts it, and if the outer timeout fired first it would drop that
+        // future — and the supervisor's JoinHandle with it — detaching a
+        // wedged task instead of aborting it. The one-second grace covers the
+        // abort-and-return tail past the inner wait; that tail must stay
+        // synchronous (or bounded well under the grace) for the guarantee to
+        // hold, so keep awaits out of the post-timeout path in
+        // `ComponentHostPlugin::stop`.
+        let stop_timeout = crate::timeouts::plugin_stop() + std::time::Duration::from_secs(1);
         for (id, plugin) in &self.plugins {
             let stop_fut = plugin.stop();
-            match tokio::time::timeout(std::time::Duration::from_secs(3), stop_fut).await {
+            match tokio::time::timeout(stop_timeout, stop_fut).await {
                 Ok(Err(e)) => {
                     tracing::error!(id = id, err = ?e, "failed to stop plugin");
                 }
                 Err(_) => {
-                    tracing::error!(id = id, "plugin stop timed out after 3 seconds");
+                    tracing::error!(
+                        id = id,
+                        timeout_secs = stop_timeout.as_secs(),
+                        "plugin stop timed out"
+                    );
                 }
                 _ => {}
             }
@@ -483,6 +729,7 @@ impl Host {
             "wasi:filesystem/preopens,types@0.2.0".into(),
             "wasi:random/insecure-seed,insecure,random@0.2.0".into(),
             "wasi:sockets/instance-network,ip-name-lookup,network,tcp-create-socket,tcp,udp-create-socket,udp@0.2.0".into(),
+            "wasi:http/types,handler@0.3.0".into(),
             #[cfg(feature = "wasi-tls")]
             "wasi:tls/client,types@0.3.0-draft".into(),
         ]);
@@ -545,11 +792,24 @@ impl Host {
         request: WorkloadStartRequest,
     ) -> anyhow::Result<ResolvedWorkload> {
         let service_present = request.workload.service.is_some();
+        let workload_id = request.workload_id.clone();
 
-        // Initialize the workload using the engine, receiving the unresolved workload
-        let unresolved_workload = self
-            .engine
-            .initialize_workload(&request.workload_id, request.workload)?;
+        // Initialize the workload using the engine, receiving the unresolved workload.
+        //
+        // Cranelift compiles every component here, guarded by the moka cache.
+        // This occupies whichever thread runs it for as long as compilation takes.
+        // On a runtime thread, that may stall async-nats connection task alongside it
+        // and a host that stops draining its socket is disconnected as a slow consumer.
+        let engine = self.engine.clone();
+        let init_id = request.workload_id;
+        let workload = request.workload;
+        let span = tracing::Span::current();
+        let unresolved_workload = tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
+            engine.initialize_workload(&init_id, workload)
+        })
+        .await
+        .context("workload initialization task failed")??;
 
         // Bounded: resolve() makes remote plugin calls that can hang on a degraded
         // JetStream API, wedging this start and every command queued behind it.
@@ -566,10 +826,11 @@ impl Host {
         // caller waits on it; if it later succeeds after we've already
         // reported the start as failed, we unbind everything ourselves.
         let plugins = self.plugins.clone();
+        let plugin_bindings = self.plugin_bindings.clone();
         let http_handler = self.http_handler.clone();
         let mut resolve_task = tokio::spawn(async move {
             unresolved_workload
-                .resolve(Some(&plugins), http_handler)
+                .resolve(Some(&plugins), &plugin_bindings, http_handler)
                 .await
         });
         let mut resolved_workload = match self.config.plugin_lifecycle_timeout {
@@ -578,7 +839,7 @@ impl Host {
                     join_result.context("workload resolve task panicked or was cancelled")??
                 }
                 Err(_) => {
-                    let workload_id = request.workload_id.clone();
+                    let workload_id = workload_id.clone();
                     tokio::spawn(async move {
                         match resolve_task.await {
                             Ok(Ok(resolved)) => {
@@ -614,12 +875,19 @@ impl Host {
                 .context("workload resolve task panicked or was cancelled")??,
         };
 
-        // If the service didn't run and we had one, warn
-        if service_present && resolved_workload.execute_service().await?.is_none() {
-            warn!(
-                workload_id = request.workload_id,
-                "service did not properly execute"
-            );
+        // Past this point the plugins are bound, so every exit either hands the
+        // workload to the caller to commit or gives the binding back. The rest
+        // of starting lives in one function rather than inline, so a step added
+        // to it is covered by this rollback instead of needing its own.
+        if let Err(e) = start_resolved(&workload_id, &mut resolved_workload, service_present).await
+        {
+            release(
+                &workload_id,
+                &resolved_workload,
+                self.config.plugin_lifecycle_timeout,
+            )
+            .await;
+            return Err(e);
         }
 
         Ok(resolved_workload)
@@ -759,6 +1027,21 @@ async fn file_older_than(entry: &tokio::fs::DirEntry, grace: Duration) -> bool {
     }
 }
 
+/// Everything after plugin binding that can still fail while starting a
+/// workload. Kept together so [`Host::workload_start_inner`] has exactly one
+/// failure path to roll back.
+async fn start_resolved(
+    workload_id: &str,
+    resolved: &mut ResolvedWorkload,
+    service_present: bool,
+) -> anyhow::Result<()> {
+    // If the service didn't run and we had one, warn
+    if service_present && resolved.execute_service().await?.is_none() {
+        warn!(workload_id, "service did not properly execute");
+    }
+    Ok(())
+}
+
 impl HostApi for Host {
     async fn heartbeat(&self) -> anyhow::Result<HostHeartbeat> {
         // Refresh system info before reporting
@@ -767,6 +1050,10 @@ impl HostApi for Host {
             monitor.refresh();
             monitor.report_usage();
         }
+        // Reported beside the machine's own usage, because the two answer
+        // different questions: the monitor says how much memory this process
+        // holds, the budget says how much of it guests asked for.
+        self.engine.guest_memory().report();
 
         let (os_arch, os_name, os_kernel) = self.get_system_info().await;
         let (system_memory_total, system_memory_free) = self
@@ -829,43 +1116,17 @@ impl HostApi for Host {
         &self,
         request: WorkloadStartRequest,
     ) -> anyhow::Result<WorkloadStartResponse> {
-        // Store the workload with initial state
-        self.workloads
-            .write()
-            .await
-            .insert(request.workload_id.clone(), HostWorkload::Starting);
-
         let workload_id = request.workload_id.clone();
-        let resolved_workload = self.workload_start_inner(request).await;
-
-        let (workload_state, message) = if let Err(ref err) = resolved_workload {
-            (WorkloadState::Error, err.to_string())
-        } else {
-            (
-                WorkloadState::Running,
-                "Workload started successfully".to_string(),
-            )
-        };
-
-        // Update the workload state to `Running`
-        self.workloads
-            .write()
-            .await
-            .entry(workload_id.clone())
-            .and_modify(|workload| match resolved_workload {
-                Ok(resolved_workload) => {
-                    *workload = HostWorkload::Running(Box::new(resolved_workload))
-                }
-                Err(err) => *workload = HostWorkload::Error(err.to_string()),
-            });
-
-        Ok(WorkloadStartResponse {
-            workload_status: WorkloadStatus {
-                workload_id,
-                workload_state,
-                message,
-            },
-        })
+        match self.workload_reserve(&workload_id).await {
+            Ok(reservation) => self.workload_start_reserved(reservation, request).await,
+            Err(message) => Ok(WorkloadStartResponse {
+                workload_status: WorkloadStatus {
+                    workload_id,
+                    workload_state: WorkloadState::Error,
+                    message,
+                },
+            }),
+        }
     }
 
     #[instrument(skip_all, fields(workload.id = request.workload_id))]
@@ -875,10 +1136,24 @@ impl HostApi for Host {
     ) -> anyhow::Result<WorkloadStatusResponse> {
         if let Some(workload) = self.workloads.read().await.get(&request.workload_id) {
             let workload_state = workload.into();
+            // A failed workload reports the reason it failed, verbatim and
+            // unprefixed. This is the only field that crosses to the operator,
+            // and the operator puts it in the `Sync` condition — so it is the
+            // one place a `kubectl`-only operator can learn *why* a workload
+            // is in `WORKLOAD_STATE_ERROR`. Wrapping it in "Workload is
+            // Error: " spends the front of a truncated condition message on
+            // saying again what the state field already says.
+            // Every other state is already named by `workload_state`, and the
+            // operator formats both — so a message here renders the state
+            // twice ("WORKLOAD_STATE_STARTING: Workload is Starting").
+            let message = match workload {
+                HostWorkload::Error(reason) => reason.clone(),
+                _ => String::new(),
+            };
             Ok(WorkloadStatusResponse {
                 workload_status: WorkloadStatus {
                     workload_id: request.workload_id,
-                    message: format!("Workload is {workload}"),
+                    message,
                     workload_state,
                 },
             })
@@ -906,26 +1181,68 @@ impl HostApi for Host {
             .contains_key(&request.workload_id);
 
         let (workload_state, message) = if has_workload {
-            // Update state to stopping
+            // What a stop can do depends on what it finds, because a workload's
+            // map slot is what owns its teardown, and only the owner may write
+            // it — otherwise the id frees up mid-teardown and a new workload
+            // claiming it is unbound by the old one's `unbind_all_plugins`,
+            // which is keyed by workload id.
+            //
+            // - `Running`: this stop owns it. Mark it under a reservation of
+            //   this stop's, tear down, and drop the id.
+            // - `Starting`: the start owns it and has not produced a workload
+            //   yet. Leave a `Stopping` marker carrying the start's own
+            //   reservation; the start sees it, tears down what it built, and
+            //   drops the id.
+            // - `Stopping`: a teardown is already under way and the id stays
+            //   reserved until it finishes. Repeating the stop cannot help and
+            //   freeing the id would hand it to a new workload that the running
+            //   teardown would then unbind, so this stop reports the state and
+            //   leaves the slot alone.
+            // - `Error`: nothing is bound (every failure path releases before
+            //   recording the error), so the slot can just go.
+            let reservation = self.reserve();
             let resolved_workload = {
                 let mut workloads = self.workloads.write().await;
                 trace!(
                     workload_id = request.workload_id,
                     "updating workload state to stopping"
                 );
-                // Insert Stopping state, extract the running workload if it was running
-                workloads
-                    .insert(request.workload_id.clone(), HostWorkload::Stopping)
-                    .and_then(|hw| match hw {
-                        HostWorkload::Running(rw) => Some(*rw),
-                        _ => None,
-                    })
+                // Read what the slot holds before writing it, so the whole
+                // decision is one exhaustive match rather than a mutation with
+                // an unreachable branch in it.
+                let outcome = match workloads.get(&request.workload_id) {
+                    // This stop owns the teardown, under a reservation of its
+                    // own.
+                    Some(HostWorkload::Running(_)) => StopAction::Mark(reservation),
+                    // The start owns it. Mark the id under the reservation the
+                    // start itself holds, so it recognises the marker as its to
+                    // finish.
+                    Some(HostWorkload::Starting(held)) => StopAction::Mark(*held),
+                    // A teardown is already under way, holding the id until it
+                    // is done; nothing here is this stop's to write.
+                    Some(HostWorkload::Stopping(_)) => StopAction::Leave,
+                    // Nothing is bound, so the slot can just go.
+                    Some(HostWorkload::Error(_)) | None => StopAction::Drop,
+                };
+                match outcome {
+                    StopAction::Mark(held) => {
+                        match workloads
+                            .insert(request.workload_id.clone(), HostWorkload::Stopping(held))
+                        {
+                            // Only a stop that found the workload running has
+                            // anything to tear down here.
+                            Some(HostWorkload::Running(rw)) => Some(*rw),
+                            _ => None,
+                        }
+                    }
+                    StopAction::Leave => None,
+                    StopAction::Drop => {
+                        workloads.remove(&request.workload_id);
+                        None
+                    }
+                }
             };
 
-            // Stop the workload:
-            // 1. Unbind from all plugins
-            // 2. Clean up resources (drop will handle wasmtime cleanup)
-            // 3. Remove from active workloads
             if let Some(resolved_workload) = resolved_workload {
                 debug!(
                     workload_id = request.workload_id,
@@ -933,33 +1250,17 @@ impl HostApi for Host {
                     "stopping workload"
                 );
 
-                // Stop the service if running
-                resolved_workload.stop_service();
-
-                // Bounded: unbind can make remote calls that hang on a degraded
-                // JetStream API, wedging this stop and every command queued behind it.
-                let unbind_result = match self.config.plugin_lifecycle_timeout {
-                    Some(timeout) => {
-                        tokio::time::timeout(timeout, resolved_workload.unbind_all_plugins())
-                            .await
-                            .unwrap_or_else(|_| {
-                                Err(anyhow!("timed out unbinding plugins after {timeout:?}"))
-                            })
-                    }
-                    None => resolved_workload.unbind_all_plugins().await,
-                };
-                if let Err(e) = unbind_result {
-                    warn!(
-                        workload_id = request.workload_id,
-                        error = ?e,
-                        "error unbinding plugins during workload stop, continuing"
-                    );
-                }
+                release(
+                    &request.workload_id,
+                    &resolved_workload,
+                    self.config.plugin_lifecycle_timeout,
+                )
+                .await;
+                // Dropped only now, so the id stays reserved for the whole
+                // teardown.
+                self.finish_teardown(&request.workload_id, reservation, None)
+                    .await;
             }
-
-            // Remove the workload from the active workloads map
-            // This will drop the workload and clean up wasmtime resources
-            self.workloads.write().await.remove(&request.workload_id);
 
             debug!(
                 workload_id = request.workload_id,
@@ -984,6 +1285,145 @@ impl HostApi for Host {
     }
 }
 
+impl WorkloadReservation for Host {
+    #[instrument(skip_all, fields(workload.id = workload_id))]
+    async fn workload_reserve(&self, workload_id: &str) -> Result<Reservation, String> {
+        // Reserve the workload ID while holding the write lock so concurrent
+        // starts cannot both observe it as available. An ID remains reserved
+        // in every lifecycle state until workload_stop removes it. The
+        // reservation stamped on the slot is what lets the commit in
+        // `workload_start_reserved` tell this start's slot from one a later
+        // start claimed.
+        let reservation = self.reserve();
+        let mut workloads = self.workloads.write().await;
+        if workloads.contains_key(workload_id) {
+            let message = format!(
+                "Workload ID [{workload_id}] already exists (the exising workload must be stopped to reuse the ID)"
+            );
+            // Logged here rather than where the response is built, because this
+            // refusal returns before the start ever begins. At `warn`, not
+            // `error`: this is the guard that makes a replayed start request
+            // idempotent, and a scheduler retrying one is not a host
+            // malfunction.
+            tracing::warn!(workload_id, reason = message, "refused to start workload");
+            return Err(message);
+        }
+        workloads.insert(workload_id.to_string(), HostWorkload::Starting(reservation));
+        Ok(reservation)
+    }
+
+    #[instrument(skip_all, fields(workload.id = workload_id))]
+    async fn workload_release(&self, workload_id: &str, reservation: Reservation) {
+        let mut workloads = self.workloads.write().await;
+        // Either state this reservation can still be in holds nothing bound: a
+        // start that never began, or one a stop handed the teardown back to
+        // before it had built anything. Anything else belongs to someone else.
+        if matches!(
+            workloads.get(workload_id),
+            Some(HostWorkload::Starting(held) | HostWorkload::Stopping(held)) if *held == reservation
+        ) {
+            workloads.remove(workload_id);
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn workload_start_reserved(
+        &self,
+        reservation: Reservation,
+        request: WorkloadStartRequest,
+    ) -> anyhow::Result<WorkloadStartResponse> {
+        let workload_id = request.workload_id.clone();
+        let started = self.workload_start_inner(request).await;
+
+        // Commit under the same lock the id was reserved under, and only into
+        // the slot this start reserved. Anything else in that slot means the
+        // workload was stopped or failed while this was still starting: writing
+        // `Running` over it would resurrect a workload nobody is tracking, and
+        // simply dropping the result — which is what an `and_modify` that finds
+        // no entry does — would leave its plugins bound and its service running
+        // detached.
+        let (workload_state, message, orphaned) = {
+            let mut workloads = self.workloads.write().await;
+            let slot = workloads.get(&workload_id);
+            let mine = matches!(slot, Some(HostWorkload::Starting(held)) if *held == reservation);
+            // A stop that arrived mid-start handed the teardown back by marking
+            // the slot `Stopping` under this start's own reservation.
+            let handed_back =
+                matches!(slot, Some(HostWorkload::Stopping(held)) if *held == reservation);
+            match started {
+                Ok(resolved) if mine => {
+                    workloads.insert(
+                        workload_id.clone(),
+                        HostWorkload::Running(Box::new(resolved)),
+                    );
+                    (
+                        WorkloadState::Running,
+                        "Workload started successfully".to_string(),
+                        None,
+                    )
+                }
+                // Stopped (or failed) while starting. The stop could not tear
+                // this down because it did not exist yet, so that falls to us.
+                // The `Stopping` marker is left in place for the whole teardown:
+                // it keeps the id reserved, so a new start cannot claim it and
+                // then be unbound by our teardown.
+                Ok(resolved) => (
+                    WorkloadState::Stopping,
+                    "Workload was stopped while starting".to_string(),
+                    Some(resolved),
+                ),
+                Err(err) => {
+                    // `{:#}` so the whole context chain reaches the caller and
+                    // the log below: the outer layer alone ("failed to pull
+                    // image for component 'x'") never names the cause.
+                    let message = format!("{err:#}");
+                    if mine {
+                        workloads.insert(workload_id.clone(), HostWorkload::Error(message.clone()));
+                    } else if handed_back {
+                        // A stop is waiting on this start to finish. Nothing is
+                        // bound — `workload_start_inner` released it before
+                        // returning — so the id can go now.
+                        workloads.remove(&workload_id);
+                    }
+                    (WorkloadState::Error, message, None)
+                }
+            }
+        };
+
+        // A start that failed is reported to whoever asked and nowhere else.
+        // Say so locally too: the operator diagnosing it — a pull against a
+        // registry this host does not trust, a plugin that would not bind — is
+        // reading the host's log, and without this the host has nothing to say.
+        if workload_state == WorkloadState::Error {
+            // `reason`, not `message`: `message` is the field tracing gives
+            // the event's own text, and a second one under that name displaces
+            // it.
+            tracing::error!(workload_id, reason = message, "failed to start workload");
+        }
+
+        if let Some(resolved) = orphaned {
+            release(
+                &workload_id,
+                &resolved,
+                self.config.plugin_lifecycle_timeout,
+            )
+            .await;
+            // Only if the `Stopping` marker is still this start's. It may not be
+            // — a failure reported mid-start writes `Error` over it — and then
+            // the slot is not ours to drop.
+            self.finish_teardown(&workload_id, reservation, None).await;
+        }
+
+        Ok(WorkloadStartResponse {
+            workload_status: WorkloadStatus {
+                workload_id,
+                workload_state,
+                message,
+            },
+        })
+    }
+}
+
 impl std::fmt::Debug for Host {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Host")
@@ -996,6 +1436,29 @@ impl std::fmt::Debug for Host {
             .field("started_at", &self.started_at)
             .field("workloads", &self.workloads)
             .finish()
+    }
+}
+
+/// Drain plugin-reported workload failures for the lifetime of the host,
+/// transitioning each reported workload to a failed state. Ends when the host
+/// is dropped, or when the last [`WorkloadFailureSink`] is (a host with no
+/// plugin that keeps one).
+///
+/// The host is held weakly and upgraded per report so this task never keeps it
+/// alive — see the spawn site in [`Host::start`].
+async fn consume_workload_failures(
+    host: std::sync::Weak<Host>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<WorkloadFailure>,
+) {
+    while let Some(WorkloadFailure {
+        workload_id,
+        reason,
+    }) = rx.recv().await
+    {
+        let Some(host) = host.upgrade() else {
+            break;
+        };
+        host.fail_workload(&workload_id, reason).await;
     }
 }
 
@@ -1016,6 +1479,21 @@ pub struct HostConfig {
     /// Bound on publishing a command's reply back to NATS. A degraded NATS server can
     /// leave the publish pending indefinitely (internal channel/socket backpressure).
     pub command_reply_timeout: Option<Duration>,
+    /// PEM CA bundles to trust for OCI pulls, on top of the compiled-in webpki
+    /// roots. Needed to reach a registry behind a private CA — an in-cluster
+    /// one, or a corporate mirror.
+    ///
+    /// Applied by [`HostBuilder::build`] to the process-wide trust store, so an
+    /// embedder that fills in this struct configures registry trust the same
+    /// way it configures every other OCI setting. `wash oci pull`/`push`, which
+    /// build no host at all, reach that store through
+    /// [`oci::set_extra_ca_certificates`](crate::oci::set_extra_ca_certificates)
+    /// directly.
+    ///
+    /// That store holds one set for the whole process. Two hosts in one process
+    /// may name the same bundles; a second host naming *different* ones fails
+    /// to build, rather than running on trust it did not ask for.
+    pub oci_ca_paths: Vec<PathBuf>,
 }
 
 impl Default for HostConfig {
@@ -1028,6 +1506,7 @@ impl Default for HostConfig {
             precompiled_fetch_timeout: Duration::from_secs(30).into(),
             plugin_lifecycle_timeout: Duration::from_secs(30).into(),
             command_reply_timeout: Duration::from_secs(30).into(),
+            oci_ca_paths: Vec::new(),
         }
     }
 }
@@ -1037,6 +1516,7 @@ pub struct HostBuilder {
     id: String,
     engine: Option<Engine>,
     plugins: HashMap<&'static str, Arc<dyn HostPlugin>>,
+    plugin_bindings: crate::plugin::PluginBindings,
     hostname: Option<String>,
     friendly_name: Option<String>,
     environment: Option<String>,
@@ -1052,6 +1532,7 @@ impl Default for HostBuilder {
             id: uuid::Uuid::new_v4().to_string(),
             engine: Default::default(),
             plugins: Default::default(),
+            plugin_bindings: Default::default(),
             hostname: Default::default(),
             friendly_name: Default::default(),
             environment: Default::default(),
@@ -1092,6 +1573,60 @@ impl HostBuilder {
         }
 
         self.plugins.insert(plugin_id, plugin);
+        Ok(self)
+    }
+
+    /// Sets what the operator declared about the registered plugins' bindings.
+    ///
+    /// Checked against the registered plugins by [`HostBuilder::build`], so
+    /// call this at any point before it — a declaration naming a plugin the
+    /// host does not have is refused rather than left inert.
+    pub fn with_plugin_bindings(mut self, bindings: crate::plugin::PluginBindings) -> Self {
+        self.plugin_bindings = bindings;
+        self
+    }
+
+    /// Every native (non-component) plugin registered so far — what a host
+    /// component plugin's own capability imports resolve against
+    /// ([`crate::plugin::component_host::load_component_plugin`]). Excludes
+    /// any component plugin already registered, so a loading plugin can never
+    /// import from another component plugin, only from host natives.
+    ///
+    /// A snapshot, not a live view: call this (and [`Self::http_handler`])
+    /// only after every native plugin and the HTTP handler are registered,
+    /// then load host component plugins last. Registering a native or
+    /// calling [`Self::with_http_handler`] afterward has no effect on a
+    /// component plugin already loaded from an earlier snapshot — a missing
+    /// native fails loudly at that plugin's construction (an unresolved
+    /// import), but a missing HTTP handler fails silently until the plugin's
+    /// first outbound call traps with "http client not available".
+    #[cfg(feature = "host-component-plugins")]
+    pub fn native_plugins(&self) -> HashMap<&'static str, Arc<dyn HostPlugin>> {
+        crate::plugin::component_host::native_only(&self.plugins)
+    }
+
+    /// The HTTP handler registered so far, if any — what a host component
+    /// plugin's own `wasi:http/outgoing-handler` calls are sent through, the
+    /// same handler a workload's outgoing calls use.
+    ///
+    /// A snapshot, not a live view — see [`Self::native_plugins`]'s doc for
+    /// the ordering this requires and the silent-until-first-call failure
+    /// mode of getting it wrong.
+    #[cfg(feature = "host-component-plugins")]
+    pub fn http_handler(&self) -> Option<Arc<dyn crate::host::http::HostHandler>> {
+        self.http_handler.clone()
+    }
+
+    /// Registers the multiplexed plugin set from
+    /// [`crate::plugin::multiplexed_plugins`], which is what makes
+    /// `(implements ..)` named imports resolvable. Without it, every
+    /// registered plugin reports `supports_named_instances() == false` and a
+    /// workload needing named multiplexing fails to bind.
+    #[cfg(feature = "wasm_component_model_implements")]
+    pub fn with_multiplexed_plugins(mut self) -> anyhow::Result<Self> {
+        for plugin in crate::plugin::multiplexed_plugins() {
+            self = self.with_plugin(plugin)?;
+        }
         Ok(self)
     }
 
@@ -1174,9 +1709,21 @@ impl HostBuilder {
     /// A new `Host` instance ready to be started.
     ///
     /// # Errors
-    /// Returns an error if the default engine cannot be created (when no engine is provided).
+    /// Returns an error if the default engine cannot be created (when no engine
+    /// is provided), if a CA bundle named by [`HostConfig::oci_ca_paths`]
+    /// cannot be read or does not parse, or if a different set of bundles is
+    /// already configured for this process.
     pub fn build(self) -> anyhow::Result<Host> {
         let config = self.config.unwrap_or_default();
+
+        // Trust roots first, before anything this host builds can pull: the
+        // host pulls on behalf of every workload, and a bundle that cannot be
+        // read is a startup failure rather than a registry that rejects every
+        // pull much later. A host built without `oci` has no registry client
+        // for them to apply to.
+        #[cfg(feature = "oci")]
+        crate::oci::set_extra_ca_certificates(&config.oci_ca_paths)
+            .context("failed to load the OCI CA certificates in the host config")?;
 
         let engine = if let Some(engine) = self.engine {
             engine
@@ -1210,10 +1757,39 @@ impl HostBuilder {
             None => Arc::new(crate::host::http::NullServer::default()),
         };
 
+        // Every plugin is registered by now, so a binding declaration naming an
+        // id this host does not have is a typo — and an inert one, which is the
+        // dangerous shape: a `workloadConfig: deny` that never applies.
+        let registered: Vec<&str> = self.plugins.keys().copied().collect();
+        self.plugin_bindings.validate_against(&registered)?;
+
+        // Each plugin checks its own declaration with its own parser, so a
+        // binding an operator wrote wrong fails startup rather than the first
+        // workload that names it.
+        for id in self.plugin_bindings.plugin_ids() {
+            // Skipped, not refused: `validate_against` already warned that this
+            // build has no such plugin. Nothing can bind it either, so the
+            // declaration is inert rather than wrong.
+            let Some(plugin) = self.plugins.get(id) else {
+                continue;
+            };
+            let declared = self.plugin_bindings.for_plugin(id);
+            declared.validate_declaration()?;
+            // The schema check next: an operator typo is named as a typo,
+            // rather than as whatever the plugin's parser makes of a config
+            // missing the key they meant to set.
+            declared.reject_unknown_keys(&plugin.binding_schema())?;
+            plugin
+                .validate_bindings(&declared)
+                .with_context(|| format!("invalid `host.plugins` declaration for '{id}'"))?;
+        }
+
         Ok(Host {
             engine,
             workloads: Arc::default(),
+            reservations: std::sync::atomic::AtomicU64::default(),
             plugins: self.plugins,
+            plugin_bindings: Arc::new(self.plugin_bindings),
             id: self.id,
             hostname,
             friendly_name,
@@ -1261,6 +1837,7 @@ mod tests {
             crate::types::LocalResources::default(),
             Arc::default(),
             key.map(Arc::<str>::from),
+            crate::engine::InstancePolicy::Ephemeral,
         )
     }
 
@@ -1300,7 +1877,7 @@ mod tests {
             let mut workloads = host.workloads.write().await;
             workloads.insert("running".into(), HostWorkload::Running(Box::new(running)));
             // Non-running workloads must contribute nothing to the mark set.
-            workloads.insert("starting".into(), HostWorkload::Starting);
+            workloads.insert("starting".into(), HostWorkload::Starting(host.reserve()));
             workloads.insert("errored".into(), HostWorkload::Error("boom".into()));
         }
 
@@ -1309,6 +1886,90 @@ mod tests {
             keys,
             HashSet::from([Arc::<str>::from("key-a"), Arc::<str>::from("key-svc")]),
             "only Some keys from running workloads' components + service are in-use"
+        );
+    }
+
+    /// An unreadable CA bundle has to stop the host being built. Trust is
+    /// configured once and used much later, so accepting it here would surface
+    /// as every pull from that registry failing to verify, far from the typo
+    /// that caused it.
+    #[cfg(feature = "oci")]
+    #[test]
+    fn an_unreadable_oci_ca_bundle_fails_the_build() {
+        let err = Host::builder()
+            .with_config(HostConfig {
+                oci_ca_paths: vec![PathBuf::from("/definitely/not/a/ca.pem")],
+                ..Default::default()
+            })
+            .build()
+            .expect_err("a host must not build around a CA bundle it cannot read");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("/definitely/not/a/ca.pem"),
+            "the error should name the bundle it could not read: {msg}"
+        );
+    }
+
+    fn empty_workload_start_request(workload_id: &str) -> WorkloadStartRequest {
+        WorkloadStartRequest {
+            workload_id: workload_id.to_string(),
+            workload: Workload {
+                namespace: "wasmcloud".to_string(),
+                name: "empty".to_string(),
+                annotations: Default::default(),
+                service: None,
+                components: vec![],
+                host_interfaces: vec![],
+                volumes: vec![],
+            },
+        }
+    }
+
+    /// `Host::stop`'s per-plugin timeout must outlast the plugin-stop budget.
+    /// A host component plugin's `stop()` waits the full budget for its
+    /// supervisor and only then runs its abort-and-cleanup tail; if the outer
+    /// timeout fired first it would drop that future mid-wait, detaching the
+    /// supervisor's JoinHandle instead of aborting it. The mock below mirrors
+    /// that shape: sleep the budget, then record that the tail ran.
+    #[tokio::test(start_paused = true)]
+    async fn test_stop_outlasts_plugin_stop_budget() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SlowStopPlugin {
+            cleanup_ran: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl HostPlugin for SlowStopPlugin {
+            fn id(&self) -> &'static str {
+                "slow-stop"
+            }
+
+            fn world(&self) -> WitWorld {
+                WitWorld::default()
+            }
+
+            async fn stop(&self) -> anyhow::Result<()> {
+                tokio::time::sleep(crate::timeouts::plugin_stop()).await;
+                self.cleanup_ran.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let cleanup_ran = Arc::new(AtomicBool::new(false));
+        let host = Host::builder()
+            .with_plugin(Arc::new(SlowStopPlugin {
+                cleanup_ran: Arc::clone(&cleanup_ran),
+            }))
+            .expect("failed to register plugin")
+            .build()
+            .expect("failed to build host");
+
+        Arc::new(host).stop().await.expect("failed to stop host");
+
+        assert!(
+            cleanup_ran.load(Ordering::SeqCst),
+            "plugin stop's post-budget cleanup must run before Host::stop gives up on it"
         );
     }
 
@@ -1361,6 +2022,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_workload_start_rejects_existing_id() {
+        let host = Host::builder().build().expect("failed to build host");
+        let request = empty_workload_start_request("duplicate");
+
+        let first = host
+            .workload_start(request.clone())
+            .await
+            .expect("first start should return a response");
+        assert_eq!(first.workload_status.workload_state, WorkloadState::Running);
+
+        let duplicate = host
+            .workload_start(request)
+            .await
+            .expect("duplicate start should return a response");
+        assert_eq!(
+            duplicate.workload_status.workload_state,
+            WorkloadState::Error
+        );
+        assert!(
+            duplicate
+                .workload_status
+                .message
+                .contains("Workload ID [duplicate] already exists"),
+            "unexpected rejection message: {}",
+            duplicate.workload_status.message
+        );
+
+        let workloads = host.workloads.read().await;
+        assert_eq!(workloads.len(), 1);
+        assert!(matches!(
+            workloads.get("duplicate"),
+            Some(HostWorkload::Running(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_workload_starts_reserve_id_atomically() {
+        let host = Host::builder().build().expect("failed to build host");
+        let request = empty_workload_start_request("concurrent-duplicate");
+
+        let (first, second) = tokio::join!(
+            host.workload_start(request.clone()),
+            host.workload_start(request)
+        );
+        let states = [
+            first
+                .expect("first start should return a response")
+                .workload_status
+                .workload_state,
+            second
+                .expect("second start should return a response")
+                .workload_status
+                .workload_state,
+        ];
+
+        assert_eq!(
+            states
+                .iter()
+                .filter(|state| **state == WorkloadState::Running)
+                .count(),
+            1
+        );
+        assert_eq!(
+            states
+                .iter()
+                .filter(|state| **state == WorkloadState::Error)
+                .count(),
+            1
+        );
+        assert_eq!(host.workloads.read().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_workload_start_failed() {
         let host = Host::builder().build().expect("failed to build host");
 
@@ -1381,6 +2115,9 @@ mod tests {
                         source: crate::types::Source::Compile(
                             vec![0xD, 0xE, 0xA, 0xD, 0xB, 0xE, 0xE, 0xF].into(),
                         ),
+                        max_concurrency: 1,
+                        reclaim_window_seconds: 0,
+                        reclaim_min_instances: 0,
                     }],
                     host_interfaces: vec![],
                     volumes: vec![],
@@ -1432,6 +2169,381 @@ mod tests {
                 }
             })
         ));
+    }
+
+    /// Records which workloads it was bound to and unbound from, so a test can
+    /// assert that a workload which never finished starting still gave its
+    /// binding back. `bind_delay` holds a start open long enough for a stop to
+    /// race it, and `unbind_delay` does the same for a teardown.
+    #[derive(Default)]
+    struct BindRecordingPlugin {
+        bound: std::sync::Mutex<Vec<String>>,
+        unbound: std::sync::Mutex<Vec<String>>,
+        bind_delay: Duration,
+        unbind_delay: Duration,
+    }
+
+    impl BindRecordingPlugin {
+        fn unbound(&self) -> Vec<String> {
+            self.unbound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn bound(&self) -> Vec<String> {
+            self.bound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HostPlugin for BindRecordingPlugin {
+        fn id(&self) -> &'static str {
+            "bind-recording"
+        }
+
+        fn world(&self) -> WitWorld {
+            WitWorld {
+                imports: HashSet::from([WitInterface::from("test:probe/marker@0.1.0")]),
+                exports: HashSet::new(),
+            }
+        }
+
+        async fn on_workload_bind(
+            &self,
+            workload: &crate::engine::workload::UnresolvedWorkload,
+            _interfaces: crate::plugin::WitInterfaces<'_>,
+        ) -> anyhow::Result<()> {
+            if !self.bind_delay.is_zero() {
+                tokio::time::sleep(self.bind_delay).await;
+            }
+            self.bound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(workload.id().to_string());
+            Ok(())
+        }
+
+        async fn on_workload_unbind(
+            &self,
+            workload_id: &str,
+            _interfaces: crate::plugin::WitInterfaces<'_>,
+        ) -> anyhow::Result<()> {
+            if !self.unbind_delay.is_zero() {
+                tokio::time::sleep(self.unbind_delay).await;
+            }
+            self.unbound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(workload_id.to_string());
+            Ok(())
+        }
+    }
+
+    /// A component whose only import is the interface `BindRecordingPlugin`
+    /// serves, so a workload carrying it binds that plugin.
+    fn marker_component_wasm() -> Vec<u8> {
+        wat::parse_str(r#"(component (import "test:probe/marker@0.1.0" (instance)))"#)
+            .expect("failed to parse WAT")
+    }
+
+    /// The same, plus a single exported interface — enough to pass the
+    /// service's export validation, but not `wasi:cli/run`, so building a
+    /// command from it fails. That failure lands *after* `resolve` has bound
+    /// the workload's plugins, which is the window these tests exercise.
+    fn marker_service_wasm() -> Vec<u8> {
+        wat::parse_str(
+            r#"(component
+                  (import "test:probe/marker@0.1.0" (instance))
+                  (instance $empty)
+                  (export "test:probe/runner@0.1.0" (instance $empty))
+               )"#,
+        )
+        .expect("failed to parse WAT")
+    }
+
+    fn marker_interfaces() -> Vec<WitInterface> {
+        vec![WitInterface::from("test:probe/marker@0.1.0")]
+    }
+
+    /// A workload whose service binds the plugin and then fails to start: the
+    /// component is valid and resolves, so plugins bind, but it exports no
+    /// `wasi:cli/run` for the service driver to call.
+    fn service_fails_after_bind_request(workload_id: &str) -> WorkloadStartRequest {
+        WorkloadStartRequest {
+            workload_id: workload_id.to_string(),
+            workload: Workload {
+                namespace: "wasmcloud".to_string(),
+                name: "binds-then-fails".to_string(),
+                annotations: Default::default(),
+                service: Some(crate::types::Service {
+                    bytes: marker_service_wasm().into(),
+                    digest: None,
+                    local_resources: Default::default(),
+                    max_restarts: 0,
+                }),
+                components: vec![],
+                host_interfaces: marker_interfaces(),
+                volumes: vec![],
+            },
+        }
+    }
+
+    /// A workload of one plain component that binds the plugin and reaches
+    /// `Running` — what a stop finds when it owns the teardown itself.
+    fn marker_request(workload_id: &str) -> WorkloadStartRequest {
+        WorkloadStartRequest {
+            workload_id: workload_id.to_string(),
+            workload: Workload {
+                namespace: "wasmcloud".to_string(),
+                name: workload_id.to_string(),
+                annotations: Default::default(),
+                service: None,
+                components: vec![Component {
+                    name: "marker".to_string(),
+                    digest: None,
+                    source: crate::types::Source::Compile(marker_component_wasm().into()),
+                    local_resources: Default::default(),
+                    pool_size: 1,
+                    max_invocations: 100,
+                    max_concurrency: 1,
+                    reclaim_window_seconds: 0,
+                    reclaim_min_instances: 0,
+                }],
+                host_interfaces: marker_interfaces(),
+                volumes: vec![],
+            },
+        }
+    }
+
+    fn host_with(plugin: Arc<BindRecordingPlugin>) -> Host {
+        Host::builder()
+            .with_plugin(plugin)
+            .expect("failed to register plugin")
+            .build()
+            .expect("failed to build host")
+    }
+
+    /// `build()` runs each plugin's own parser over the operator's
+    /// declaration, so a binding written wrong fails startup rather than the
+    /// first workload that asks for it. The message has to name the binding.
+    ///
+    /// Also the other direction: a named binding that omits `servers` inherits
+    /// the host's data-plane address at resolve time, so it is complete by the
+    /// time the plugin reads it and must *not* fail startup.
+    #[cfg(feature = "wasmcloud-nats")]
+    #[test]
+    fn a_bad_declaration_fails_at_startup() {
+        use crate::plugin::wasmcloud_nats::{PLUGIN_NATS_ID, WasmcloudNats};
+        use crate::plugin::{PluginBindingSet, PluginBindings};
+
+        let build = |binding: &[(&str, &str)]| {
+            let declared = PluginBindingSet::new(PLUGIN_NATS_ID)
+                .with_binding(
+                    "orders",
+                    binding
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                        .collect(),
+                )
+                .with_default_bundle("servers", [("servers", "nats://data:4222")]);
+            Host::builder()
+                .with_plugin(Arc::new(WasmcloudNats::new()))
+                .expect("failed to register plugin")
+                .with_plugin_bindings(PluginBindings::new().with_plugin(declared))
+                .build()
+        };
+
+        let err = build(&[("ack-mode", "sometimes")]).expect_err("not an ack mode");
+        // Alternate form: the binding name is in the context chain, and a
+        // message that stops at "invalid declaration" sends an operator
+        // through every binding they have.
+        let err = format!("{err:#}");
+        assert!(err.contains("orders"), "names the binding: {err}");
+
+        build(&[("subject-allow", "orders.>")])
+            .expect("a binding that inherits the data-plane address is complete");
+    }
+
+    /// A start that fails *after* its plugins bound must give the binding back.
+    /// `resolve` rolls back its own failures; anything failing later has to be
+    /// released by the start itself, or every plugin is left holding
+    /// per-workload state for a workload that never ran — and, for a plugin
+    /// that can call into workloads, still able to reach it.
+    #[tokio::test]
+    async fn test_start_failing_after_bind_unbinds_plugins() {
+        let plugin = Arc::new(BindRecordingPlugin::default());
+        let host = host_with(Arc::clone(&plugin));
+
+        let response = host
+            .workload_start(service_fails_after_bind_request("late-failure"))
+            .await
+            .expect("workload_start should report rather than error");
+
+        assert_eq!(
+            response.workload_status.workload_state,
+            WorkloadState::Error,
+            "the service cannot start, so the workload is in error"
+        );
+        assert_eq!(
+            plugin.bound(),
+            vec!["late-failure".to_string()],
+            "the plugin should have been bound before the failure; start said: {}",
+            response.workload_status.message
+        );
+        assert_eq!(
+            plugin.unbound(),
+            vec!["late-failure".to_string()],
+            "a start that fails after binding must unbind"
+        );
+    }
+
+    /// Stopping a workload that failed to start is a no-op beyond dropping the
+    /// id: the failure path already released it. In particular the plugin must
+    /// not be unbound a second time.
+    #[tokio::test]
+    async fn test_stopping_an_errored_workload_does_not_unbind_twice() {
+        let plugin = Arc::new(BindRecordingPlugin::default());
+        let host = host_with(Arc::clone(&plugin));
+
+        host.workload_start(service_fails_after_bind_request("errored"))
+            .await
+            .expect("workload_start should report rather than error");
+        host.workload_stop(WorkloadStopRequest {
+            workload_id: "errored".to_string(),
+        })
+        .await
+        .expect("stopping an errored workload should succeed");
+
+        assert_eq!(
+            plugin.unbound(),
+            vec!["errored".to_string()],
+            "the errored workload was already released; stop must not unbind again"
+        );
+        assert!(
+            host.workloads.read().await.is_empty(),
+            "stopping should drop the id"
+        );
+    }
+
+    /// A stop that arrives while a workload is still starting cannot tear it
+    /// down — there is nothing built yet — so it leaves a `Stopping` marker and
+    /// the start owns the cleanup: it finds its slot taken, releases what it
+    /// built, and drops the id itself. Without that the workload's plugins stay
+    /// bound and its service keeps running with no record of either.
+    #[tokio::test]
+    async fn test_stop_racing_a_start_releases_the_workload() {
+        let plugin = Arc::new(BindRecordingPlugin {
+            bind_delay: Duration::from_millis(300),
+            ..Default::default()
+        });
+        let host = Arc::new(host_with(Arc::clone(&plugin)));
+
+        let starting = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move { host.workload_start(marker_request("raced")).await })
+        };
+
+        // Stop while the plugin's bind is still sleeping.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stopped = host
+            .workload_stop(WorkloadStopRequest {
+                workload_id: "raced".to_string(),
+            })
+            .await
+            .expect("stopping a starting workload should succeed");
+        assert_eq!(
+            stopped.workload_status.workload_state,
+            WorkloadState::Stopping
+        );
+
+        let started = starting
+            .await
+            .expect("the start task should not panic")
+            .expect("workload_start should report rather than error");
+        assert_eq!(
+            started.workload_status.workload_state,
+            WorkloadState::Stopping,
+            "a start whose slot was taken by a stop reports that, not Running"
+        );
+
+        assert_eq!(
+            plugin.unbound(),
+            vec!["raced".to_string()],
+            "the start must release what it bound once it finds its slot stopped"
+        );
+        assert!(
+            host.workloads.read().await.is_empty(),
+            "the id is dropped only once the start has released the workload"
+        );
+    }
+
+    /// A teardown holds its workload id for as long as it runs, so a second
+    /// stop arriving mid-teardown cannot free the id. Were it able to, a start
+    /// could claim the id while the first teardown is still unbinding — and
+    /// `unbind_all_plugins` is keyed by workload id, so the newcomer would be
+    /// unbound by its predecessor's teardown and then dropped from the map
+    /// entirely, left running with nothing tracking it.
+    #[tokio::test]
+    async fn test_a_second_stop_does_not_free_an_in_flight_teardown() {
+        let plugin = Arc::new(BindRecordingPlugin {
+            unbind_delay: Duration::from_millis(300),
+            ..Default::default()
+        });
+        let host = Arc::new(host_with(Arc::clone(&plugin)));
+        host.workload_start(marker_request("held"))
+            .await
+            .expect("workload_start should report rather than error");
+
+        let stopping = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move {
+                host.workload_stop(WorkloadStopRequest {
+                    workload_id: "held".to_string(),
+                })
+                .await
+            })
+        };
+
+        // A retried stop, while the first one's unbind is still sleeping.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        host.workload_stop(WorkloadStopRequest {
+            workload_id: "held".to_string(),
+        })
+        .await
+        .expect("a second stop should report rather than error");
+        assert!(
+            host.workloads.read().await.contains_key("held"),
+            "the id stays reserved while the first stop is still tearing down"
+        );
+
+        // ...so a redeploy under the same id cannot slip in behind it.
+        let redeployed = host
+            .workload_start(marker_request("held"))
+            .await
+            .expect("workload_start should report rather than error");
+        assert_eq!(
+            redeployed.workload_status.workload_state,
+            WorkloadState::Error,
+            "the id is still taken, so a start under it is refused rather than racing the teardown"
+        );
+
+        stopping
+            .await
+            .expect("the stop task should not panic")
+            .expect("stopping should succeed");
+        assert_eq!(
+            plugin.unbound(),
+            vec!["held".to_string()],
+            "the workload is unbound exactly once, by the stop that owned it"
+        );
+        assert!(
+            host.workloads.read().await.is_empty(),
+            "the id is dropped once its teardown finishes"
+        );
     }
 
     #[test]
