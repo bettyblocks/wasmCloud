@@ -830,7 +830,10 @@ async fn workload_start(
     }
 
     // Every exit from here gives the id back, so a start that never began
-    // cannot leave it reserved against the next one.
+    // cannot leave it reserved against the next one. Not awaited here: it is
+    // handed to `start_bounded` so the bound covers this half too, which is
+    // the half that holds the permit while pulling images and fetching
+    // `.cwasm` bytes.
     let prepared = async {
         let (components, host_interfaces) = if let Some(wit_world) = wit_world {
             let mut pulled_components = Vec::with_capacity(wit_world.components.len());
@@ -987,68 +990,88 @@ async fn workload_start(
             },
         };
         Ok(request)
-    }
-    .await;
-
-    let request = match prepared {
-        Ok(request) => request,
-        Err(message) => {
-            host.workload_release(&workload_id, reservation).await;
-            return Ok(workload_start_error(&workload_id, message));
-        }
     };
 
-    info!(
-        workload_id=?workload_id,
-        namespace=?request.workload.namespace,
-        name=?request.workload.name,
-        "Starting workload");
-
-    start_reserved_bounded(
+    start_bounded(
         host,
         &workload_id,
         reservation,
-        request,
+        prepared,
         config.workload_start_timeout,
     )
     .await
 }
 
-/// Run a reserved start under [`HostConfig::workload_start_timeout`], giving
-/// the id back if it expires.
+/// Prepare and start a reserved workload under
+/// [`HostConfig::workload_start_timeout`], giving the id back if it expires.
+///
+/// Covers *both* halves deliberately. The caller takes a
+/// [`MAX_CONCURRENT_STARTS`] permit before preparing, so a start wedged while
+/// pulling an image or fetching `.cwasm` bytes holds a permit as surely as one
+/// wedged in `workload_start_reserved` does — and with only four permits, four
+/// such starts stop the host accepting any start at all while stops keep
+/// working, which is exactly the state a host gets into. Bounding only the
+/// second half leaves that untouched.
 ///
 /// Bounded here, inside the task that holds the reservation, rather than by
-/// the caller: on expiry this task is the one that releases the id. A
-/// caller-side timeout would free the id while this task might still be inside
-/// `workload_start_reserved` believing it owns the teardown, and
-/// `unbind_all_plugins` is keyed by workload id — a new workload claiming that
-/// id would then be unbound by the old start finishing.
+/// the caller: on expiry this task is the one that releases the id, and the
+/// permit goes back when this frame drops. A caller-side timeout would free
+/// the id while this task might still be inside `workload_start_reserved`
+/// believing it owns the teardown, and `unbind_all_plugins` is keyed by
+/// workload id — a new workload claiming that id would then be unbound by the
+/// old start finishing.
 ///
 /// Only reachable when the start is stuck at an await. A start spinning in
 /// synchronous code never yields, so the timer never gets to fire and this is
 /// inert: `Starting` still pins the id and only a restart clears it.
-async fn start_reserved_bounded(
+async fn start_bounded(
     host: &impl WorkloadReservation,
     workload_id: &str,
     reservation: crate::host::Reservation,
-    request: crate::types::WorkloadStartRequest,
+    prepared: impl Future<Output = Result<crate::types::WorkloadStartRequest, String>>,
     limit: Option<Duration>,
 ) -> anyhow::Result<types::v2::WorkloadStartResponse> {
-    let start = host.workload_start_reserved(reservation, request);
-    let Some(limit) = limit else {
-        return Ok(start.await?.into());
+    // `Ok(Err(message))` is a prepare that failed and reported why;
+    // `Err(_)` is a start that failed outright.
+    let attempt = async {
+        let request = match prepared.await {
+            Ok(request) => request,
+            Err(message) => return Ok(Err(message)),
+        };
+        info!(
+            workload_id=?workload_id,
+            namespace=?request.workload.namespace,
+            name=?request.workload.name,
+            "Starting workload");
+        anyhow::Ok(Ok(types::v2::WorkloadStartResponse::from(
+            host.workload_start_reserved(reservation, request).await?,
+        )))
     };
-    match tokio::time::timeout(limit, start).await {
-        Ok(started) => Ok(started?.into()),
-        Err(_) => {
-            // Dropped at its last await, so it will not touch the slot again;
-            // releasing is this task's to do. `workload_release` is a no-op if
-            // the id has already moved on to another owner.
+
+    // `None` here means the bound expired; the attempt is dropped at its last
+    // await and will not touch the slot again.
+    let outcome = match limit {
+        Some(limit) => tokio::time::timeout(limit, attempt).await.ok(),
+        None => Some(attempt.await),
+    };
+
+    match outcome {
+        Some(Ok(Ok(response))) => Ok(response),
+        // Prepare reported a reason, so the id goes back for a retry.
+        Some(Ok(Err(message))) => {
             host.workload_release(workload_id, reservation).await;
+            Ok(workload_start_error(workload_id, message))
+        }
+        Some(Err(e)) => Err(e),
+        None => {
+            // `workload_release` is a no-op if the id has already moved on to
+            // another owner.
+            host.workload_release(workload_id, reservation).await;
+            let limit = limit.unwrap_or_default();
             error!(
                 workload_id=?workload_id,
-                "timed out starting workload after {limit:?}; releasing the id so a retry can \
-                 claim it"
+                "timed out starting workload after {limit:?}; releasing the id and its start \
+                 permit so a retry can claim them"
             );
             Ok(workload_start_error(
                 workload_id,
@@ -1344,11 +1367,11 @@ mod tests {
             released: std::sync::atomic::AtomicBool::new(false),
         };
 
-        let response = start_reserved_bounded(
+        let response = start_bounded(
             &host,
             "stuck-id",
             1,
-            start_request("stuck-id"),
+            std::future::ready(Ok(start_request("stuck-id"))),
             Some(Duration::from_secs(300)),
         )
         .await
@@ -1377,7 +1400,13 @@ mod tests {
 
         let pending = tokio::time::timeout(
             Duration::from_secs(3600),
-            start_reserved_bounded(&host, "stuck-id", 1, start_request("stuck-id"), None),
+            start_bounded(
+                &host,
+                "stuck-id",
+                1,
+                std::future::ready(Ok(start_request("stuck-id"))),
+                None,
+            ),
         )
         .await;
 
@@ -1386,6 +1415,63 @@ mod tests {
             !host.released.load(std::sync::atomic::Ordering::SeqCst),
             "nothing released the id, which is exactly the behaviour being bounded"
         );
+    }
+
+    /// The half that holds a [`MAX_CONCURRENT_STARTS`] permit while it pulls
+    /// images has to be inside the bound too. Four starts wedged here take
+    /// every permit, and the host then accepts no start at all — while stops,
+    /// which need no permit, keep working and make it look alive.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_prepare_releases_its_id_too() {
+        let host = HangingStart {
+            released: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let response = start_bounded(
+            &host,
+            "stuck-in-prepare",
+            1,
+            // Never resolves: an image pull that hangs past its own bound.
+            std::future::pending::<Result<crate::types::WorkloadStartRequest, String>>(),
+            Some(Duration::from_secs(300)),
+        )
+        .await
+        .expect("a timed-out prepare reports itself, it does not fail the command");
+
+        assert!(
+            host.released.load(std::sync::atomic::Ordering::SeqCst),
+            "a prepare that never finishes still has to give the id back"
+        );
+        let status = response.workload_status.expect("status is reported");
+        assert_eq!(status.workload_state, types::v2::WorkloadState::Error as i32);
+        assert!(
+            status.message.contains("timed out starting workload"),
+            "the reason reaches the operator, got: {}",
+            status.message
+        );
+    }
+
+    /// A prepare that fails for its own reasons reports that reason, not a
+    /// timeout, and still gives the id back.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_prepare_reports_its_own_reason() {
+        let host = HangingStart {
+            released: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let response = start_bounded(
+            &host,
+            "bad-image",
+            1,
+            std::future::ready(Err("failed to pull image".to_string())),
+            Some(Duration::from_secs(300)),
+        )
+        .await
+        .expect("a failed prepare reports itself");
+
+        assert!(host.released.load(std::sync::atomic::Ordering::SeqCst));
+        let status = response.workload_status.expect("status is reported");
+        assert_eq!(status.message, "failed to pull image");
     }
 
     /// A host always keeps a start it can run and a core it can serve on.
