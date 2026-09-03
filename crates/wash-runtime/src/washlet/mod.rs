@@ -1323,11 +1323,18 @@ mod tests {
     }
 
     impl WorkloadReservation for HangingStart {
-        async fn workload_reserve(&self, _workload_id: &str) -> Result<crate::host::Reservation, String> {
+        async fn workload_reserve(
+            &self,
+            _workload_id: &str,
+        ) -> Result<crate::host::Reservation, String> {
             Ok(1)
         }
 
-        async fn workload_release(&self, _workload_id: &str, _reservation: crate::host::Reservation) {
+        async fn workload_release(
+            &self,
+            _workload_id: &str,
+            _reservation: crate::host::Reservation,
+        ) {
             self.released
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -1382,7 +1389,10 @@ mod tests {
             "the id has to be released, or no retry can ever claim it"
         );
         let status = response.workload_status.expect("status is reported");
-        assert_eq!(status.workload_state, types::v2::WorkloadState::Error as i32);
+        assert_eq!(
+            status.workload_state,
+            types::v2::WorkloadState::Error as i32
+        );
         assert!(
             status.message.contains("timed out starting workload"),
             "the reason reaches the operator, got: {}",
@@ -1443,7 +1453,10 @@ mod tests {
             "a prepare that never finishes still has to give the id back"
         );
         let status = response.workload_status.expect("status is reported");
-        assert_eq!(status.workload_state, types::v2::WorkloadState::Error as i32);
+        assert_eq!(
+            status.workload_state,
+            types::v2::WorkloadState::Error as i32
+        );
         assert!(
             status.message.contains("timed out starting workload"),
             "the reason reaches the operator, got: {}",

@@ -485,14 +485,16 @@ impl WorkloadComponent {
     /// Like [`Self::pre_instantiate`] but without requiring `&mut self`:
     /// `Linker::instantiate_pre` only needs `&self`, so callers holding a read
     /// lock on the component map can pre-instantiate without serializing on a
-    /// write lock. See [`Self::pre_instantiate`] for why this runs on a
-    /// blocking thread.
+    /// write lock.
+    ///
+    /// Unlike [`Self::pre_instantiate`], this stays synchronous: every caller
+    /// is on the request path (`new_store`, `new_ephemeral_store`), not the
+    /// start path, so `spawn_blocking` here would add a thread hop and a full
+    /// `Linker` clone to every request instead of once at start.
     pub async fn pre_instantiate_ref(&self) -> wasmtime::Result<InstancePre<SharedCtx>> {
-        let component = self.metadata.component.clone();
-        let linker = self.metadata.linker.clone();
-        tokio::task::spawn_blocking(move || linker.instantiate_pre(&component))
-            .await
-            .map_err(|e| wasmtime::Error::msg(format!("pre-instantiate task panicked: {e}")))?
+        self.metadata
+            .linker
+            .instantiate_pre(&self.metadata.component)
     }
 
     pub fn metadata(&self) -> &WorkloadMetadata {
@@ -1821,9 +1823,8 @@ impl ResolvedWorkload {
         drop(components);
         // See `WorkloadComponent::pre_instantiate` for why this runs on a
         // blocking thread rather than inline here.
-        let pre =
-            tokio::task::spawn_blocking(move || linker.instantiate_pre(&wasmtime_component))
-                .await??;
+        let pre = tokio::task::spawn_blocking(move || linker.instantiate_pre(&wasmtime_component))
+            .await??;
 
         Ok(pre)
     }
