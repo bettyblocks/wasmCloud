@@ -1004,10 +1004,58 @@ async fn workload_start(
         name=?request.workload.name,
         "Starting workload");
 
-    Ok(host
-        .workload_start_reserved(reservation, request)
-        .await?
-        .into())
+    start_reserved_bounded(
+        host,
+        &workload_id,
+        reservation,
+        request,
+        config.workload_start_timeout,
+    )
+    .await
+}
+
+/// Run a reserved start under [`HostConfig::workload_start_timeout`], giving
+/// the id back if it expires.
+///
+/// Bounded here, inside the task that holds the reservation, rather than by
+/// the caller: on expiry this task is the one that releases the id. A
+/// caller-side timeout would free the id while this task might still be inside
+/// `workload_start_reserved` believing it owns the teardown, and
+/// `unbind_all_plugins` is keyed by workload id — a new workload claiming that
+/// id would then be unbound by the old start finishing.
+///
+/// Only reachable when the start is stuck at an await. A start spinning in
+/// synchronous code never yields, so the timer never gets to fire and this is
+/// inert: `Starting` still pins the id and only a restart clears it.
+async fn start_reserved_bounded(
+    host: &impl WorkloadReservation,
+    workload_id: &str,
+    reservation: crate::host::Reservation,
+    request: crate::types::WorkloadStartRequest,
+    limit: Option<Duration>,
+) -> anyhow::Result<types::v2::WorkloadStartResponse> {
+    let start = host.workload_start_reserved(reservation, request);
+    let Some(limit) = limit else {
+        return Ok(start.await?.into());
+    };
+    match tokio::time::timeout(limit, start).await {
+        Ok(started) => Ok(started?.into()),
+        Err(_) => {
+            // Dropped at its last await, so it will not touch the slot again;
+            // releasing is this task's to do. `workload_release` is a no-op if
+            // the id has already moved on to another owner.
+            host.workload_release(workload_id, reservation).await;
+            error!(
+                workload_id=?workload_id,
+                "timed out starting workload after {limit:?}; releasing the id so a retry can \
+                 claim it"
+            );
+            Ok(workload_start_error(
+                workload_id,
+                format!("timed out starting workload after {limit:?}"),
+            ))
+        }
+    }
 }
 
 #[instrument(skip_all, fields(workload_id = %req.workload_id))]
@@ -1245,6 +1293,100 @@ mod tests {
     use super::*;
     use crate::host::allowed_hosts::AllowedHost;
     use crate::host::allowed_ip_name::AllowedIpName;
+
+    /// A host whose start never returns.
+    struct HangingStart {
+        released: std::sync::atomic::AtomicBool,
+    }
+
+    impl WorkloadReservation for HangingStart {
+        async fn workload_reserve(&self, _workload_id: &str) -> Result<crate::host::Reservation, String> {
+            Ok(1)
+        }
+
+        async fn workload_release(&self, _workload_id: &str, _reservation: crate::host::Reservation) {
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        async fn workload_start_reserved(
+            &self,
+            _reservation: crate::host::Reservation,
+            _request: crate::types::WorkloadStartRequest,
+        ) -> anyhow::Result<crate::types::WorkloadStartResponse> {
+            // Stuck at an await, which is the case the bound exists for.
+            std::future::pending().await
+        }
+    }
+
+    fn start_request(workload_id: &str) -> crate::types::WorkloadStartRequest {
+        crate::types::WorkloadStartRequest {
+            workload_id: workload_id.to_string(),
+            workload: crate::types::Workload {
+                namespace: "wasm".to_string(),
+                name: "stuck".to_string(),
+                annotations: Default::default(),
+                service: None,
+                components: Vec::new(),
+                host_interfaces: Vec::new(),
+                volumes: Vec::new(),
+            },
+        }
+    }
+
+    /// A start that hangs has to give its id back. Holding it leaves the id in
+    /// `Starting` for the life of the process: the operator's retries are
+    /// refused as already existing, and a stop only marks the slot for the
+    /// hung start to finish, so the workload can never become ready again.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_start_releases_its_id() {
+        let host = HangingStart {
+            released: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let response = start_reserved_bounded(
+            &host,
+            "stuck-id",
+            1,
+            start_request("stuck-id"),
+            Some(Duration::from_secs(300)),
+        )
+        .await
+        .expect("a timed-out start reports itself, it does not fail the command");
+
+        assert!(
+            host.released.load(std::sync::atomic::Ordering::SeqCst),
+            "the id has to be released, or no retry can ever claim it"
+        );
+        let status = response.workload_status.expect("status is reported");
+        assert_eq!(status.workload_state, types::v2::WorkloadState::Error as i32);
+        assert!(
+            status.message.contains("timed out starting workload"),
+            "the reason reaches the operator, got: {}",
+            status.message
+        );
+    }
+
+    /// With no bound configured the start is awaited as-is, so an embedder that
+    /// wants the old behaviour keeps it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unbounded_start_is_left_alone() {
+        let host = HangingStart {
+            released: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let pending = tokio::time::timeout(
+            Duration::from_secs(3600),
+            start_reserved_bounded(&host, "stuck-id", 1, start_request("stuck-id"), None),
+        )
+        .await;
+
+        assert!(pending.is_err(), "an unbounded start never returns");
+        assert!(
+            !host.released.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing released the id, which is exactly the behaviour being bounded"
+        );
+    }
 
     /// A host always keeps a start it can run and a core it can serve on.
     #[test]

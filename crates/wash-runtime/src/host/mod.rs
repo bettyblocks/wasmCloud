@@ -1479,6 +1479,29 @@ pub struct HostConfig {
     /// Bound on publishing a command's reply back to NATS. A degraded NATS server can
     /// leave the publish pending indefinitely (internal channel/socket backpressure).
     pub command_reply_timeout: Option<Duration>,
+    /// Bound on the whole of a reserved start — everything from the id being
+    /// claimed to the workload being in the map.
+    ///
+    /// Without it a start that never returns holds its id in `Starting`
+    /// forever: the operator's retries are refused (`already exists`), and a
+    /// stop cannot clear it either, because a stop arriving on `Starting`
+    /// only marks the slot for the start itself to finish. The id is then
+    /// unusable for the life of the process and the workload never becomes
+    /// ready.
+    ///
+    /// Enforced by the start task around its own work, so when it fires the
+    /// task is the one that releases the reservation — no window where the id
+    /// is free while another task still believes it owns the teardown.
+    ///
+    /// Sized for a genuine hang, not a slow start: an image pull, a
+    /// precompiled fetch and a compile all happen inside it, each with its own
+    /// (shorter) bound. It is the backstop for the case none of those catch.
+    ///
+    /// A start cancelled this way may leave plugins bound under the id, since
+    /// it is dropped part-way through binding them. That is the trade: a
+    /// possible leaked binding on a host that is already failing, against an
+    /// id that can never be used again.
+    pub workload_start_timeout: Option<Duration>,
     /// PEM CA bundles to trust for OCI pulls, on top of the compiled-in webpki
     /// roots. Needed to reach a registry behind a private CA — an in-cluster
     /// one, or a corporate mirror.
@@ -1506,6 +1529,10 @@ impl Default for HostConfig {
             precompiled_fetch_timeout: Duration::from_secs(30).into(),
             plugin_lifecycle_timeout: Duration::from_secs(30).into(),
             command_reply_timeout: Duration::from_secs(30).into(),
+            // Five minutes: longer than the pull, fetch and compile bounds it
+            // contains put together, so it only fires on a start that has
+            // genuinely stopped making progress.
+            workload_start_timeout: Duration::from_secs(300).into(),
             oci_ca_paths: Vec::new(),
         }
     }
