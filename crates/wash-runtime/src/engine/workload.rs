@@ -358,19 +358,29 @@ impl WorkloadService {
     }
 
     /// Pre-instantiate the component to prepare for execution.
-    pub fn pre_instantiate(&mut self) -> anyhow::Result<CommandPre<SharedCtx>> {
+    ///
+    /// `Linker::instantiate_pre` is a synchronous typecheck/link step with no
+    /// yield points; run inline on a tokio worker thread it can occupy that
+    /// thread long enough to stall the heartbeat/NATS I/O tasks sharing it
+    /// (the same risk `spawn_blocking` around compilation already guards
+    /// against in `host::mod::workload_start_inner`), so it gets the same
+    /// treatment here.
+    pub async fn pre_instantiate(&mut self) -> anyhow::Result<CommandPre<SharedCtx>> {
         let component = self.metadata.component.clone();
-        let pre = self.metadata.linker.instantiate_pre(&component)?;
+        let linker = self.metadata.linker.clone();
+        let pre = tokio::task::spawn_blocking(move || linker.instantiate_pre(&component)).await??;
         let command = CommandPre::new(pre)?;
         Ok(command)
     }
 
-    /// Pre-instantiate the component for P3 execution.
-    pub fn pre_instantiate_p3(
+    /// Pre-instantiate the component for P3 execution. See
+    /// [`Self::pre_instantiate`] for why this runs on a blocking thread.
+    pub async fn pre_instantiate_p3(
         &mut self,
     ) -> anyhow::Result<wasmtime_wasi::p3::bindings::CommandPre<SharedCtx>> {
         let component = self.metadata.component.clone();
-        let pre = self.metadata.linker.instantiate_pre(&component)?;
+        let linker = self.metadata.linker.clone();
+        let pre = tokio::task::spawn_blocking(move || linker.instantiate_pre(&component)).await??;
         let command = wasmtime_wasi::p3::bindings::CommandPre::new(pre)?;
         Ok(command)
     }
@@ -378,13 +388,13 @@ impl WorkloadService {
     /// Pre-instantiate the raw component, leaving binding-view construction
     /// (e.g. both cli `Command` and http `Service`) to the caller. Used when a
     /// p3 service also serves HTTP and must drive both exports on one instance.
-    pub fn pre_instantiate_raw(
+    /// See [`Self::pre_instantiate`] for why this runs on a blocking thread.
+    pub async fn pre_instantiate_raw(
         &self,
     ) -> anyhow::Result<wasmtime::component::InstancePre<SharedCtx>> {
-        Ok(self
-            .metadata
-            .linker
-            .instantiate_pre(&self.metadata.component)?)
+        let component = self.metadata.component.clone();
+        let linker = self.metadata.linker.clone();
+        Ok(tokio::task::spawn_blocking(move || linker.instantiate_pre(&component)).await??)
     }
 
     /// Whether or not the service is currently running.
@@ -456,16 +466,32 @@ impl WorkloadComponent {
     }
 
     /// Pre-instantiate the component to prepare for instantiation.
-    pub fn pre_instantiate(&mut self) -> wasmtime::Result<InstancePre<SharedCtx>> {
+    ///
+    /// `Linker::instantiate_pre` is a synchronous typecheck/link step with no
+    /// yield points; run inline on a tokio worker thread it can occupy that
+    /// thread long enough to stall whatever else is scheduled on it (see
+    /// `WorkloadService::pre_instantiate` for the fuller rationale), so it
+    /// gets the same `spawn_blocking` treatment here. Most callers hold a
+    /// lock on the component map across this call — that part is unchanged;
+    /// only the CPU-bound work itself moves off the worker thread.
+    pub async fn pre_instantiate(&mut self) -> wasmtime::Result<InstancePre<SharedCtx>> {
         let component = self.metadata.component.clone();
-        self.metadata.linker.instantiate_pre(&component)
+        let linker = self.metadata.linker.clone();
+        tokio::task::spawn_blocking(move || linker.instantiate_pre(&component))
+            .await
+            .map_err(|e| wasmtime::Error::msg(format!("pre-instantiate task panicked: {e}")))?
     }
 
     /// Like [`Self::pre_instantiate`] but without requiring `&mut self`:
     /// `Linker::instantiate_pre` only needs `&self`, so callers holding a read
     /// lock on the component map can pre-instantiate without serializing on a
     /// write lock.
-    pub fn pre_instantiate_ref(&self) -> wasmtime::Result<InstancePre<SharedCtx>> {
+    ///
+    /// Unlike [`Self::pre_instantiate`], this stays synchronous: every caller
+    /// is on the request path (`new_store`, `new_ephemeral_store`), not the
+    /// start path, so `spawn_blocking` here would add a thread hop and a full
+    /// `Linker` clone to every request instead of once at start.
+    pub async fn pre_instantiate_ref(&self) -> wasmtime::Result<InstancePre<SharedCtx>> {
         self.metadata
             .linker
             .instantiate_pre(&self.metadata.component)
@@ -730,7 +756,7 @@ impl ResolvedWorkload {
         let Some(service) = self.service.as_mut() else {
             return Ok(None);
         };
-        let pre = service.pre_instantiate()?;
+        let pre = service.pre_instantiate().await?;
         let mut max_restarts = service.max_restarts;
         self.resolve_service_volume_mounts().await?;
         // Re-borrow immutably after the mutable borrow for pre_instantiate() is done
@@ -766,10 +792,10 @@ impl ResolvedWorkload {
 
     /// Execute a service using P3 (wasi:cli@0.3) CommandPre.
     async fn execute_service_p3(&mut self) -> anyhow::Result<Option<Arc<JoinHandle<()>>>> {
-        let service = self
-            .service
-            .as_mut()
-            .map(|s| (s.pre_instantiate_p3(), s.max_restarts));
+        let service = match self.service.as_mut() {
+            Some(s) => Some((s.pre_instantiate_p3().await, s.max_restarts)),
+            None => None,
+        };
 
         if let Some((Ok(pre), mut max_restarts)) = service {
             self.resolve_service_volume_mounts().await?;
@@ -850,7 +876,7 @@ impl ResolvedWorkload {
         let Some(service) = self.service.as_ref() else {
             return Ok(None);
         };
-        let pre = service.pre_instantiate_raw()?;
+        let pre = service.pre_instantiate_raw().await?;
         let (serves_http, serves_messaging, max_restarts) = (
             crate::engine::exports_wasi_http(&service.metadata.component),
             crate::engine::exports_messaging_handler(&service.metadata.component),
@@ -1295,7 +1321,7 @@ impl ResolvedWorkload {
                     trace!(name = import_name, index = ?instance_idx, "found import at index");
 
                     // Preinstantiate the plugin instance so we can use it later
-                    let pre = plugin_component.pre_instantiate().map_err(|e| {
+                    let pre = plugin_component.pre_instantiate().await.map_err(|e| {
                         e.context("failed to pre-instantiate during component linking")
                     })?;
 
@@ -1560,7 +1586,7 @@ impl ResolvedWorkload {
                     format!("linked component '{linked_id}' not found in workload")
                 })?;
                 linked_templates.push(self.component_ctx_template(&linked.metadata));
-                linked_instances.push((linked_id.clone(), linked.pre_instantiate_ref()?));
+                linked_instances.push((linked_id.clone(), linked.pre_instantiate_ref().await?));
             }
             (
                 metadata.engine().clone(),
@@ -1788,8 +1814,17 @@ impl ResolvedWorkload {
             .get_mut(component_id)
             .context("component ID not found in workload")?;
         let wasmtime_component = component.metadata.component.clone();
-        let linker = component.metadata.linker();
-        let pre = linker.instantiate_pre(&wasmtime_component)?;
+        let linker = component.metadata.linker().clone();
+        // Dropped before the blocking call below, unlike the lock most other
+        // `pre_instantiate*` callers hold across it: nothing else in this fn
+        // needs `components` afterward, so there's no reason to keep every
+        // other reader/writer of the map queued behind a compile-speed link
+        // step that doesn't touch it.
+        drop(components);
+        // See `WorkloadComponent::pre_instantiate` for why this runs on a
+        // blocking thread rather than inline here.
+        let pre = tokio::task::spawn_blocking(move || linker.instantiate_pre(&wasmtime_component))
+            .await??;
 
         Ok(pre)
     }
