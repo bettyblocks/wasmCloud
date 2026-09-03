@@ -264,6 +264,7 @@ mod tests {
             Vec::new(),
             local_resources,
             Arc::default(),
+            None,
             InstancePolicy::Ephemeral,
         )
     }
