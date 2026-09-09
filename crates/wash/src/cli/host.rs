@@ -617,18 +617,29 @@ impl CliCommand for HostCommand {
             load_config::<crate::config::Config>(&ctx.user_config_path(), Some(project_dir), None)
                 .context("failed to load config for wash host")?;
 
-        let scheduler_nats_client = wash_runtime::washlet::connect_nats(
-            self.scheduler_nats_url.clone(),
-            wash_runtime::washlet::NatsConnectionOptions {
-                request_timeout: None,
-                tls_ca: self.scheduler_nats_tls_ca.clone(),
-                tls_first: self.scheduler_nats_tls_first,
-                tls_cert: self.scheduler_nats_tls_cert.clone(),
-                tls_key: self.scheduler_nats_tls_key.clone(),
-            },
-        )
-        .await
-        .context("failed to connect to NATS Scheduler URL")?;
+        // Connected via the control-plane runtime handle, not awaited directly
+        // here on the main one: `connect_nats` spawns the connection's own
+        // read/reconnect loop on whichever runtime is current at connect
+        // time, and that background task is what actually delivers
+        // subscription messages and flushes publishes for this client for as
+        // long as it lives. Connecting it on the main runtime would pin that
+        // task there permanently, leaving it just as starvable by a
+        // `workload.start` burst as if the command loop had never moved off
+        // it. See `washlet::control_plane_handle` for the full rationale.
+        let scheduler_nats_client = wash_runtime::washlet::control_plane_handle()?
+            .spawn(wash_runtime::washlet::connect_nats(
+                self.scheduler_nats_url.clone(),
+                wash_runtime::washlet::NatsConnectionOptions {
+                    request_timeout: None,
+                    tls_ca: self.scheduler_nats_tls_ca.clone(),
+                    tls_first: self.scheduler_nats_tls_first,
+                    tls_cert: self.scheduler_nats_tls_cert.clone(),
+                    tls_key: self.scheduler_nats_tls_key.clone(),
+                },
+            ))
+            .await
+            .context("control-plane runtime task panicked while connecting to NATS")?
+            .context("failed to connect to NATS Scheduler URL")?;
 
         let data_nats_client = wash_runtime::washlet::connect_nats(
             self.data_nats_url.clone(),

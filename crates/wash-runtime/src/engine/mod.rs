@@ -1447,6 +1447,25 @@ impl EngineBuilder {
         // which is what decides when one is acted on.
         config.epoch_interruption(true);
 
+        // Do not hand JIT unwind info (`.eh_frame`) to the system unwinder. On
+        // libunwind, wasmtime registers one FDE per compiled function and
+        // deregisters them one at a time, and libunwind's `__deregister_frame`
+        // rescans its entire global FDE cache on every one of those calls. A
+        // host running hundreds of workloads holds millions of FDEs, so tearing
+        // a single workload down pegs a core for hours inside
+        // `DwarfFDECache::removeAllIn` — silently, since dropping a workload
+        // logs nothing. Only third-party stack capture (a system debugger, the
+        // `backtrace` crate) reads this info; wasmtime's own traps and
+        // `WasmBacktrace` carry their own unwind tables, and a host panic is
+        // caught at the host-call boundary rather than unwound through guest
+        // frames.
+        //
+        // This maps to Cranelift's `unwind_info` setting, which is recorded in
+        // every `.cwasm` and checked when one is loaded, so `wash-precompile`
+        // has to set it the same way and artifacts precompiled with it on have
+        // to be regenerated.
+        config.native_unwind_info(false);
+
         for proposal in &self.proposals {
             proposal.apply(&mut config);
         }
@@ -1763,6 +1782,33 @@ mod tests {
         let raw = wasmtime::Error::msg("expected a WebAssembly component");
         let explained = format!("{:#}", explain_compile_failure(raw, 1024 * 1024));
         assert_eq!(explained, "expected a WebAssembly component");
+    }
+
+    // Registering per-function FDEs with the system unwinder makes workload
+    // teardown quadratic, and the setting is baked into every `.cwasm` and
+    // checked on load, so assert the section is really absent rather than
+    // trusting the flag: a regression here both pegs a core on teardown and
+    // invalidates the precompiled artifacts already in the bucket.
+    #[test]
+    fn compiled_artifacts_carry_no_native_unwind_info() {
+        let wasm = wat::parse_str(
+            r#"(component
+                 (core module $m (func (export "f") (result i32) i32.const 1))
+                 (core instance (instantiate $m))
+               )"#,
+        )
+        .expect("component should parse");
+
+        let engine = Engine::builder().build().expect("engine should build");
+        let cwasm = engine
+            .inner()
+            .precompile_component(&wasm)
+            .expect("component should precompile");
+
+        assert!(
+            !cwasm.windows(b".eh_frame".len()).any(|w| w == b".eh_frame"),
+            "compiled artifact still carries an .eh_frame section"
+        );
     }
 
     // Compiling is parallel unless a host says otherwise, and saying so
