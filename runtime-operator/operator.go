@@ -130,6 +130,15 @@ func NewEmbeddedOperator(
 		cfg.HeartbeatTTL = MinHeartbeatTTL
 	}
 
+	switch {
+	case cfg.HeartbeatTTL <= 0:
+		cfg.HeartbeatTTL = DefaultHeartbeatTTL
+	case cfg.HeartbeatTTL < MinHeartbeatTTL:
+		mgr.GetLogger().Info("HeartbeatTTL raised to the minimum the host heartbeat interval allows",
+			"configured", cfg.HeartbeatTTL, "using", MinHeartbeatTTL)
+		cfg.HeartbeatTTL = MinHeartbeatTTL
+	}
+
 	nc, err := wasmbus.NatsConnect(cfg.NatsURL, cfg.NatsOptions...)
 	if err != nil {
 		return nil, err

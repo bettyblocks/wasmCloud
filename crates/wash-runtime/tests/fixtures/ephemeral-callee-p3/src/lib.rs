@@ -8,17 +8,39 @@ mod bindings {
         generate_all,
         async: [
             "export:wasmcloud:ephemeral-test/compute@0.1.0#run",
+            "export:wasmcloud:ephemeral-test/compute@0.1.0#calls",
         ],
     });
 }
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use bindings::exports::wasmcloud::ephemeral_test::compute::Guest;
+
+/// Lives in this instance's linear memory, so it starts at zero in every new
+/// instance and survives only for as long as the instance does.
+static CALLS: AtomicU32 = AtomicU32::new(0);
 
 struct Component;
 
 impl Guest for Component {
     async fn run(n: u32) -> u32 {
+        // `run(0)` wedges: a loop that never yields, unreachable by any
+        // host-side timeout (those are futures on this store, and this poll
+        // never returns). Only the epoch deadline compiled into the loop's
+        // back-edge can end it. A magic argument rather than a separate
+        // function so the WIT (vendored into both fixtures) stays unchanged.
+        if n == 0 {
+            let mut x: u64 = 0;
+            loop {
+                x = std::hint::black_box(x.wrapping_add(1));
+            }
+        }
         n.wrapping_mul(2).wrapping_add(1)
+    }
+
+    async fn calls() -> u32 {
+        CALLS.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
 

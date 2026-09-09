@@ -98,6 +98,51 @@ type LocalResources struct {
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:items:Pattern=`^\*$|^([A-Za-z][A-Za-z0-9+.-]*://)(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*(:[0-9]{1,5})?/?$|^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*(:[0-9]{1,5})?$`
 	AllowedHosts []string `json:"allowedHosts,omitempty"`
+	// AllowedIPNameLookups is the set of names this component may resolve
+	// through wasi:sockets/ip-name-lookup (resolve-addresses).
+	//
+	// Each entry must match one of:
+	//   - "*"                (resolve any name)
+	//   - "*.suffix"         e.g. "*.wasmcloud.io"
+	//   - "host"             e.g. "api.wasmcloud.io"
+	//   - a literal IP address, e.g. "10.0.0.1" or "::1"
+	//
+	// A name is not a URL: entries must not carry a scheme, port, path,
+	// query string, or fragment. The wildcard must be "*.<rest>" with a
+	// leading dot; a bare "*foo" is rejected.
+	//
+	// Empty or absent allowedIpNameLookups denies every lookup, reported to
+	// the component as permanent-resolver-failure. To resolve any name,
+	// set allowedIpNameLookups: ["*"] explicitly. Resolution is granted
+	// separately from allowedHosts, which governs outbound connections
+	// rather than name lookups. Final validation runs in the runtime.
+	// This regex is an admission-time guard, not the source of truth.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:items:Pattern=`^\*$|^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$|^[0-9A-Fa-f:.]+$`
+	AllowedIPNameLookups []string `json:"allowedIpNameLookups,omitempty"`
+	// AllowedHostLoopbackPorts lists ports on the machine's own loopback this
+	// component may reach through the reserved name
+	// `host.wasmcloud.internal`.
+	//
+	// Each entry is a port with an optional protocol:
+	//   - "5432"      TCP port 5432 (the default)
+	//   - "5432/tcp"  TCP port 5432
+	//   - "53/udp"    UDP port 53
+	//
+	// Deliberately narrow: no ranges, no wildcards, no names. Reaching the
+	// host's own loopback is the most privileged grant here, and the set of
+	// local ports a component legitimately needs is small and knowable.
+	//
+	// An empty or absent list denies every host-loopback connection. A
+	// non-empty list is still inert unless the host itself runs with
+	// --allow-host-loopback, so neither the workload author nor the operator
+	// can open this door alone. Note that "127.0.0.1" keeps meaning the
+	// workload's own virtual loopback; only the reserved name reaches the
+	// machine. Final validation runs in the runtime. This regex is an
+	// admission-time guard, not the source of truth.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:items:Pattern=`^[0-9]{1,5}(/(tcp|udp|TCP|UDP))?$`
+	AllowedHostLoopbackPorts []string `json:"allowedHostLoopbackPorts,omitempty"`
 }
 
 // WorkloadComponent represents a component of a workload.
@@ -115,10 +160,44 @@ type WorkloadComponent struct {
 	ImagePullSecret *corev1.LocalObjectReference `json:"imagePullSecret,omitempty"`
 	// +kubebuilder:validation:Optional
 	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
+	// PoolSize is how many instances of this component are kept warm between
+	// calls. Unset means none are: every call gets a fresh instance, and the
+	// component's state stays ephemeral.
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
 	PoolSize int32 `json:"poolSize,omitempty"`
+	// MaxInvocations retires a warm instance once it has served this many
+	// calls, and a fresh one takes its place. Unset means an instance serves
+	// calls indefinitely. Only meaningful alongside PoolSize.
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
 	MaxInvocations int32 `json:"maxInvocations,omitempty"`
+	// MaxConcurrency is how many calls one warm instance may serve at the same
+	// time. Unset means one, which is what a component gets without asking.
+	// Raising it lets an instance overlap calls while it awaits I/O, and is
+	// only safe for a guest that yields rather than blocks. Only meaningful
+	// alongside PoolSize.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	MaxConcurrency int32 `json:"maxConcurrency,omitempty"`
+	// ReclaimWindowSeconds is how long the pool watches its own peak
+	// concurrency before retiring the warm instances that peak did not need.
+	// A pool grows to PoolSize under load and, unset, stays there, so a
+	// spike's high-water mark outlives the spike. Set this and the pool
+	// sweeps every window, keeps the instances its measured peak actually
+	// needed and drains the rest. Unset means warm instances are never
+	// reclaimed for idleness. Only meaningful alongside PoolSize.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	ReclaimWindowSeconds int32 `json:"reclaimWindowSeconds,omitempty"`
+	// ReclaimMinInstances is how many warm instances an idle sweep never
+	// retires below. Unset lets a fully idle pool empty out, so the next call
+	// after a quiet spell starts cold. Capped at PoolSize. This is a floor on
+	// reclaim, not a target to grow to: instances are still only built when a
+	// call needs one. Only meaningful alongside ReclaimWindowSeconds.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	ReclaimMinInstances int32 `json:"reclaimMinInstances,omitempty"`
 	// +kubebuilder:validation:Optional
 	LocalResources *LocalResources `json:"localResources,omitempty"`
 	// PrecompiledURL is the URL of a precompiled .cwasm for this component.
@@ -369,7 +448,7 @@ type WorkloadStatus struct {
 // +kubebuilder:printcolumn:name="READY",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="AGE",type="date",JSONPath=".metadata.creationTimestamp"
 
-// Workload is the Schema for the artifacts API.
+// Workload defines a set of WebAssembly components and services to run on wasmCloud hosts, with the configuration, volumes, and host interfaces they use.
 type Workload struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

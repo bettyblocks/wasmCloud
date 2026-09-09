@@ -27,7 +27,7 @@ use wash_runtime::{
     },
     host::{
         HostApi, HostBuilder,
-        http::{DevRouter, HttpServer},
+        http::{DevRouter, Ingress},
     },
     plugin::{
         HostPlugin, WitInterfaces, wasi_config::DynamicConfig, wasi_keyvalue::InMemoryKeyValue,
@@ -164,8 +164,8 @@ async fn test_inter_component_call() -> Result<()> {
     let engine = Engine::builder().build()?;
 
     // Create HTTP server plugin on a dynamically allocated port
-    let http_plugin = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
-    let addr = http_plugin.addr();
+    let ingress = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
+    let addr = ingress.addr();
 
     // Create keyvalue plugin for counter persistence (still using built-in)
     let keyvalue_plugin = InMemoryKeyValue::new();
@@ -180,7 +180,7 @@ async fn test_inter_component_call() -> Result<()> {
     // We'll use the blobstore-filesystem component instead
     let host = HostBuilder::new()
         .with_engine(engine.clone())
-        .with_http_handler(Arc::new(http_plugin))
+        .with_http_handler(Arc::new(ingress))
         .with_plugin(Arc::new(keyvalue_plugin))?
         .with_plugin(Arc::new(logging_plugin))?
         .with_plugin(Arc::new(config_plugin))?
@@ -208,12 +208,17 @@ async fn test_inter_component_call() -> Result<()> {
                         environment: HashMap::new(),
                         volume_mounts: vec![],
                         allowed_hosts: Default::default(),
+                        allowed_ip_name_lookups: Default::default(),
+                        allowed_host_loopback_ports: Default::default(),
                     },
                     pool_size: 1,
                     max_invocations: 100,
                     source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
                         CALLER_WASM,
                     )),
+                    max_concurrency: 1,
+                    reclaim_window_seconds: 0,
+                    reclaim_min_instances: 0,
                 },
                 Component {
                     name: "middleware".to_string(),
@@ -225,12 +230,17 @@ async fn test_inter_component_call() -> Result<()> {
                         environment: HashMap::new(),
                         volume_mounts: vec![],
                         allowed_hosts: Default::default(),
+                        allowed_ip_name_lookups: Default::default(),
+                        allowed_host_loopback_ports: Default::default(),
                     },
                     pool_size: 2,
                     max_invocations: 100,
                     source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
                         MIDDLEWARE_WASM,
                     )),
+                    max_concurrency: 1,
+                    reclaim_window_seconds: 0,
+                    reclaim_min_instances: 0,
                 },
                 Component {
                     name: "callee".to_string(),
@@ -242,12 +252,17 @@ async fn test_inter_component_call() -> Result<()> {
                         environment: HashMap::new(),
                         volume_mounts: vec![],
                         allowed_hosts: Default::default(),
+                        allowed_ip_name_lookups: Default::default(),
+                        allowed_host_loopback_ports: Default::default(),
                     },
                     pool_size: 2,
                     max_invocations: 100,
                     source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
                         CALLEE_WASM,
                     )),
+                    max_concurrency: 1,
+                    reclaim_window_seconds: 0,
+                    reclaim_min_instances: 0,
                 },
             ],
             host_interfaces: vec![

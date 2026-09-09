@@ -43,6 +43,8 @@ fn echo_client_workload_request(
                     environment: HashMap::from([("ECHO_ADDR".to_string(), echo_addr.to_string())]),
                     volume_mounts: vec![],
                     allowed_hosts: Default::default(),
+                    allowed_ip_name_lookups: Default::default(),
+                    allowed_host_loopback_ports: Default::default(),
                 },
                 max_restarts: 0,
             }),

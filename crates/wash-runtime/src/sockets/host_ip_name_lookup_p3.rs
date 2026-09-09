@@ -3,6 +3,7 @@
 use super::WasiSocketsCtxView;
 use crate::sockets::WasiSockets;
 use crate::sockets::util::{from_ipv4_addr, from_ipv6_addr, parse_host};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use wasmtime::component::Accessor;
 use wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::{Host, HostWithStore};
@@ -13,13 +14,30 @@ impl<U> HostWithStore<U> for WasiSockets {
         store: &Accessor<U, Self>,
         name: String,
     ) -> wasmtime::Result<Result<Vec<types::IpAddress>, ErrorCode>> {
+        // The reserved zone answers before `allowedIpNameLookups` and before any
+        // resolver — see [`crate::sockets::internal_names`]. Ahead of the parse,
+        // too: these are host-internal names, not names a resolver would ever
+        // see, so `parse_host`'s opinion of them is irrelevant.
+        if let Some(internal) = crate::sockets::internal_names::resolve(&name) {
+            return Ok(match internal {
+                Ok(internal) => Ok(vec![internal.address().into()]),
+                Err(_) => Err(ErrorCode::NameUnresolvable),
+            });
+        }
+
         // Mirror the ordering of the upstream wasmtime implementation: parse the
         // name before consulting the capability so a malformed name reports
         // `InvalidArgument` regardless of whether lookups are permitted.
         let Ok(host) = parse_host(&name) else {
             return Ok(Err(ErrorCode::InvalidArgument));
         };
-        if !store.with(|mut view| view.get().ctx.allowed_network_uses.ip_name_lookup) {
+        let allowed = store.with(|mut view| {
+            crate::host::allowed_ip_name::check_allowed_ip_name(
+                &view.get().ctx.allowed_ip_name_lookups,
+                &host,
+            )
+        });
+        if !allowed {
             return Ok(Err(ErrorCode::PermanentResolverFailure));
         }
         Ok(resolve(host).await)
@@ -38,6 +56,12 @@ async fn resolve(host: url::Host) -> Result<Vec<types::IpAddress>, ErrorCode> {
         url::Host::Ipv4(addr) => Ok(vec![types::IpAddress::Ipv4(from_ipv4_addr(addr))]),
         url::Host::Ipv6(addr) => Ok(vec![types::IpAddress::Ipv6(from_ipv6_addr(addr))]),
         url::Host::Domain(domain) => {
+            if domain.ends_with(".localhost") && domain != "localhost" {
+                return Ok(vec![
+                    types::IpAddress::Ipv4(from_ipv4_addr(Ipv4Addr::LOCALHOST)),
+                    types::IpAddress::Ipv6(from_ipv6_addr(Ipv6Addr::LOCALHOST)),
+                ]);
+            }
             // Only names are resolved here, not ports, so force the port to 0.
             let addrs = tokio::net::lookup_host((domain.as_str(), 0))
                 .await

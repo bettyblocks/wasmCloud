@@ -247,7 +247,7 @@ impl types::Host for WasiSocketsCtxView<'_> {
     }
 }
 
-impl<T> HostTcpSocketWithStore<T> for WasiSockets {
+impl<T: Send> HostTcpSocketWithStore<T> for WasiSockets {
     async fn connect(
         store: &Accessor<T, Self>,
         socket: Resource<UpstreamTcpSocket>,
@@ -257,11 +257,15 @@ impl<T> HostTcpSocketWithStore<T> for WasiSockets {
 
         // Check if address is allowed
         let check = store.with(|mut view| view.get().ctx.socket_addr_check.clone());
-        if !check(remote_address, SocketAddrUse::TcpConnect).await {
-            return Err(types::ErrorCode::AccessDenied.into());
-        }
+        let allowed = check(remote_address, SocketAddrUse::TcpConnect)
+            .await
+            .into_allowed()
+            .map_err(se)?;
+        let remote_address = allowed.addr;
 
         // Start connect
+        let plane = allowed.plane;
+        let mut permit = allowed.permit;
         let connecting = store.with(|mut store| {
             let view = store.get();
             let socket_ref = get_socket_mut(view.table, &socket)?;
@@ -271,8 +275,11 @@ impl<T> HostTcpSocketWithStore<T> for WasiSockets {
                 .lock()
                 .map_err(|e| SocketError::trap(wasmtime::format_err!("{e}")))?;
             let connecting = socket_ref
-                .start_connect(&remote_address, &mut loopback)
+                .start_connect(&remote_address, plane, &mut loopback)
                 .map_err(se)?;
+            // Held until the guest drops the socket, so the budget bounds
+            // concurrent connections rather than counting attempts.
+            socket_ref.hold_quota_slot(permit.take());
             SocketResult::Ok(connecting)
         })?;
 
@@ -293,11 +300,31 @@ impl<T> HostTcpSocketWithStore<T> for WasiSockets {
         })
     }
 
-    fn listen(
+    async fn listen(
         mut store: Access<'_, T, Self>,
         socket: Resource<UpstreamTcpSocket>,
     ) -> SocketResult<StreamReader<Resource<UpstreamTcpSocket>>> {
         let getter = store.getter();
+
+        // A socket that has not been explicitly bound implicitly binds to an
+        // ephemeral port during `listen`. Run the host's `socket_addr_check`
+        // against that implicit bind address first — the same check `bind`
+        // performs — so `listen` cannot be used to bind to an address the
+        // network policy would otherwise deny. (bytecodealliance/wasmtime#13677)
+        let implicit_addr = {
+            let view = store.get();
+            let socket_ref = get_socket_mut(view.table, &socket)?;
+            socket_ref
+                .needs_implicit_bind()
+                .then(|| crate::sockets::util::implicit_bind_addr(socket_ref.address_family()))
+        };
+        if let Some(addr) = implicit_addr {
+            let check = store.get().ctx.socket_addr_check.clone();
+            check(addr, SocketAddrUse::TcpBind)
+                .await
+                .into_allowed()
+                .map_err(se)?;
+        }
 
         // Scope: do the listen and extract info
         enum ListenKind {
@@ -490,9 +517,11 @@ impl HostTcpSocket for WasiSocketsCtxView<'_> {
         local_address: IpSocketAddress,
     ) -> SocketResult<()> {
         let local_address = SocketAddr::from(local_address);
-        if !(self.ctx.socket_addr_check)(local_address, SocketAddrUse::TcpBind).await {
-            return Err(types::ErrorCode::AccessDenied.into());
-        }
+        let local_address = (self.ctx.socket_addr_check)(local_address, SocketAddrUse::TcpBind)
+            .await
+            .into_allowed()
+            .map_err(se)?
+            .addr;
         let mut loopback = self
             .ctx
             .loopback

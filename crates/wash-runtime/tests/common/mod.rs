@@ -10,19 +10,27 @@
 #[cfg(feature = "wasi-tls")]
 pub mod tls;
 
+#[cfg(feature = "wasmcloud-postgres")]
+pub mod postgres;
+
+pub mod streaming;
+
 use anyhow::{Context, Result};
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use tokio::time::timeout;
 
+#[cfg(feature = "host-component-plugins")]
+use wash_runtime::plugin::component_host::ComponentHostPlugin;
 use wash_runtime::{
     engine::Engine,
     host::{
         HostApi, HostBuilder,
-        http::{DevRouter, DynamicRouter, HttpServer, TlsConfig},
+        http::{DevRouter, DynamicRouter, Ingress, TlsConfig},
     },
     plugin::{
         wasi_blobstore::InMemoryBlobstore, wasi_config::DynamicConfig,
         wasi_keyvalue::InMemoryKeyValue, wasi_logging::TracingLogger,
+        wasmcloud_secrets::WasmcloudSecrets,
     },
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
     wit::WitInterface,
@@ -125,6 +133,72 @@ pub fn http_only_host_interfaces(host_header: &str) -> Vec<WitInterface> {
     vec![http_incoming_handler_interface(host_header, None)]
 }
 
+/// The bespoke `acme:kv/store@0.1.0` capability, provided by the `kv-plugin`
+/// host component plugin.
+#[cfg(feature = "host-component-plugins")]
+pub fn acme_kv_interface() -> WitInterface {
+    WitInterface {
+        namespace: "acme".to_string(),
+        package: "kv".to_string(),
+        interfaces: ["store".to_string()].into_iter().collect(),
+        version: Some(semver::Version::parse("0.1.0").unwrap()),
+        config: HashMap::new(),
+        name: None,
+    }
+}
+
+/// Interfaces for the `kv-plugin-caller` workload: HTTP ingress plus the imported
+/// `acme:kv/store` capability the host component plugin satisfies.
+#[cfg(feature = "host-component-plugins")]
+pub fn kv_plugin_caller_host_interfaces(host_header: &str) -> Vec<WitInterface> {
+    kv_plugin_caller_host_interfaces_with_config(host_header, HashMap::new())
+}
+
+/// Like [`kv_plugin_caller_host_interfaces`] but carrying interface-level
+/// config on the `acme:kv` entry — delivered to a lifecycle-exporting plugin's
+/// `on-workload-bind`.
+#[cfg(feature = "host-component-plugins")]
+pub fn kv_plugin_caller_host_interfaces_with_config(
+    host_header: &str,
+    config: HashMap<String, String>,
+) -> Vec<WitInterface> {
+    vec![
+        http_incoming_handler_interface(host_header, None),
+        WitInterface {
+            config,
+            ..acme_kv_interface()
+        },
+    ]
+}
+
+/// The `wasmcloud:secrets` capability (store + reveal), served by the native
+/// `wasmcloud-secrets` plugin.
+pub fn secrets_interface(config: HashMap<String, String>) -> WitInterface {
+    WitInterface {
+        namespace: "wasmcloud".to_string(),
+        package: "secrets".to_string(),
+        interfaces: ["store".to_string(), "reveal".to_string()]
+            .into_iter()
+            .collect(),
+        version: Some(semver::Version::parse("2.1.0").unwrap()),
+        config,
+        name: None,
+    }
+}
+
+/// Interfaces for the `secrets-caller` workload: HTTP ingress plus the imported
+/// `wasmcloud:secrets` capability, carrying the credentials as interface config —
+/// which the secrets plugin captures in its `on-workload-bind`.
+pub fn secrets_caller_host_interfaces_with_config(
+    host_header: &str,
+    config: HashMap<String, String>,
+) -> Vec<WitInterface> {
+    vec![
+        http_incoming_handler_interface(host_header, None),
+        secrets_interface(config),
+    ]
+}
+
 /// Interfaces for P3 HTTP + blobstore components.
 pub fn http_blobstore_host_interfaces(host_header: &str) -> Vec<WitInterface> {
     vec![
@@ -194,6 +268,9 @@ pub fn component_workload_request(
                 source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(wasm)),
                 pool_size: 1,
                 max_invocations: 100,
+                max_concurrency: 1,
+                reclaim_window_seconds: 0,
+                reclaim_min_instances: 0,
             }],
             host_interfaces,
             volumes: vec![],
@@ -212,6 +289,8 @@ pub fn default_counter_resources() -> LocalResources {
         environment: HashMap::new(),
         volume_mounts: vec![],
         allowed_hosts: vec!["example.com".parse().unwrap()].into(),
+        allowed_ip_name_lookups: Default::default(),
+        allowed_host_loopback_ports: Default::default(),
     }
 }
 
@@ -224,7 +303,8 @@ fn with_standard_plugins(
         .with_plugin(Arc::new(InMemoryBlobstore::new(None)))?
         .with_plugin(Arc::new(InMemoryKeyValue::new()))?
         .with_plugin(Arc::new(TracingLogger::default()))?
-        .with_plugin(Arc::new(DynamicConfig::default()))
+        .with_plugin(Arc::new(DynamicConfig::default()))?
+        .with_plugin(Arc::new(WasmcloudSecrets::new()))
 }
 
 /// Start a host with a "DevRouter" backed HTTP server and the standard plugin
@@ -233,12 +313,12 @@ pub async fn start_host_with_dev_router(
     addr: &str,
 ) -> Result<(std::net::SocketAddr, impl HostApi)> {
     let engine = Engine::builder().build()?;
-    let http_server = HttpServer::new(DevRouter::default(), addr.parse()?).await?;
-    let bound_addr = http_server.addr();
+    let ingress = Ingress::new(DevRouter::default(), addr.parse()?).await?;
+    let bound_addr = ingress.addr();
     let host = with_standard_plugins(
         HostBuilder::new()
             .with_engine(engine)
-            .with_http_handler(Arc::new(http_server)),
+            .with_http_handler(Arc::new(ingress)),
     )?
     .build()?;
     let host = host.start().await.context("Failed to start host")?;
@@ -251,12 +331,12 @@ pub async fn start_host_with_dynamic_router(
     addr: &str,
 ) -> Result<(std::net::SocketAddr, impl HostApi)> {
     let engine = Engine::builder().build()?;
-    let http_server = HttpServer::new(DynamicRouter::default(), addr.parse()?).await?;
-    let bound_addr = http_server.addr();
+    let ingress = Ingress::new(DynamicRouter::default(), addr.parse()?).await?;
+    let bound_addr = ingress.addr();
     let host = with_standard_plugins(
         HostBuilder::new()
             .with_engine(engine)
-            .with_http_handler(Arc::new(http_server)),
+            .with_http_handler(Arc::new(ingress)),
     )?
     .build()?;
     let host = host.start().await.context("Failed to start host")?;
@@ -271,17 +351,17 @@ pub async fn start_host_with_tls(
     key_path: &Path,
 ) -> Result<(std::net::SocketAddr, impl HostApi)> {
     let engine = Engine::builder().build()?;
-    let http_server = HttpServer::new_with_tls(
+    let ingress = Ingress::new_with_tls(
         DevRouter::default(),
         "127.0.0.1:0".parse()?,
         TlsConfig::new(cert_path, key_path),
     )
     .await?;
-    let bound_addr = http_server.addr();
+    let bound_addr = ingress.addr();
     let host = with_standard_plugins(
         HostBuilder::new()
             .with_engine(engine)
-            .with_http_handler(Arc::new(http_server)),
+            .with_http_handler(Arc::new(ingress)),
     )?
     .build()?;
     let host = host.start().await.context("Failed to start host")?;
@@ -290,14 +370,16 @@ pub async fn start_host_with_tls(
 
 /// Start a host with `wasip3` enabled on the engine, a `DevRouter` backed
 /// HTTP server, and the standard plugin set.
-pub async fn start_host_with_p3(addr: &str) -> Result<(std::net::SocketAddr, impl HostApi)> {
+pub async fn start_host_with_p3_http_handler(
+    addr: &str,
+) -> Result<(std::net::SocketAddr, impl HostApi)> {
     let engine = Engine::builder().build()?;
-    let http_server = HttpServer::new(DevRouter::default(), addr.parse()?).await?;
-    let bound_addr = http_server.addr();
+    let ingress = Ingress::new(DevRouter::default(), addr.parse()?).await?;
+    let bound_addr = ingress.addr();
     let host = with_standard_plugins(
         HostBuilder::new()
             .with_engine(engine)
-            .with_http_handler(Arc::new(http_server)),
+            .with_http_handler(Arc::new(ingress)),
     )?
     .build()?;
     let host = host.start().await.context("Failed to start host")?;
@@ -316,7 +398,7 @@ pub async fn start_host_with_p3_cancellable(
     use wash_runtime::plugin::cancellable_jobs::CancellableJobsPlugin;
 
     let engine = Engine::builder().build()?;
-    let http_server = HttpServer::new(DevRouter::default(), addr.parse()?).await?;
+    let http_server = Ingress::new(DevRouter::default(), addr.parse()?).await?;
     let bound_addr = http_server.addr();
     let host = with_standard_plugins(
         HostBuilder::new()
@@ -348,7 +430,7 @@ pub async fn start_host_with_p3_cancellation_broker(
         .context("failed to connect host plugin client to NATS")?;
 
     let engine = Engine::builder().build()?;
-    let http_server = HttpServer::new(DevRouter::default(), addr.parse()?).await?;
+    let http_server = Ingress::new(DevRouter::default(), addr.parse()?).await?;
     let bound_addr = http_server.addr();
     let host = with_standard_plugins(
         HostBuilder::new()
@@ -359,6 +441,135 @@ pub async fn start_host_with_p3_cancellation_broker(
     .build()?;
     let host = host.start().await.context("Failed to start host")?;
     Ok((bound_addr, host))
+}
+
+/// Start a p3 host with the standard plugin set plus a [`ComponentHostPlugin`]
+/// built from `plugin_wasm`, routed by `router`, with `max_restarts` overriding
+/// the plugin's supervision budget when given. The named wrappers below cover
+/// the common shapes.
+#[cfg(feature = "host-component-plugins")]
+async fn start_host_with_component_plugin_router(
+    addr: &str,
+    router: impl wash_runtime::host::http::Router,
+    plugin_id: &'static str,
+    plugin_wasm: &'static [u8],
+    max_restarts: Option<u32>,
+) -> Result<(std::net::SocketAddr, impl HostApi)> {
+    let engine = Engine::builder().build()?;
+    let ingress = Ingress::new(router, addr.parse()?).await?;
+    let bound_addr = ingress.addr();
+    let builder = with_standard_plugins(
+        HostBuilder::new()
+            .with_engine(engine.clone())
+            .with_http_handler(Arc::new(ingress)),
+    )?;
+    let native_plugins = builder.native_plugins();
+    let http_handler = builder.http_handler();
+    let mut plugin = ComponentHostPlugin::builder()
+        .id(plugin_id)
+        .wasm(plugin_wasm)
+        .engine(engine.clone())
+        .native_plugins(native_plugins)
+        .maybe_http_handler(http_handler)
+        .build()
+        .await
+        .context("failed to build host component plugin")?;
+    if let Some(max_restarts) = max_restarts {
+        plugin = plugin.with_max_restarts(max_restarts);
+    }
+    let host = builder.with_plugin(Arc::new(plugin))?.build()?;
+    let host = host.start().await.context("Failed to start host")?;
+    Ok((bound_addr, host))
+}
+
+/// Start a p3 host with the standard plugin set plus a [`ComponentHostPlugin`]
+/// built from `plugin_wasm` (a host component plugin exporting a capability).
+/// Used to test workloads that import a component-provided host capability.
+#[cfg(feature = "host-component-plugins")]
+pub async fn start_host_with_component_plugin(
+    addr: &str,
+    plugin_id: &'static str,
+    plugin_wasm: &'static [u8],
+) -> Result<(std::net::SocketAddr, impl HostApi)> {
+    start_host_with_component_plugin_router(
+        addr,
+        DevRouter::default(),
+        plugin_id,
+        plugin_wasm,
+        None,
+    )
+    .await
+}
+
+/// Like [`start_host_with_component_plugin`] but with a `DynamicRouter` that
+/// routes by `Host` header — so distinct workloads are reachable individually
+/// (the `DevRouter` sends every request to the last-resolved workload). Needed
+/// to test per-caller behavior across genuinely separate workloads.
+#[cfg(feature = "host-component-plugins")]
+pub async fn start_host_with_component_plugin_by_host(
+    addr: &str,
+    plugin_id: &'static str,
+    plugin_wasm: &'static [u8],
+) -> Result<(std::net::SocketAddr, impl HostApi)> {
+    start_host_with_component_plugin_router(
+        addr,
+        DynamicRouter::default(),
+        plugin_id,
+        plugin_wasm,
+        None,
+    )
+    .await
+}
+
+/// Like [`start_host_with_component_plugin`] but overriding the plugin's
+/// supervision restart budget — for tests that exhaust it.
+#[cfg(feature = "host-component-plugins")]
+pub async fn start_host_with_component_plugin_max_restarts(
+    addr: &str,
+    plugin_id: &'static str,
+    plugin_wasm: &'static [u8],
+    max_restarts: u32,
+) -> Result<(std::net::SocketAddr, impl HostApi)> {
+    start_host_with_component_plugin_router(
+        addr,
+        DevRouter::default(),
+        plugin_id,
+        plugin_wasm,
+        Some(max_restarts),
+    )
+    .await
+}
+
+/// Like [`start_host_with_p3_http_handler`] but also returns the [`Ingress`], so a test can
+/// drive host-side ingress hooks directly (e.g. deliver a message to a trigger service's
+/// messaging handler via `deliver_trigger_service_message`).
+pub async fn start_host_with_p3_handler(
+    addr: &str,
+) -> Result<(std::net::SocketAddr, impl HostApi, Arc<Ingress<DevRouter>>)> {
+    let engine = Engine::builder().build()?;
+    let ingress = Arc::new(Ingress::new(DevRouter::default(), addr.parse()?).await?);
+    let bound_addr = ingress.addr();
+    let host = with_standard_plugins(
+        HostBuilder::new()
+            .with_engine(engine)
+            .with_http_handler(ingress.clone()),
+    )?
+    .build()?;
+    let host = host.start().await.context("Failed to start host")?;
+    Ok((bound_addr, host, ingress))
+}
+
+/// Extract the numeric value of `"name":N` from a flat JSON body without
+/// pulling in a JSON dependency. Panics (failing the test) if the field is
+/// missing or non-numeric.
+pub fn json_u64_field(body: &str, name: &str) -> u64 {
+    let key = format!("\"{name}\":");
+    let start = body.find(&key).expect("field present in body") + key.len();
+    let rest = &body[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().expect("numeric field")
 }
 
 /// GET `http://{addr}/` with the given `HOST` header and a 10s timeout.
@@ -398,5 +609,28 @@ pub async fn get_status_and_body(
     .context("request failed")?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
+    Ok((status, body))
+}
+
+/// Like `get_status_and_body`, but against an arbitrary `path` instead of
+/// always `/` — for tests whose routing is on the path (e.g. `/get?key=…`),
+/// not just the `HOST` header.
+pub async fn req(
+    client: &reqwest::Client,
+    addr: &std::net::SocketAddr,
+    host: &str,
+    path: &str,
+) -> Result<(reqwest::StatusCode, String)> {
+    let resp = timeout(
+        Duration::from_secs(15),
+        client
+            .get(format!("http://{addr}{path}"))
+            .header("HOST", host)
+            .send(),
+    )
+    .await
+    .context("request timed out")??;
+    let status = resp.status();
+    let body = resp.text().await?;
     Ok((status, body))
 }

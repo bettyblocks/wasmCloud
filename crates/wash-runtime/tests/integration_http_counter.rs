@@ -50,6 +50,8 @@ async fn test_http_counter_integration() -> Result<()> {
             volume_mounts: vec![],
             // http-counter calls example.com
             allowed_hosts: vec!["example.com".parse().unwrap()].into(),
+            allowed_ip_name_lookups: Default::default(),
+            allowed_host_loopback_ports: Default::default(),
         },
     );
 
