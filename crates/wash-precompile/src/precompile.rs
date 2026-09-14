@@ -11,7 +11,8 @@ pub fn compile(wasm_bytes: &[u8]) -> Result<Vec<u8>> {
     // setting, which is recorded in the `.cwasm` and checked when the host
     // loads it, so the two have to agree or every artifact this produces is
     // refused as "incompatible with native host".
-    config.native_unwind_info(false);
+
+    // disabled, need for musl build: config.native_unwind_info(false);
     #[cfg(feature = "epoch-interruption")]
     config.epoch_interruption(true);
 

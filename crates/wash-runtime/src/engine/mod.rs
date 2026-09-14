@@ -1464,7 +1464,7 @@ impl EngineBuilder {
         // every `.cwasm` and checked when one is loaded, so `wash-precompile`
         // has to set it the same way and artifacts precompiled with it on have
         // to be regenerated.
-        config.native_unwind_info(false);
+        // disabled, need for musl build: config.native_unwind_info(false);
 
         for proposal in &self.proposals {
             proposal.apply(&mut config);
