@@ -5,14 +5,10 @@ pub fn compile(wasm_bytes: &[u8]) -> Result<Vec<u8>> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     // Keep in lockstep with the host's engine builder
-    // (`wash_runtime::engine::Engine::builder`), which explains why the system
-    // unwinder is left out of this: registering per-function FDEs makes
-    // workload teardown quadratic. This maps to Cranelift's `unwind_info`
-    // setting, which is recorded in the `.cwasm` and checked when the host
-    // loads it, so the two have to agree or every artifact this produces is
-    // refused as "incompatible with native host".
-
-    // disabled, need for musl build: config.native_unwind_info(false);
+    // On musl the system unwinder is left out:
+    // registering per-function FDEs makes workload teardown quadratic there.
+    #[cfg(target_env = "musl")]
+    config.native_unwind_info(false);
     #[cfg(feature = "epoch-interruption")]
     config.epoch_interruption(true);
 
@@ -30,7 +26,8 @@ mod tests {
 
     // The host refuses an artifact whose `unwind_info` setting differs from its
     // own, so this asserts the section is really gone rather than trusting the
-    // flag — the two crates have to stay in lockstep.
+    // flag — the two crates have to stay in lockstep. Only musl disables it.
+    #[cfg(target_env = "musl")]
     #[test]
     fn precompiled_artifacts_carry_no_native_unwind_info() {
         let wasm = wat::parse_str(
