@@ -1448,7 +1448,7 @@ impl EngineBuilder {
         config.epoch_interruption(true);
 
         // Do not hand JIT unwind info (`.eh_frame`) to the system unwinder. On
-        // libunwind, wasmtime registers one FDE per compiled function and
+        // musl's libunwind, wasmtime registers one FDE per compiled function and
         // deregisters them one at a time, and libunwind's `__deregister_frame`
         // rescans its entire global FDE cache on every one of those calls. A
         // host running hundreds of workloads holds millions of FDEs, so tearing
@@ -1462,8 +1462,9 @@ impl EngineBuilder {
         //
         // This maps to Cranelift's `unwind_info` setting, which is recorded in
         // every `.cwasm` and checked when one is loaded, so `wash-precompile`
-        // has to set it the same way and artifacts precompiled with it on have
-        // to be regenerated.
+        // has to set it the same way per target and artifacts precompiled with
+        // it on have to be regenerated.
+        #[cfg(target_env = "musl")]
         config.native_unwind_info(false);
 
         for proposal in &self.proposals {
@@ -1788,7 +1789,9 @@ mod tests {
     // teardown quadratic, and the setting is baked into every `.cwasm` and
     // checked on load, so assert the section is really absent rather than
     // trusting the flag: a regression here both pegs a core on teardown and
-    // invalidates the precompiled artifacts already in the bucket.
+    // invalidates the precompiled artifacts already in the bucket. Only musl
+    // disables it.
+    #[cfg(target_env = "musl")]
     #[test]
     fn compiled_artifacts_carry_no_native_unwind_info() {
         let wasm = wat::parse_str(
