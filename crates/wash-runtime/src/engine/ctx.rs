@@ -91,6 +91,16 @@ pub struct SharedCtx {
     /// here is what makes the release exact: dropping the store drops this and
     /// hands the bytes back.
     pub memory_limiter: crate::engine::guest_memory::StoreMemoryLimiter,
+    /// Whether this store outlives the call running on it — a service store or
+    /// a pooled instance — as opposed to one built per request, per message,
+    /// or per ephemeral linked call and dropped with it.
+    ///
+    /// What a long call costs depends entirely on this, which is why the store
+    /// has to carry the answer: see
+    /// [`crate::engine::linked_call::invoke_linked_sync_export`], which picks
+    /// between [`crate::timeouts::shared_store_call`] and
+    /// [`crate::timeouts::linked_call`] on it.
+    pub outlives_call: bool,
 }
 
 /// The identity of whoever is invoking a host component plugin, used to
@@ -118,6 +128,7 @@ impl SharedCtx {
             abandoned: Arc::default(),
             executed: Arc::default(),
             memory_limiter: Default::default(),
+            outlives_call: false,
         }
     }
 
@@ -125,6 +136,15 @@ impl SharedCtx {
     /// real resources alive as it hands proxies across the bridge.
     pub fn with_resource_registry(mut self) -> Self {
         self.resource_registry = Some(Default::default());
+        self
+    }
+
+    /// Records whether this store outlives the call running on it; see
+    /// [`Self::outlives_call`]. Defaults to `false` — the store is discarded
+    /// with its call — so a new store-building path that forgets this gets the
+    /// budget that cannot wedge anything but itself.
+    pub fn with_outlives_call(mut self, outlives_call: bool) -> Self {
+        self.outlives_call = outlives_call;
         self
     }
 

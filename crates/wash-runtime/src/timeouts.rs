@@ -79,8 +79,19 @@ declare_timeouts! {
     /// Max wall-clock to drain an ephemeral call's result streams before its
     /// throwaway store is torn down.
     stream_drain = ("WASH_STREAM_DRAIN_TIMEOUT_SECS", 600);
-    /// Max wall-clock for a single shared-store dynamic linked call.
+    /// Max wall-clock for a single dynamic linked call on a store that
+    /// outlives it — a service store, or a pooled instance. Tight on purpose:
+    /// a call occupying such a store holds up every later call it will serve,
+    /// and abandonment does not cover this — that acts on a guest that is
+    /// wedged, not on one that is merely slow.
     shared_store_call = ("WASH_SHARED_STORE_CALL_TIMEOUT_SECS", 30);
+    /// Max wall-clock for a single dynamic linked call on a store built to
+    /// serve one call and be discarded with it (a per-request HTTP store, a
+    /// per-message store, a cold ephemeral one). Nothing is waiting on such a
+    /// store, so this tracks the enclosing ingress budget rather than the
+    /// occupancy bound above: bounding it tighter buys nothing and turns a
+    /// slow-but-healthy guest into a trapped one, taking its response with it.
+    linked_call = ("WASH_LINKED_CALL_TIMEOUT_SECS", 600);
     /// Max wall-clock for a trigger service to produce an HTTP response.
     http_response = ("WASH_HTTP_RESPONSE_TIMEOUT_SECS", 600);
     /// Max wall-clock for a trigger service to acknowledge a delivered message.
