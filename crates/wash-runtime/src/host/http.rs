@@ -2444,21 +2444,34 @@ pub async fn handle_component_request(
         Some((Ok(Ok(resp)), watch)) => Ok(watch_body(resp, watch)),
         Some((Ok(Err(e)), _)) => Err(e.into()),
 
-        // Otherwise the `sender` will get dropped along with the `Store`
-        // meaning that the oneshot will get disconnected
-        Some((Err(e), _)) => {
-            if let Err(task_error) = task.await {
-                error!(err = ?task_error, "error receiving http response");
+        // Otherwise the `sender` was dropped along with the `Store`, so the
+        // oneshot disconnected without a response head.
+        //
+        // Three distinct failures land here and the task's own `Err` is only
+        // one of them: `JoinHandle` reports `Err` for a panic or an abort,
+        // while a guest trap, a failed instantiation, or any other error out
+        // of the guest resolves as `Ok(Err(_))`. Matching on both layers is
+        // what keeps the real cause in the returned chain — `classify_error`
+        // walks it, so a trap is reported as `error.kind=Trap` and a guest
+        // that simply returned as `NoResponse`, instead of every one of them
+        // collapsing to a bare `Other` with the cause dropped unread.
+        Some((Err(e), _)) => match task.await {
+            Err(task_error) => {
+                error!(err = ?task_error, "component handler task panicked or was aborted");
                 Err(anyhow::anyhow!(
                     "error receiving http response: {task_error}"
                 ))
-            } else {
-                error!(err = ?e, "error receiving http response");
-                Err(anyhow::anyhow!(
-                    "oneshot channel closed but no response was sent"
-                ))
             }
-        }
+            Ok(Err(guest_error)) => {
+                error!(err = ?guest_error, "component failed before setting the response outparam");
+                Err(guest_error.context("component produced no response"))
+            }
+            Ok(Ok(())) => {
+                error!(err = ?e, "component returned without setting the response outparam");
+                Err(anyhow::Error::new(e)
+                    .context("component returned without setting the response outparam"))
+            }
+        },
 
         // No response within the deadline; the call is abandoned, and the
         // store's epoch callback ends the guest work behind it.

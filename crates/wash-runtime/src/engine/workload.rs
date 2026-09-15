@@ -700,6 +700,7 @@ impl ServiceStoreRecipe {
             &self.linked_templates,
             &self.linked_instances,
             true,
+            true,
         )
         .await
     }
@@ -1572,12 +1573,23 @@ impl ResolvedWorkload {
         &self,
         component_id: &str,
     ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
-        let (engine, active_template, linked_templates, linked_instances) = {
+        let (engine, active_template, linked_templates, linked_instances, outlives_call) = {
             let components = self.components.read().await;
             let component = components
                 .get(component_id)
                 .context("component ID not found in workload")?;
             let metadata = &component.metadata;
+            // A poolable component's store may be parked in the pool and serve
+            // later calls, so a call on it occupies a store others are waiting
+            // for; one that is not poolable is built for this call and dropped
+            // with it. Same rule as `instance_pool_for_component`, answered
+            // here because the store is built before the dispatch path knows
+            // whether the pool has room for it — a poolable component whose
+            // pool is saturated gets the tighter bound, which is the safe
+            // direction to be wrong in.
+            let outlives_call =
+                instance_pool::poolable(&components, component_id, &metadata.linked_components)
+                    .is_some();
             let active_template = self.component_ctx_template(metadata);
             let mut linked_templates = Vec::with_capacity(metadata.linked_components.len());
             let mut linked_instances = Vec::with_capacity(metadata.linked_components.len());
@@ -1593,6 +1605,7 @@ impl ResolvedWorkload {
                 active_template,
                 linked_templates,
                 linked_instances,
+                outlives_call,
             )
         };
         let store = new_store_from_templates(
@@ -1602,6 +1615,7 @@ impl ResolvedWorkload {
             &linked_templates,
             &linked_instances,
             false,
+            outlives_call,
         )
         .await?;
         // Skipped when nothing will read it: the p2 HTTP path builds a store
@@ -1723,6 +1737,7 @@ impl ResolvedWorkload {
             &recipe.active_template,
             &recipe.linked_templates,
             &recipe.linked_instances,
+            is_service,
             is_service,
         )
         .await?;
