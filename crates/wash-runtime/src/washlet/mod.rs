@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::component_source::{ComponentSource, LoadedComponent};
@@ -45,6 +45,35 @@ fn default_max_concurrent_starts() -> usize {
 /// [`default_max_concurrent_starts`] against a known core count.
 fn starts_for_cores(cores: usize) -> usize {
     cores.saturating_sub(1).clamp(1, MAX_CONCURRENT_STARTS)
+}
+
+/// A tokio runtime dedicated to the scheduler NATS connection, the heartbeat
+/// tick, and the command-receive loop — kept off the main runtime so a burst
+/// of `workload.start`s saturating its worker threads (Cranelift compiles on
+/// the blocking pool aside, `instantiate_pre`/`instantiate_async` still run
+/// inline there) can never also starve the tasks that keep this host visible
+/// to the operator. One worker thread is enough: nothing scheduled here does
+/// real CPU work, it only needs a guaranteed turn.
+///
+/// The scheduler `nats_client` must be *connected* through this handle, not
+/// merely have its tasks moved here afterward — `async_nats::connect` spawns
+/// the connection's own read/reconnect loop on whichever runtime is current
+/// at connect time, and that task is what actually delivers subscription
+/// messages and flushes publishes. Connecting it on the main runtime would
+/// leave that background task starvable right alongside `workload.start`,
+/// defeating the isolation even though this loop itself moved.
+pub fn control_plane_handle() -> anyhow::Result<tokio::runtime::Handle> {
+    static RUNTIME: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("wash-control-plane")
+            .enable_all()
+            .build()
+    }) {
+        Ok(rt) => Ok(rt.handle().clone()),
+        Err(e) => Err(anyhow!("failed to build control-plane runtime: {e}")),
+    }
 }
 
 pub mod types {
@@ -297,6 +326,10 @@ impl ClusterHost {
         let (one_shot_tx, mut one_shot_rx) = oneshot::channel();
         let nats_client = self.nats_client.clone();
         let data_nats_client = self.data_nats_client.clone();
+        // Captured here, on the main runtime that's driving `start()` — this
+        // is where command handling (the heavy half: compiles, instantiates)
+        // is dispatched to, kept apart from the control-plane loop below.
+        let main_handle = tokio::runtime::Handle::current();
         let host = self
             .prepared_host
             .start()
@@ -323,7 +356,14 @@ impl ClusterHost {
 
         host.log_interfaces();
 
-        let task = tokio::task::spawn({
+        // Everything in this task — the heartbeat tick, the cache-sweep
+        // timers, and `api_subscription` itself — runs on the isolated
+        // control-plane runtime (see `control_plane_handle`), never on the
+        // main one. Only the actual command handling, spawned into
+        // `commands` below via `spawn_on(&main_handle)`, does real work on
+        // the main runtime.
+        let control_handle = control_plane_handle()?;
+        let task = control_handle.clone().spawn({
             let host = host.clone();
             async move {
                 let host_subject = host_subject(host_id.as_ref());
@@ -451,7 +491,23 @@ impl ClusterHost {
                             let data_nats_client = data_nats_client.clone();
                             let starts = Arc::clone(&starts);
                             let command = msg.subject.split('.').skip(3).collect::<Vec<_>>().join(".");
-                            commands.spawn(async move {
+                            // The operator's own liveness verdict for this host comes from
+                            // this RPC, not from the periodic self-push above — reconcileReporting
+                            // calls it fresh every reconcile and treats a failure as "not
+                            // reporting" outright, regardless of how recent the last self-pushed
+                            // heartbeat was. Dispatching it to the main runtime like every other
+                            // command would reopen exactly the starvation this split exists to
+                            // avoid, just one hop later — so it stays on the control-plane runtime
+                            // instead. Every other command still goes to `main_handle`: that's
+                            // where compiles and instantiations happen, and it has the thread
+                            // budget to absorb a burst of them without taking the heartbeat (or
+                            // this) down with it.
+                            let spawn_handle = if command == "heartbeat" {
+                                &control_handle
+                            } else {
+                                &main_handle
+                            };
+                            commands.spawn_on(async move {
                                 let response = handle_command(host.as_ref(), &msg, &command, host.config(), &data_nats_client, &starts).await;
                                 match response {
                                     Ok(resp_bytes) => {
@@ -480,7 +536,7 @@ impl ClusterHost {
                                         error!("error handling command: {e}");
                                     }
                                 }
-                            });
+                            }, spawn_handle);
                         }
                     }
                 }
@@ -774,7 +830,10 @@ async fn workload_start(
     }
 
     // Every exit from here gives the id back, so a start that never began
-    // cannot leave it reserved against the next one.
+    // cannot leave it reserved against the next one. Not awaited here: it is
+    // handed to `start_bounded` so the bound covers this half too, which is
+    // the half that holds the permit while pulling images and fetching
+    // `.cwasm` bytes.
     let prepared = async {
         let (components, host_interfaces) = if let Some(wit_world) = wit_world {
             let mut pulled_components = Vec::with_capacity(wit_world.components.len());
@@ -931,27 +990,95 @@ async fn workload_start(
             },
         };
         Ok(request)
-    }
-    .await;
-
-    let request = match prepared {
-        Ok(request) => request,
-        Err(message) => {
-            host.workload_release(&workload_id, reservation).await;
-            return Ok(workload_start_error(&workload_id, message));
-        }
     };
 
-    info!(
-        workload_id=?workload_id,
-        namespace=?request.workload.namespace,
-        name=?request.workload.name,
-        "Starting workload");
+    start_bounded(
+        host,
+        &workload_id,
+        reservation,
+        prepared,
+        config.workload_start_timeout,
+    )
+    .await
+}
 
-    Ok(host
-        .workload_start_reserved(reservation, request)
-        .await?
-        .into())
+/// Prepare and start a reserved workload under
+/// [`HostConfig::workload_start_timeout`], giving the id back if it expires.
+///
+/// Covers *both* halves deliberately. The caller takes a
+/// [`MAX_CONCURRENT_STARTS`] permit before preparing, so a start wedged while
+/// pulling an image or fetching `.cwasm` bytes holds a permit as surely as one
+/// wedged in `workload_start_reserved` does — and with only four permits, four
+/// such starts stop the host accepting any start at all while stops keep
+/// working, which is exactly the state a host gets into. Bounding only the
+/// second half leaves that untouched.
+///
+/// Bounded here, inside the task that holds the reservation, rather than by
+/// the caller: on expiry this task is the one that releases the id, and the
+/// permit goes back when this frame drops. A caller-side timeout would free
+/// the id while this task might still be inside `workload_start_reserved`
+/// believing it owns the teardown, and `unbind_all_plugins` is keyed by
+/// workload id — a new workload claiming that id would then be unbound by the
+/// old start finishing.
+///
+/// Only reachable when the start is stuck at an await. A start spinning in
+/// synchronous code never yields, so the timer never gets to fire and this is
+/// inert: `Starting` still pins the id and only a restart clears it.
+async fn start_bounded(
+    host: &impl WorkloadReservation,
+    workload_id: &str,
+    reservation: crate::host::Reservation,
+    prepared: impl Future<Output = Result<crate::types::WorkloadStartRequest, String>>,
+    limit: Option<Duration>,
+) -> anyhow::Result<types::v2::WorkloadStartResponse> {
+    // `Ok(Err(message))` is a prepare that failed and reported why;
+    // `Err(_)` is a start that failed outright.
+    let attempt = async {
+        let request = match prepared.await {
+            Ok(request) => request,
+            Err(message) => return Ok(Err(message)),
+        };
+        info!(
+            workload_id=?workload_id,
+            namespace=?request.workload.namespace,
+            name=?request.workload.name,
+            "Starting workload");
+        anyhow::Ok(Ok(types::v2::WorkloadStartResponse::from(
+            host.workload_start_reserved(reservation, request).await?,
+        )))
+    };
+
+    // `None` here means the bound expired; the attempt is dropped at its last
+    // await and will not touch the slot again.
+    let outcome = match limit {
+        Some(limit) => tokio::time::timeout(limit, attempt).await.ok(),
+        None => Some(attempt.await),
+    };
+
+    match outcome {
+        Some(Ok(Ok(response))) => Ok(response),
+        // Prepare reported a reason, so the id goes back for a retry.
+        Some(Ok(Err(message))) => {
+            host.workload_release(workload_id, reservation).await;
+            Ok(workload_start_error(workload_id, message))
+        }
+        Some(Err(e)) => Err(e),
+        None => {
+            // `workload_release` is a no-op if the id has already moved on to
+            // another owner.
+            host.workload_release(workload_id, reservation).await;
+            let limit = limit.unwrap_or_default();
+            error!(
+                workload_id=?workload_id,
+                "timed out starting workload after {limit:?}; releasing the id and its start \
+                 permit so a retry can claim them"
+            );
+            Ok(workload_start_error(
+                workload_id,
+                format!("timed out starting workload after {limit:?}"),
+            ))
+        }
+    }
 }
 
 #[instrument(skip_all, fields(workload_id = %req.workload_id))]
@@ -1189,6 +1316,176 @@ mod tests {
     use super::*;
     use crate::host::allowed_hosts::AllowedHost;
     use crate::host::allowed_ip_name::AllowedIpName;
+
+    /// A host whose start never returns.
+    struct HangingStart {
+        released: std::sync::atomic::AtomicBool,
+    }
+
+    impl WorkloadReservation for HangingStart {
+        async fn workload_reserve(
+            &self,
+            _workload_id: &str,
+        ) -> Result<crate::host::Reservation, String> {
+            Ok(1)
+        }
+
+        async fn workload_release(
+            &self,
+            _workload_id: &str,
+            _reservation: crate::host::Reservation,
+        ) {
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        async fn workload_start_reserved(
+            &self,
+            _reservation: crate::host::Reservation,
+            _request: crate::types::WorkloadStartRequest,
+        ) -> anyhow::Result<crate::types::WorkloadStartResponse> {
+            // Stuck at an await, which is the case the bound exists for.
+            std::future::pending().await
+        }
+    }
+
+    fn start_request(workload_id: &str) -> crate::types::WorkloadStartRequest {
+        crate::types::WorkloadStartRequest {
+            workload_id: workload_id.to_string(),
+            workload: crate::types::Workload {
+                namespace: "wasm".to_string(),
+                name: "stuck".to_string(),
+                annotations: Default::default(),
+                service: None,
+                components: Vec::new(),
+                host_interfaces: Vec::new(),
+                volumes: Vec::new(),
+            },
+        }
+    }
+
+    /// A start that hangs has to give its id back. Holding it leaves the id in
+    /// `Starting` for the life of the process: the operator's retries are
+    /// refused as already existing, and a stop only marks the slot for the
+    /// hung start to finish, so the workload can never become ready again.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_start_releases_its_id() {
+        let host = HangingStart {
+            released: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let response = start_bounded(
+            &host,
+            "stuck-id",
+            1,
+            std::future::ready(Ok(start_request("stuck-id"))),
+            Some(Duration::from_secs(300)),
+        )
+        .await
+        .expect("a timed-out start reports itself, it does not fail the command");
+
+        assert!(
+            host.released.load(std::sync::atomic::Ordering::SeqCst),
+            "the id has to be released, or no retry can ever claim it"
+        );
+        let status = response.workload_status.expect("status is reported");
+        assert_eq!(
+            status.workload_state,
+            types::v2::WorkloadState::Error as i32
+        );
+        assert!(
+            status.message.contains("timed out starting workload"),
+            "the reason reaches the operator, got: {}",
+            status.message
+        );
+    }
+
+    /// With no bound configured the start is awaited as-is, so an embedder that
+    /// wants the old behaviour keeps it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unbounded_start_is_left_alone() {
+        let host = HangingStart {
+            released: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let pending = tokio::time::timeout(
+            Duration::from_secs(3600),
+            start_bounded(
+                &host,
+                "stuck-id",
+                1,
+                std::future::ready(Ok(start_request("stuck-id"))),
+                None,
+            ),
+        )
+        .await;
+
+        assert!(pending.is_err(), "an unbounded start never returns");
+        assert!(
+            !host.released.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing released the id, which is exactly the behaviour being bounded"
+        );
+    }
+
+    /// The half that holds a [`MAX_CONCURRENT_STARTS`] permit while it pulls
+    /// images has to be inside the bound too. Four starts wedged here take
+    /// every permit, and the host then accepts no start at all — while stops,
+    /// which need no permit, keep working and make it look alive.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_prepare_releases_its_id_too() {
+        let host = HangingStart {
+            released: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let response = start_bounded(
+            &host,
+            "stuck-in-prepare",
+            1,
+            // Never resolves: an image pull that hangs past its own bound.
+            std::future::pending::<Result<crate::types::WorkloadStartRequest, String>>(),
+            Some(Duration::from_secs(300)),
+        )
+        .await
+        .expect("a timed-out prepare reports itself, it does not fail the command");
+
+        assert!(
+            host.released.load(std::sync::atomic::Ordering::SeqCst),
+            "a prepare that never finishes still has to give the id back"
+        );
+        let status = response.workload_status.expect("status is reported");
+        assert_eq!(
+            status.workload_state,
+            types::v2::WorkloadState::Error as i32
+        );
+        assert!(
+            status.message.contains("timed out starting workload"),
+            "the reason reaches the operator, got: {}",
+            status.message
+        );
+    }
+
+    /// A prepare that fails for its own reasons reports that reason, not a
+    /// timeout, and still gives the id back.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_prepare_reports_its_own_reason() {
+        let host = HangingStart {
+            released: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let response = start_bounded(
+            &host,
+            "bad-image",
+            1,
+            std::future::ready(Err("failed to pull image".to_string())),
+            Some(Duration::from_secs(300)),
+        )
+        .await
+        .expect("a failed prepare reports itself");
+
+        assert!(host.released.load(std::sync::atomic::Ordering::SeqCst));
+        let status = response.workload_status.expect("status is reported");
+        assert_eq!(status.message, "failed to pull image");
+    }
 
     /// A host always keeps a start it can run and a core it can serve on.
     #[test]

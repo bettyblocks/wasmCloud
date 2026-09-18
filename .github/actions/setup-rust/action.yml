@@ -104,12 +104,17 @@ runs:
 
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
-        # Only save the cache on main pushes; PR runs restore but never save.
+        # Save on main pushes and on same-repo PR branches, not just main.
+        # rust-cache keys by branch/Cargo.lock, so a PR's own save only ever
+        # helps later runs of that same branch — it restores from main's
+        # cache on the first push same as before, then keeps its own cache
+        # warm across fixup pushes instead of rebuilding from main's (now
+        # stale) Cargo.lock every time. Excluded for forked PRs: their
+        # actions/cache token can't write to this repo's cache, so the save
+        # step would just no-op after paying to tar it up.
         # Tar+zstd of `target/` over the GHA cache API runs a very long time on
         # Windows runners and was timing out the `check (windows-latest)` job.
-        # Main builds keep refreshing the cache PRs read from, so PR runs
-        # don't need to save anything themselves.
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        save-if: ${{ github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
         # Drop `target/` from the cache on Windows. Git's tar.exe + zstd
         # over the GHA cache API is the slow path, and target/ is the bulk
         # of what gets tarred. Windows builds will recompile deps from the

@@ -325,6 +325,7 @@ pub(crate) async fn new_store_from_templates(
     linked: &[ComponentCtxTemplate],
     linked_instances: &[(Arc<str>, InstancePre<SharedCtx>)],
     is_service: bool,
+    outlives_call: bool,
 ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
     let store_id = uuid::Uuid::new_v4().to_string();
     let all_volume_mounts = std::iter::once(active)
@@ -343,7 +344,9 @@ pub(crate) async fn new_store_from_templates(
     #[cfg(feature = "epoch-interruption")]
     let epoch_cancel_handle = active_ctx.cancel_handle.clone();
 
-    let mut shared_ctx = SharedCtx::new(active_ctx).with_guest_memory(&active.guest_memory);
+    let mut shared_ctx = SharedCtx::new(active_ctx)
+        .with_guest_memory(&active.guest_memory)
+        .with_outlives_call(outlives_call);
 
     for linked in linked {
         let linked_ctx = build_ctx_from_template(
@@ -444,8 +447,12 @@ async fn linked_attributes(
     )
 }
 
+/// Build a store for an ephemeral linked call. `outlives_call` is the
+/// caller's to answer: the same builder serves the pooled path, whose store is
+/// parked and reused, and the cold path, whose store is dropped with the call.
 async fn new_ephemeral_store(
     call: &EphemeralLinkedCall,
+    outlives_call: bool,
 ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
     let mut component_ids = call.linked_component_ids.clone();
     component_ids.push(call.active_component_id.clone());
@@ -486,7 +493,7 @@ async fn new_ephemeral_store(
             linked.push(template_of(&component.metadata));
             linked_instances.push((
                 component_id.clone(),
-                component.pre_instantiate_ref().map_err(|e| {
+                component.pre_instantiate_ref().await.map_err(|e| {
                     anyhow::anyhow!(
                         "failed to pre-instantiate linked components for ephemeral call: {e}"
                     )
@@ -503,6 +510,7 @@ async fn new_ephemeral_store(
         &linked,
         &linked_instances,
         false,
+        outlives_call,
     )
     .await?;
     if let Some(identity) = callee_identity(call).await {
@@ -664,7 +672,7 @@ async fn invoke_ephemeral_relocated(
     // timeout. Once results are handed back the task must outlive this call to
     // drain result streams, so the guard is forgotten (detached) on success.
     let task = AbortOnDrop(tokio::task::spawn(async move {
-        let mut store = match new_ephemeral_store(&ephemeral_call).await {
+        let mut store = match new_ephemeral_store(&ephemeral_call, false).await {
             Ok(s) => s,
             Err(e) => {
                 let _ = ready_tx.send(Err(wasmtime::format_err!("{e:#}")));
@@ -851,9 +859,11 @@ async fn invoke_ephemeral_plain(
             // instantiate reports that failure to this call rather than only
             // to the log.
             Dispatch::NeedsInstance(job) => {
-                let mut store = new_ephemeral_store(ephemeral_call).await.map_err(|e| {
-                    wasmtime::format_err!("new pooled store creation failed: {e:#}")
-                })?;
+                let mut store = new_ephemeral_store(ephemeral_call, true)
+                    .await
+                    .map_err(|e| {
+                        wasmtime::format_err!("new pooled store creation failed: {e:#}")
+                    })?;
                 let instance = inv.pre.instantiate_async(&mut store).await?;
                 pool.dispatch_on_new(ComponentInstance { store, instance }, job)
             }
@@ -891,7 +901,7 @@ async fn invoke_ephemeral_plain(
         }
     }
 
-    let mut store = new_ephemeral_store(ephemeral_call)
+    let mut store = new_ephemeral_store(ephemeral_call, false)
         .await
         .map_err(|e| wasmtime::format_err!("new ephemeral store creation failed: {e:#}"))?;
     let instance = inv.pre.instantiate_async(&mut store).await?;
@@ -1060,7 +1070,19 @@ pub(crate) async fn invoke_linked_sync_export(
 
         let mut results_buf = vec![Val::Bool(false); results.len()];
 
-        let call_timeout = crate::timeouts::shared_store_call();
+        // What a long call costs here depends on whether anything else is
+        // waiting for this store. On one that outlives the call, occupying it
+        // holds up every later call, which is what `shared_store_call` bounds.
+        // On a store built for this call alone there is nothing to hold up, so
+        // the occupancy bound only does harm: a host import returning `Err`
+        // traps the caller, so an HTTP request that crosses it loses its
+        // `response-outparam` and surfaces as "no response was sent" with the
+        // real cause several layers down.
+        let call_timeout = if store.data().outlives_call {
+            crate::timeouts::shared_store_call()
+        } else {
+            crate::timeouts::linked_call()
+        };
         timeout(
             call_timeout,
             func.call_async(&mut store, &params_buf, &mut results_buf),

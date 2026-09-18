@@ -1,9 +1,19 @@
 # syntax=docker/dockerfile:1-labs
 
 
-FROM lukemathwalker/cargo-chef:latest-rust-1.96.0-alpine3.22 AS chef
+FROM cgr.dev/chainguard/wolfi-base@sha256:9a8d954d8f03a21bcf2be73d4628f0ad26d35c3275469925de63a34eebd58f13 AS chef
 USER root
 WORKDIR /src
+
+RUN apk add --no-cache \
+        gcc \
+        glibc-dev \
+        binutils \
+        rust-1.96 \
+        curl
+ENV PATH=/root/.cargo/bin:$PATH
+RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | sh
+RUN cargo binstall -y --disable-telemetry cargo-chef
 
 FROM chef AS planner
 COPY --exclude=rust-toolchain.toml . .
@@ -17,8 +27,8 @@ FROM chef AS builder
 # so TARGETARCH always matches the host's own already-installed Rust target.
 ARG TARGETARCH
 RUN case "$TARGETARCH" in \
-      amd64) echo x86_64-unknown-linux-musl ;; \
-      arm64) echo aarch64-unknown-linux-musl ;; \
+      amd64) echo x86_64-unknown-linux-gnu ;; \
+      arm64) echo aarch64-unknown-linux-gnu ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac > /rust_target.txt
 
@@ -39,18 +49,12 @@ RUN cargo build --release --target "$(cat /rust_target.txt)" --bin wash ${CARGO_
     && cp "target/$(cat /rust_target.txt)/release/wash" /src/wash
 
 # Release image
-FROM cgr.dev/chainguard/wolfi-base
+FROM cgr.dev/chainguard/wolfi-base@sha256:9a8d954d8f03a21bcf2be73d4628f0ad26d35c3275469925de63a34eebd58f13
 RUN apk add --no-cache git
+
 COPY --from=builder /src/wash /usr/local/bin/wash
 
-# Smoke test the binary against THIS stage's libc. The builder and the runtime
-# base are independently-rolling `:latest` Chainguard images, so they can sit on
-# different glibc majors for a window (e.g. rust:latest-dev on 2.44 while
-# wolfi-base is still on 2.43, which Wolfi ships as separate, mutually
-# conflicting `glibc-2.43`/`glibc-2.44` packages — apk cannot reconcile them
-# here). Without this the image builds green and only fails much later, as an
-# unreadable `libm.so.6: version GLIBC_x.y not found` CrashLoopBackOff in the
-# operator e2e cluster. Fail here instead, where the error points at the cause.
+# Smoke test the binary against THIS stage's libc.
 RUN ["/usr/local/bin/wash", "--version"]
 
 ENTRYPOINT ["/usr/local/bin/wash"]

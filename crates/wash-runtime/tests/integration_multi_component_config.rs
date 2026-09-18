@@ -42,14 +42,16 @@ fn component(name: &str, bytes: &'static [u8], own: &[(&str, &str)], warm: bool)
     Component {
         name: name.to_string(),
         digest: None,
-        bytes: bytes::Bytes::from_static(bytes),
+        source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(bytes)),
         local_resources: LocalResources {
             config: config(own),
             ..Default::default()
         },
         pool_size,
         max_invocations,
-        ..Default::default()
+        max_concurrency: 1,
+        reclaim_window_seconds: 0,
+        reclaim_min_instances: 0,
     }
 }
 
