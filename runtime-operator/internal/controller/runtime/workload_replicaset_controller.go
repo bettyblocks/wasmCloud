@@ -18,11 +18,10 @@ import (
 )
 
 const (
-	workloadReplicaSetReconcileInterval    = 1 * time.Minute
-	workloadReplicaSetReplicaGracePeriod   = 1 * time.Minute
-	workloadReplicaSetNameIndex            = "workload.replicaset.name"
-	workloadReplicaSetHashIndex            = "workload.replicaset.hash"
-	workloadReplicaSetGenerationAnnotation = "runtime.wasmcloud.dev/workload-replica-set-generation"
+	workloadReplicaSetReconcileInterval  = 1 * time.Minute
+	workloadReplicaSetReplicaGracePeriod = 1 * time.Minute
+	workloadReplicaSetNameIndex          = "workload.replicaset.name"
+	workloadReplicaSetHashIndex          = "workload.replicaset.hash"
 )
 
 // WorkloadReplicaSetReconciler reconciles a WorkloadReplicaSet object
@@ -63,7 +62,7 @@ func (r *WorkloadReplicaSetReconciler) reconcileScaleUp(ctx context.Context, rep
 				Namespace: replicaSet.Namespace,
 				Labels:    replicaSet.Spec.Template.Labels,
 				Annotations: map[string]string{
-					workloadReplicaSetGenerationAnnotation: replicaSet.Spec.Template.Hash(),
+					runtimev1alpha1.WorkloadReplicaSetGenerationAnnotation: replicaSet.Spec.Template.Hash(),
 				},
 			},
 			Spec: replicaSet.Spec.Template.Spec,
@@ -200,7 +199,7 @@ func (r *WorkloadReplicaSetReconciler) cleanupPreviousRevisionsWorkloads(ctx con
 		}
 
 		// catches workloads that are of the current generation
-		if generation, ok := workload.Annotations[workloadReplicaSetGenerationAnnotation]; !ok || generation == currentGeneration {
+		if generation, ok := workload.Annotations[runtimev1alpha1.WorkloadReplicaSetGenerationAnnotation]; !ok || generation == currentGeneration {
 			continue
 		}
 
@@ -304,7 +303,7 @@ func (r *WorkloadReplicaSetReconciler) SetupWithManager(mgr ctrl.Manager) error 
 			return []string{}
 		}
 
-		if generation, ok := rawObj.GetAnnotations()[workloadReplicaSetGenerationAnnotation]; ok {
+		if generation, ok := rawObj.GetAnnotations()[runtimev1alpha1.WorkloadReplicaSetGenerationAnnotation]; ok {
 			return []string{generation}
 		}
 

@@ -82,7 +82,8 @@ func (a *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	log.Info("Reconciling Workload")
 
 	if workload.Status.IsAvailable() {
-		if err := a.Registry.RegisterWorkload(ctx, req.NamespacedName, workload.Status.HostID, workload.Status.WorkloadID, hostname); err != nil {
+		generation := workload.Annotations[runtimev1alpha1.WorkloadReplicaSetGenerationAnnotation]
+		if err := a.Registry.RegisterWorkload(ctx, req.NamespacedName, workload.Status.HostID, workload.Status.WorkloadID, hostname, generation); err != nil {
 			log.Error(err, "failed to register workload")
 			return ctrl.Result{}, err
 		}

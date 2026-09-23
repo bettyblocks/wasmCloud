@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 
@@ -34,8 +35,18 @@ type HostRegistry interface {
 
 // WorkloadRegistry tracks which workloads serve which hostname. As with
 // HostRegistry, registrations are keyed by the Workload object's key.
+//
+// generation identifies the rollout that produced the workload (a
+// WorkloadReplicaSet's template hash — see
+// runtimev1alpha1.WorkloadReplicaSetGenerationAnnotation). During a rolling
+// update the previous generation's workloads stay registered, and available,
+// alongside the new generation's until the operator tears them down; Resolve
+// uses generation to route only to the newest one present instead of
+// splitting traffic between old and new code. Workloads with no generation
+// (not created by a ReplicaSet) share the empty-string generation and behave
+// as before: a single pool, load-balanced across all of them.
 type WorkloadRegistry interface {
-	RegisterWorkload(ctx context.Context, key types.NamespacedName, hostID string, workloadID string, hostname string) error
+	RegisterWorkload(ctx context.Context, key types.NamespacedName, hostID string, workloadID string, hostname string, generation string) error
 	DeregisterWorkload(ctx context.Context, key types.NamespacedName) error
 }
 
@@ -49,6 +60,58 @@ type workloadRoute struct {
 	hostID     string
 	workloadID string
 	hostname   string
+	generation string
+}
+
+// hostnameRoute is the routing state for a single hostname: the workloads
+// registered for it, grouped by rollout generation, plus the order in which
+// generations were first seen so Resolve can prefer the newest one.
+type hostnameRoute struct {
+	// generation to the set of workloadIDs currently registered for it
+	generations map[string]sets.Set[string]
+	// generations in the order first seen for this hostname, oldest first
+	order []string
+}
+
+func (hr *hostnameRoute) addWorkload(workloadID, generation string) {
+	set, ok := hr.generations[generation]
+	if !ok {
+		set = sets.New[string]()
+		hr.generations[generation] = set
+		hr.order = append(hr.order, generation)
+	}
+	set.Insert(workloadID)
+}
+
+func (hr *hostnameRoute) removeWorkload(workloadID, generation string) {
+	set, ok := hr.generations[generation]
+	if !ok {
+		return
+	}
+	set.Delete(workloadID)
+	if set.Len() == 0 {
+		delete(hr.generations, generation)
+		hr.order = slices.DeleteFunc(hr.order, func(g string) bool { return g == generation })
+	}
+}
+
+// newestWorkload returns a workload from the newest generation that still has
+// any registered, preferring it over every older generation even if the
+// older one has more replicas. Older generations only remain as a fallback
+// for hostnames whose newest generation has no available workloads at all.
+func (hr *hostnameRoute) newestWorkload() (string, bool) {
+	for i := len(hr.order) - 1; i >= 0; i-- {
+		set, ok := hr.generations[hr.order[i]]
+		if !ok || set.Len() == 0 {
+			continue
+		}
+		return set.UnsortedList()[0], true
+	}
+	return "", false
+}
+
+func (hr *hostnameRoute) empty() bool {
+	return len(hr.order) == 0
 }
 
 type HostTracker struct {
@@ -58,8 +121,8 @@ type HostTracker struct {
 	lock sync.RWMutex
 	// HostID to "hostname:port"
 	hosts map[string]string
-	// hostname to WorkloadID
-	hostnames map[string]sets.Set[string]
+	// hostname to its routing state
+	hostnames map[string]*hostnameRoute
 	// WorkloadID to HostID
 	workloads map[string]string
 	// Host object key to HostID
@@ -72,7 +135,7 @@ func newHostTracker(fallback Fallback) *HostTracker {
 	return &HostTracker{
 		Fallback:     fallback,
 		hosts:        make(map[string]string),
-		hostnames:    make(map[string]sets.Set[string]),
+		hostnames:    make(map[string]*hostnameRoute),
 		workloads:    make(map[string]string),
 		hostKeys:     make(map[types.NamespacedName]string),
 		workloadKeys: make(map[types.NamespacedName]workloadRoute),
@@ -90,8 +153,8 @@ func (ht *HostTracker) Resolve(ctx context.Context, req *http.Request) LookupRes
 		lookupHost = routeHost
 	}
 
-	workloads, ok := ht.hostnames[lookupHost]
-	if !ok {
+	route, ok := ht.hostnames[lookupHost]
+	if !ok || route.empty() {
 		scheme, endpoint := ht.Fallback.InvalidHostname(lookupHost)
 		return LookupResult{
 			Hostname: endpoint,
@@ -99,16 +162,17 @@ func (ht *HostTracker) Resolve(ctx context.Context, req *http.Request) LookupRes
 		}
 	}
 
-	if workloads.Len() == 0 {
+	// Pick a random workload from the newest generation registered for this
+	// hostname, so a rollout in progress never splits traffic between old and
+	// new component code.
+	workloadID, ok := route.newestWorkload()
+	if !ok {
 		scheme, endpoint := ht.Fallback.NoWorkloads(lookupHost)
 		return LookupResult{
 			Hostname: endpoint,
 			Scheme:   scheme,
 		}
 	}
-
-	// pick a random workload
-	workloadID := workloads.UnsortedList()[0]
 
 	// find the host for the workload
 	// (should always exist if the workload exists)
@@ -184,9 +248,11 @@ func (ht *HostTracker) removeHost(hostID string) {
 			continue
 		}
 		delete(ht.workloads, workloadID)
-		for hostname, workloadSet := range ht.hostnames {
-			workloadSet.Delete(workloadID)
-			if workloadSet.Len() == 0 {
+		for hostname, route := range ht.hostnames {
+			for _, generation := range route.order {
+				route.removeWorkload(workloadID, generation)
+			}
+			if route.empty() {
 				delete(ht.hostnames, hostname)
 			}
 		}
@@ -195,24 +261,26 @@ func (ht *HostTracker) removeHost(hostID string) {
 	delete(ht.hosts, hostID)
 }
 
-func (ht *HostTracker) RegisterWorkload(ctx context.Context, key types.NamespacedName, hostID string, workloadID string, hostname string) error {
+func (ht *HostTracker) RegisterWorkload(ctx context.Context, key types.NamespacedName, hostID string, workloadID string, hostname string, generation string) error {
 	ht.lock.Lock()
 	defer ht.lock.Unlock()
 
-	route := workloadRoute{hostID: hostID, workloadID: workloadID, hostname: hostname}
-	// A workload that moved to another host, or whose routing hostname changed,
-	// must not keep serving its previous hostname.
+	route := workloadRoute{hostID: hostID, workloadID: workloadID, hostname: hostname, generation: generation}
+	// A workload that moved to another host, whose routing hostname changed,
+	// or whose generation changed (a redeploy reusing the same object key)
+	// must not keep serving its previous route.
 	if prev, ok := ht.workloadKeys[key]; ok && prev != route {
 		ht.removeWorkload(prev)
 	}
 
 	ht.workloadKeys[key] = route
 	ht.workloads[workloadID] = hostID
-	if workloadSet, ok := ht.hostnames[hostname]; !ok {
-		ht.hostnames[hostname] = sets.New(workloadID)
-	} else {
-		workloadSet.Insert(workloadID)
+	hr, ok := ht.hostnames[hostname]
+	if !ok {
+		hr = &hostnameRoute{generations: make(map[string]sets.Set[string])}
+		ht.hostnames[hostname] = hr
 	}
+	hr.addWorkload(workloadID, generation)
 	return nil
 }
 
@@ -232,9 +300,9 @@ func (ht *HostTracker) DeregisterWorkload(ctx context.Context, key types.Namespa
 // The caller must hold ht.lock.
 func (ht *HostTracker) removeWorkload(route workloadRoute) {
 	delete(ht.workloads, route.workloadID)
-	if workloadSet, ok := ht.hostnames[route.hostname]; ok {
-		workloadSet.Delete(route.workloadID)
-		if workloadSet.Len() == 0 {
+	if hr, ok := ht.hostnames[route.hostname]; ok {
+		hr.removeWorkload(route.workloadID, route.generation)
+		if hr.empty() {
 			delete(ht.hostnames, route.hostname)
 		}
 	}

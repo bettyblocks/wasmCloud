@@ -14,6 +14,13 @@ import (
 const (
 	WorkloadReplicaSetConditionScaleUp   condition.ConditionType = "ScaleUp"
 	WorkloadReplicaSetConditionScaleDown condition.ConditionType = "ScaleDown"
+
+	// WorkloadReplicaSetGenerationAnnotation marks a Workload with the template
+	// hash of the WorkloadReplicaSet that created it. It is exported so that
+	// consumers outside this module — the gateway, in particular — can tell
+	// workloads from different rollout generations apart without depending on
+	// runtime-operator's internal packages.
+	WorkloadReplicaSetGenerationAnnotation = "runtime.wasmcloud.dev/workload-replica-set-generation"
 )
 
 type WorkloadReplicaTemplate struct {
