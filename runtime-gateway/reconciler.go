@@ -16,6 +16,15 @@ import (
 const (
 	gatewayWorkloadFinalizerName = "runtime.wasmcloud.dev/gateway-workload-finalizer"
 	gatewayHostFinalizerName     = "runtime.wasmcloud.dev/gateway-host-finalizer"
+
+	// workloadReplicaSetGenerationAnnotation must match
+	// runtimev1alpha1.WorkloadReplicaSetGenerationAnnotation, which the
+	// operator sets on every Workload it creates for a WorkloadReplicaSet.
+	// It is duplicated here, rather than imported, because this module
+	// builds against a released runtime-operator version (see the
+	// Dockerfile, which has no go.work) that may lag behind the operator's
+	// own source tree.
+	workloadReplicaSetGenerationAnnotation = "runtime.wasmcloud.dev/workload-replica-set-generation"
 )
 
 // dropGatewayFinalizer removes a gateway finalizer from obj if it carries one.
@@ -82,7 +91,7 @@ func (a *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	log.Info("Reconciling Workload")
 
 	if workload.Status.IsAvailable() {
-		generation := workload.Annotations[runtimev1alpha1.WorkloadReplicaSetGenerationAnnotation]
+		generation := workload.Annotations[workloadReplicaSetGenerationAnnotation]
 		if err := a.Registry.RegisterWorkload(ctx, req.NamespacedName, workload.Status.HostID, workload.Status.WorkloadID, hostname, generation); err != nil {
 			log.Error(err, "failed to register workload")
 			return ctrl.Result{}, err
