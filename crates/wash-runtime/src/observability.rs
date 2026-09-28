@@ -6,13 +6,41 @@ use std::time::Duration;
 
 use opentelemetry::{KeyValue, trace::TracerProvider};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_semantic_conventions::attribute::ERROR_TYPE;
 use opentelemetry_semantic_conventions::resource;
 use tracing::Level;
 use tracing_subscriber::{
-    EnvFilter, Layer, Registry, filter::Directive, layer::SubscriberExt, util::SubscriberInitExt,
+    EnvFilter, Layer, Registry,
+    filter::{Directive, FilterExt, filter_fn},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
 };
+
+/// The `tracing` event target every guest (workload/component) log line
+/// carries — the module path of `crate::plugin::wasi_logging`, the only place
+/// in this crate that emits a `wasi:logging` event — so
+/// [`initialize_observability`] can route those events to a separate OTel
+/// backend from wasmCloud's own logs. `tracing::trace!`/`info!`/etc. default
+/// `target` to the call site's module path, so nothing needs to override it
+/// explicitly (and doing so hits a `tracing` macro grammar ambiguity when
+/// combined with this call site's dotted field names, e.g.
+/// `workload.component_id = ...`).
+pub const WORKLOAD_LOG_TARGET: &str = "wash_runtime::plugin::wasi_logging";
+
+/// Env var naming the OTLP endpoint that receives only workload/component
+/// logs (those tagged [`WORKLOAD_LOG_TARGET`]), separate from
+/// `OTEL_EXPORTER_OTLP_*`/`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, which name the
+/// destination for wasmCloud's own logs, traces and metrics: OTLP's env
+/// config only names one destination per signal, and an operator wants
+/// wasmCloud's own logs in one backend (e.g. Grafana) and every workload's
+/// guest logs in another (e.g. a customer-facing log viewer).
+///
+/// Named with the `OTEL_` prefix so setting it also satisfies `otel_enabled`
+/// below — there is no "workload logs only, no host telemetry" mode; setting
+/// this always turns on the same OTel machinery `OTEL_EXPORTER_OTLP_*` does.
+const WORKLOAD_OTLP_LOGS_ENDPOINT_ENV: &str = "OTEL_WORKLOAD_LOGS_ENDPOINT";
 
 /// Initialize observability, setting up console & OpenTelemetry layers.
 ///
@@ -46,6 +74,8 @@ pub fn initialize_observability(
         .with_filter(fmt_filter);
 
     let otel_enabled = std::env::vars().any(|(key, _)| key.starts_with("OTEL_"));
+    let workload_otlp_endpoint = std::env::var(WORKLOAD_OTLP_LOGS_ENDPOINT_ENV).ok();
+
     if !otel_enabled {
         Registry::default().with(fmt_layer).init();
 
@@ -69,76 +99,131 @@ pub fn initialize_observability(
         ))
         .build();
 
-    // OTel logging layer
-    let log_exporter = opentelemetry_otlp::LogExporter::builder()
-        .with_tonic()
-        .build()?;
-    let log_provider = opentelemetry_sdk::logs::LoggerProviderBuilder::default()
-        .with_batch_exporter(log_exporter)
-        .with_resource(resource.clone())
-        .build();
-    let filter_otel_logs = EnvFilter::new(log_level.as_str());
+    // Host's own OTel logging layer, from `OTEL_EXPORTER_OTLP_*`. When a
+    // workload backend is also configured below, this excludes
+    // `WORKLOAD_LOG_TARGET` events so a component's logs land in exactly one
+    // backend instead of both.
+    let (otel_logs_layer, log_provider_shutdown) = if otel_enabled {
+        let log_exporter = opentelemetry_otlp::LogExporter::builder()
+            .with_tonic()
+            .build()?;
+        let log_provider = opentelemetry_sdk::logs::LoggerProviderBuilder::default()
+            .with_batch_exporter(log_exporter)
+            .with_resource(resource.clone())
+            .build();
+        let filter_otel_logs = EnvFilter::new(log_level.as_str());
+        let exclude_workload_target = workload_otlp_endpoint.is_some();
+        let filter = filter_otel_logs.and(filter_fn(move |meta| {
+            !exclude_workload_target || meta.target() != WORKLOAD_LOG_TARGET
+        }));
+        let layer = OpenTelemetryTracingBridge::new(&log_provider).with_filter(filter);
+        (Some(layer), Some(log_provider))
+    } else {
+        (None, None)
+    };
 
-    let otel_logs_layer =
-        OpenTelemetryTracingBridge::new(&log_provider).with_filter(filter_otel_logs);
+    // Workload/component logging layer: a second, independently-addressed
+    // OTel logs backend fed only the `wasi:logging` events the host plugin
+    // tags with `WORKLOAD_LOG_TARGET` (e.g. the customer-facing log viewer).
+    let (workload_logs_layer, workload_log_provider_shutdown) =
+        if let Some(endpoint) = &workload_otlp_endpoint {
+            let workload_log_exporter = opentelemetry_otlp::LogExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint.clone())
+                .build()?;
+            let workload_log_provider = opentelemetry_sdk::logs::LoggerProviderBuilder::default()
+                .with_batch_exporter(workload_log_exporter)
+                .with_resource(resource.clone())
+                .build();
+            // Unfiltered by `log_level`, unlike the host's own logs above:
+            // every workload log line ships, regardless of level.
+            let filter = filter_fn(|meta| meta.target() == WORKLOAD_LOG_TARGET);
+            let layer =
+                OpenTelemetryTracingBridge::new(&workload_log_provider).with_filter(filter);
+            (Some(layer), Some(workload_log_provider))
+        } else {
+            (None, None)
+        };
 
-    // OTel tracing layer
-    let tracer_exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .build()?;
-    let tracer_provider = opentelemetry_sdk::trace::TracerProviderBuilder::default()
-        .with_batch_exporter(tracer_exporter)
-        .with_resource(resource.clone())
-        .build();
-
-    let filter_otel_traces = EnvFilter::new(log_level.as_str());
-
-    let otel_tracer_layer = tracing_opentelemetry::layer()
-        .with_tracer(tracer_provider.tracer("runtime"))
-        .with_error_records_to_exceptions(true)
-        .with_error_fields_to_exceptions(true)
-        .with_error_events_to_status(true)
-        .with_error_events_to_exceptions(true)
-        .with_location(true)
-        .with_filter(filter_otel_traces);
+    // OTel tracing layer. Not split by the above: traces stay on the host's
+    // own backend regardless of a workload logs endpoint.
+    let (otel_tracer_layer, tracer_provider_shutdown) = if otel_enabled {
+        let tracer_exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .build()?;
+        let tracer_provider = opentelemetry_sdk::trace::TracerProviderBuilder::default()
+            .with_batch_exporter(tracer_exporter)
+            .with_resource(resource.clone())
+            .build();
+        let filter_otel_traces = EnvFilter::new(log_level.as_str());
+        let layer = tracing_opentelemetry::layer()
+            .with_tracer(tracer_provider.tracer("runtime"))
+            .with_error_records_to_exceptions(true)
+            .with_error_fields_to_exceptions(true)
+            .with_error_events_to_status(true)
+            .with_error_events_to_exceptions(true)
+            .with_location(true)
+            .with_filter(filter_otel_traces);
+        (Some(layer), Some(tracer_provider))
+    } else {
+        (None, None)
+    };
 
     Registry::default()
         .with(fmt_layer)
         .with(otel_logs_layer)
         .with(otel_tracer_layer)
+        .with(workload_logs_layer)
         .init();
 
-    let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_tonic()
-        .build()
-        .context("failed to create OTEL tonic exporter")?;
+    let meter_provider_shutdown = if otel_enabled {
+        let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+            .with_tonic()
+            .build()
+            .context("failed to create OTEL tonic exporter")?;
 
-    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-        .with_periodic_exporter(metric_exporter)
-        .with_resource(resource.clone())
-        .build();
+        let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_periodic_exporter(metric_exporter)
+            .with_resource(resource.clone())
+            .build();
 
-    opentelemetry::global::set_meter_provider(meter_provider.clone());
+        opentelemetry::global::set_meter_provider(meter_provider.clone());
 
-    // Register the W3C Trace Context propagator so the incoming-request path
-    // (`opentelemetry::global::get_text_map_propagator` in `host::http`) can
-    // parse the `traceparent` header into the OpenTelemetry context.
-    // Without this every workload roots its own trace instead of continuing the
-    // caller's. Registering it here is what lets a trace roll up across
-    // workload/host boundaries.
-    opentelemetry::global::set_text_map_propagator(
-        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-    );
+        // Register the W3C Trace Context propagator so the incoming-request path
+        // (`opentelemetry::global::get_text_map_propagator` in `host::http`) can
+        // parse the `traceparent` header into the OpenTelemetry context.
+        // Without this every workload roots its own trace instead of continuing the
+        // caller's. Registering it here is what lets a trace roll up across
+        // workload/host boundaries.
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+
+        Some(meter_provider)
+    } else {
+        None
+    };
 
     // Return a shutdown function to flush providers on exit
     let shutdown_fn = move || {
-        if let Err(e) = tracer_provider.shutdown() {
+        if let Some(tracer_provider) = tracer_provider_shutdown
+            && let Err(e) = tracer_provider.shutdown()
+        {
             eprintln!("failed to shutdown tracer provider: {e}");
         }
-        if let Err(e) = log_provider.shutdown() {
+        if let Some(log_provider) = log_provider_shutdown
+            && let Err(e) = log_provider.shutdown()
+        {
             eprintln!("failed to shutdown log provider: {e}");
         }
-        if let Err(e) = meter_provider.shutdown() {
+        if let Some(workload_log_provider) = workload_log_provider_shutdown
+            && let Err(e) = workload_log_provider.shutdown()
+        {
+            eprintln!("failed to shutdown workload log provider: {e}");
+        }
+        if let Some(meter_provider) = meter_provider_shutdown
+            && let Err(e) = meter_provider.shutdown()
+        {
             eprintln!("failed to shutdown meter provider: {e}");
         }
     };
