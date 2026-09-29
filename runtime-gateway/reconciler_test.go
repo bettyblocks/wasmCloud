@@ -100,8 +100,8 @@ func newRecordingRegistry() *recordingRegistry {
 	}
 }
 
-func (r *recordingRegistry) RegisterWorkload(_ context.Context, key types.NamespacedName, hostID string, workloadID string, hostname string) error {
-	r.workloads[key] = workloadRoute{hostID: hostID, workloadID: workloadID, hostname: hostname}
+func (r *recordingRegistry) RegisterWorkload(_ context.Context, key types.NamespacedName, hostID string, workloadID string, hostname string, generation string) error {
+	r.workloads[key] = workloadRoute{hostID: hostID, workloadID: workloadID, hostname: hostname, generation: generation}
 	return nil
 }
 
