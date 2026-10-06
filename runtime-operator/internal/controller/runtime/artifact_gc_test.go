@@ -68,7 +68,7 @@ func TestInUseKeysFromArtifacts(t *testing.T) {
 					gcTestBaseURL+"/b/img/aarch64-27.0.0.cwasm"),
 			},
 			want: map[string]struct{}{
-				"a/img/x86_64-27.0.0.cwasm":  {},
+				testCwasmKey:                 {},
 				"b/img/x86_64-27.0.0.cwasm":  {},
 				"b/img/aarch64-27.0.0.cwasm": {},
 			},
@@ -80,7 +80,7 @@ func TestInUseKeysFromArtifacts(t *testing.T) {
 					gcTestBaseURL+"/a/img/x86_64-27.0.0.cwasm",
 					"nats://other-bucket/a/img/x86_64-27.0.0.cwasm"),
 			},
-			want: map[string]struct{}{"a/img/x86_64-27.0.0.cwasm": {}},
+			want: map[string]struct{}{testCwasmKey: {}},
 		},
 		{
 			name:      "empty status yields empty set",
@@ -204,7 +204,7 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 	const runningKey = "running/img/x86_64-27.0.0.cwasm"
 	const orphanKey = "orphan/img/x86_64-27.0.0.cwasm"
 	for key, bytes := range map[string][]byte{
-		liveKey:    []byte("live"),
+		liveKey:    []byte("still-referenced"),
 		runningKey: []byte("running"),
 		orphanKey:  []byte("orphan"),
 	} {
@@ -218,7 +218,7 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 	// the Artifact was later deleted while the replica set is still running).
 	// Neither may ever be collected. Nothing references orphanKey.
 	liveArtifact := &runtimev1alpha1.Artifact{
-		ObjectMeta: metav1.ObjectMeta{Name: "live", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "live-workload", Namespace: metav1.NamespaceDefault},
 		Status: runtimev1alpha1.ArtifactStatus{
 			Precompiled: []runtimev1alpha1.PrecompiledVariant{
 				{ArtifactURL: gcTestBaseURL + "/" + liveKey},
@@ -226,7 +226,7 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 		},
 	}
 	runningReplicaSet := &runtimev1alpha1.WorkloadReplicaSet{
-		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "running", Namespace: metav1.NamespaceDefault},
 	}
 	runningReplicaSet.Spec.Template.Spec.Components = []runtimev1alpha1.WorkloadComponent{
 		{PrecompiledURL: gcTestBaseURL + "/" + runningKey},
@@ -311,7 +311,7 @@ func TestInUseKeysFromReplicaSets(t *testing.T) {
 			replicaSets: []runtimev1alpha1.WorkloadReplicaSet{
 				replicaSet("a", gcTestBaseURL+"/a/img/x86_64-27.0.0.cwasm"),
 			},
-			want: map[string]struct{}{"a/img/x86_64-27.0.0.cwasm": {}},
+			want: map[string]struct{}{testCwasmKey: {}},
 		},
 		{
 			name: "skips unresolved component (empty PrecompiledURL)",

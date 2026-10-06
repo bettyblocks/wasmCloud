@@ -105,7 +105,7 @@ func TestFinalizeStopsWorkloadWithoutRecordedPlacement(t *testing.T) {
 	bus := &mockBus{reply: &wasmbus.Message{Data: reply}}
 	r := &WorkloadReconciler{Bus: bus}
 	workload := &runtimev1alpha1.Workload{
-		ObjectMeta: metav1.ObjectMeta{Name: "deleted-mid-start", Namespace: "default", UID: testWorkloadUID},
+		ObjectMeta: metav1.ObjectMeta{Name: "deleted-mid-start", Namespace: metav1.NamespaceDefault, UID: testWorkloadUID},
 		Status:     runtimev1alpha1.WorkloadStatus{HostID: "host-1"},
 	}
 
@@ -130,7 +130,7 @@ func TestFinalizeSkipsWorkloadWithoutHost(t *testing.T) {
 	bus := &mockBus{err: errors.New("no request expected")}
 	r := &WorkloadReconciler{Bus: bus}
 	workload := &runtimev1alpha1.Workload{
-		ObjectMeta: metav1.ObjectMeta{Name: "unscheduled", Namespace: "default", UID: testWorkloadUID},
+		ObjectMeta: metav1.ObjectMeta{Name: "unscheduled", Namespace: metav1.NamespaceDefault, UID: testWorkloadUID},
 	}
 
 	if err := r.finalize(context.Background(), workload); err != nil {
