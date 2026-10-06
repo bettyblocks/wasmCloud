@@ -33,7 +33,7 @@ var testArtifactStore = runtimectrl.ArtifactStoreConfig{
 
 func newArtifact(ctx context.Context, name string) *runtimev1alpha1.Artifact {
 	GinkgoHelper()
-	a := &runtimev1alpha1.Artifact{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+	a := &runtimev1alpha1.Artifact{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metav1.NamespaceDefault},
 		Spec: runtimev1alpha1.ArtifactSpec{Image: testArtifactImage},
 	}
 	Expect(k8sClient.Create(ctx, a)).To(Succeed())
@@ -47,7 +47,7 @@ var _ = Describe("Artifact CRD", func() {
 		_ = newArtifact(ctx, "demo")
 
 		var got runtimev1alpha1.Artifact
-		key := types.NamespacedName{Namespace: "default", Name: "demo"}
+		key := types.NamespacedName{Namespace: metav1.NamespaceDefault, Name: "demo"}
 		Expect(k8sClient.Get(ctx, key, &got)).To(Succeed())
 		Expect(got.Spec.Image).To(Equal("ghcr.io/example/comp:v1"))
 	})
@@ -63,7 +63,7 @@ var _ = Describe("precompile pipeline", func() {
 
 		Eventually(func(g Gomega) {
 			var job batchv1.Job
-			jobKey := types.NamespacedName{Namespace: "default", Name: "precompile-" + a.Name}
+			jobKey := types.NamespacedName{Namespace: metav1.NamespaceDefault, Name: "precompile-" + a.Name}
 			g.Expect(k8sClient.Get(ctx, jobKey, &job)).To(Succeed())
 
 			g.Expect(job.OwnerReferences).To(ContainElement(HaveField("UID", a.UID)))
@@ -94,7 +94,7 @@ var _ = Describe("precompile pipeline", func() {
 		var job batchv1.Job
 		Eventually(func(g Gomega) {
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: "precompile-" + a.Name,
+				Namespace: metav1.NamespaceDefault, Name: "precompile-" + a.Name,
 			}, &job)).To(Succeed())
 		}).Should(Succeed())
 
@@ -112,7 +112,7 @@ var _ = Describe("precompile pipeline", func() {
 			var got runtimev1alpha1.Artifact
 			g.Expect(k8sClient.Get(ctx,
 				types.NamespacedName{
-					Namespace: "default", Name: a.Name,
+					Namespace: metav1.NamespaceDefault, Name: a.Name,
 				}, &got)).To(Succeed())
 
 			g.Expect(got.Status.Precompiled).To(HaveLen(1))
@@ -135,7 +135,7 @@ var _ = Describe("precompile pipeline", func() {
 		var job batchv1.Job
 		Eventually(func(g Gomega) {
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: "precompile-" + a.Name,
+				Namespace: metav1.NamespaceDefault, Name: "precompile-" + a.Name,
 			}, &job)).To(Succeed())
 		}).Should(Succeed())
 
@@ -151,7 +151,7 @@ var _ = Describe("precompile pipeline", func() {
 		Eventually(func(g Gomega) {
 			var got runtimev1alpha1.Artifact
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: a.Name,
+				Namespace: metav1.NamespaceDefault, Name: a.Name,
 			}, &got)).To(Succeed())
 
 			failed := got.Status.GetCondition(runtimev1alpha1.ArtifactConditionPrecompileFailed)
@@ -168,14 +168,14 @@ var _ = Describe("precompile pipeline", func() {
 		var job batchv1.Job
 		Eventually(func(g Gomega) {
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: "precompile-" + a.Name,
+				Namespace: metav1.NamespaceDefault, Name: "precompile-" + a.Name,
 			}, &job)).To(Succeed())
 		}).Should(Succeed())
 
 		Eventually(func(g Gomega) {
 			var got runtimev1alpha1.Artifact
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: a.Name,
+				Namespace: metav1.NamespaceDefault, Name: a.Name,
 			}, &got)).To(Succeed())
 
 			prog := got.Status.GetCondition(runtimev1alpha1.ArtifactConditionPrecompileProgressing)
@@ -192,7 +192,7 @@ var _ = Describe("precompile pipeline", func() {
 		Eventually(func(g Gomega) {
 			var got runtimev1alpha1.Artifact
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: a.Name,
+				Namespace: metav1.NamespaceDefault, Name: a.Name,
 			}, &got)).To(Succeed())
 
 			prog := got.Status.GetCondition(runtimev1alpha1.ArtifactConditionPrecompileProgressing)
@@ -204,7 +204,7 @@ var _ = Describe("precompile pipeline", func() {
 		ctx := context.Background()
 
 		a := &runtimev1alpha1.Artifact{
-			ObjectMeta: metav1.ObjectMeta{Name: "needs-creds", Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: "needs-creds", Namespace: metav1.NamespaceDefault},
 			Spec: runtimev1alpha1.ArtifactSpec{
 				Image:           testArtifactImage,
 				ImagePullSecret: &corev1.LocalObjectReference{Name: "ghcr-secret"},
@@ -215,7 +215,7 @@ var _ = Describe("precompile pipeline", func() {
 		Eventually(func(g Gomega) {
 			var job batchv1.Job
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: "precompile-" + a.Name,
+				Namespace: metav1.NamespaceDefault, Name: "precompile-" + a.Name,
 			}, &job)).To(Succeed())
 
 			g.Expect(job.Spec.Template.Spec.Volumes).To(HaveLen(1))
@@ -248,7 +248,7 @@ var _ = Describe("precompile pipeline", func() {
 		var job batchv1.Job
 		Eventually(func(g Gomega) {
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: "precompile-" + a.Name,
+				Namespace: metav1.NamespaceDefault, Name: "precompile-" + a.Name,
 			}, &job)).To(Succeed())
 		}).Should(Succeed())
 
@@ -262,7 +262,7 @@ var _ = Describe("precompile pipeline", func() {
 		Eventually(func(g Gomega) {
 			var got runtimev1alpha1.Artifact
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: a.Name,
+				Namespace: metav1.NamespaceDefault, Name: a.Name,
 			}, &got)).To(Succeed())
 			g.Expect(got.Status.Precompiled).To(HaveLen(1))
 		}).Should(Succeed())
@@ -275,7 +275,7 @@ var _ = Describe("precompile pipeline", func() {
 		Consistently(func(g Gomega) {
 			var probe batchv1.Job
 			err := k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: "precompile-" + a.Name,
+				Namespace: metav1.NamespaceDefault, Name: "precompile-" + a.Name,
 			}, &probe)
 			g.Expect(apierrors.IsNotFound(err)).To(BeTrue(),
 				"expected Job to stay absent after variant is recorded, got err=%v", err)
@@ -289,7 +289,7 @@ var _ = Describe("precompile pipeline", func() {
 		var oldJob batchv1.Job
 		Eventually(func(g Gomega) {
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: "precompile-" + a.Name,
+				Namespace: metav1.NamespaceDefault, Name: "precompile-" + a.Name,
 			}, &oldJob)).To(Succeed())
 			g.Expect(oldJob.Spec.Template.Spec.Containers[0].Args).
 				To(ContainElement(testArtifactImage))
@@ -303,7 +303,7 @@ var _ = Describe("precompile pipeline", func() {
 		Eventually(func(g Gomega) {
 			var updated runtimev1alpha1.Artifact
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: a.Name,
+				Namespace: metav1.NamespaceDefault, Name: a.Name,
 			}, &updated)).To(Succeed())
 			updated.Spec.Image = "ghcr.io/example/comp:v2"
 			g.Expect(k8sClient.Update(ctx, &updated)).To(Succeed())
@@ -312,7 +312,7 @@ var _ = Describe("precompile pipeline", func() {
 		Eventually(func(g Gomega) {
 			var newJob batchv1.Job
 			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Namespace: "default", Name: "precompile-" + a.Name,
+				Namespace: metav1.NamespaceDefault, Name: "precompile-" + a.Name,
 			}, &newJob)).To(Succeed())
 			g.Expect(newJob.UID).NotTo(Equal(oldJob.UID),
 				"Job should have been recreated, not reused")

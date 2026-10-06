@@ -15,18 +15,18 @@ var _ = Describe("workloadDeploymentsReferencing", func() {
 	It("returns WorkloadDeployments that reference the Artifact by name", func() {
 		ctx := context.Background()
 		art := &runtimev1alpha1.Artifact{
-			ObjectMeta: metav1.ObjectMeta{Name: "comp", Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: testArtifactName, Namespace: metav1.NamespaceDefault},
 		}
 		referencing := &runtimev1alpha1.WorkloadDeployment{
-			ObjectMeta: metav1.ObjectMeta{Name: "echo", Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: testWatchedDeploymentName, Namespace: metav1.NamespaceDefault},
 			Spec: runtimev1alpha1.WorkloadDeploymentSpec{
 				Artifacts: []runtimev1alpha1.WorkloadDeploymentArtifact{
-					{Name: "comp", ArtifactFrom: corev1.LocalObjectReference{Name: "comp"}},
+					{Name: testArtifactName, ArtifactFrom: corev1.LocalObjectReference{Name: testArtifactName}},
 				},
 			},
 		}
 		unrelated := &runtimev1alpha1.WorkloadDeployment{
-			ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: metav1.NamespaceDefault},
 			Spec: runtimev1alpha1.WorkloadDeploymentSpec{
 				Artifacts: []runtimev1alpha1.WorkloadDeploymentArtifact{
 					{Name: "different", ArtifactFrom: corev1.LocalObjectReference{Name: "different"}},
@@ -39,19 +39,19 @@ var _ = Describe("workloadDeploymentsReferencing", func() {
 
 		Expect(err).ToNot(HaveOccurred())
 		Expect(wds).To(HaveLen(1))
-		Expect(wds[0].Name).To(Equal("echo"))
+		Expect(wds[0].Name).To(Equal(testWatchedDeploymentName))
 	})
 
 	It("does not return WorkloadDeployments in a different namespace, even if they reference an Artifact with the same name", func() {
 		ctx := context.Background()
 		art := &runtimev1alpha1.Artifact{
-			ObjectMeta: metav1.ObjectMeta{Name: "comp", Namespace: "ns-a"},
+			ObjectMeta: metav1.ObjectMeta{Name: testArtifactName, Namespace: "ns-a"},
 		}
 		otherNamespace := &runtimev1alpha1.WorkloadDeployment{
-			ObjectMeta: metav1.ObjectMeta{Name: "echo", Namespace: "ns-b"},
+			ObjectMeta: metav1.ObjectMeta{Name: testWatchedDeploymentName, Namespace: "ns-b"},
 			Spec: runtimev1alpha1.WorkloadDeploymentSpec{
 				Artifacts: []runtimev1alpha1.WorkloadDeploymentArtifact{
-					{Name: "comp", ArtifactFrom: corev1.LocalObjectReference{Name: "comp"}},
+					{Name: testArtifactName, ArtifactFrom: corev1.LocalObjectReference{Name: testArtifactName}},
 				},
 			},
 		}
@@ -66,14 +66,14 @@ var _ = Describe("workloadDeploymentsReferencing", func() {
 	It("matches a WorkloadDeployment even when the referencing entry is not the first in Spec.Artifacts", func() {
 		ctx := context.Background()
 		art := &runtimev1alpha1.Artifact{
-			ObjectMeta: metav1.ObjectMeta{Name: "comp", Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: testArtifactName, Namespace: metav1.NamespaceDefault},
 		}
 		wd := &runtimev1alpha1.WorkloadDeployment{
-			ObjectMeta: metav1.ObjectMeta{Name: "echo", Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: testWatchedDeploymentName, Namespace: metav1.NamespaceDefault},
 			Spec: runtimev1alpha1.WorkloadDeploymentSpec{
 				Artifacts: []runtimev1alpha1.WorkloadDeploymentArtifact{
 					{Name: "first", ArtifactFrom: corev1.LocalObjectReference{Name: "first"}},
-					{Name: "comp", ArtifactFrom: corev1.LocalObjectReference{Name: "comp"}},
+					{Name: testArtifactName, ArtifactFrom: corev1.LocalObjectReference{Name: testArtifactName}},
 					{Name: "third", ArtifactFrom: corev1.LocalObjectReference{Name: "third"}},
 				},
 			},
@@ -84,6 +84,6 @@ var _ = Describe("workloadDeploymentsReferencing", func() {
 
 		Expect(err).ToNot(HaveOccurred())
 		Expect(wds).To(HaveLen(1))
-		Expect(wds[0].Name).To(Equal("echo"))
+		Expect(wds[0].Name).To(Equal(testWatchedDeploymentName))
 	})
 })

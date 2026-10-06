@@ -34,15 +34,15 @@ func newTestClient(objs ...client.Object) client.Client {
 
 func newArtifact() *runtimev1alpha1.Artifact {
 	return &runtimev1alpha1.Artifact{
-		ObjectMeta: metav1.ObjectMeta{Name: "comp", Namespace: "default"},
-		Spec:       runtimev1alpha1.ArtifactSpec{Image: "ghcr.io/x/y:v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: testArtifactName, Namespace: metav1.NamespaceDefault},
+		Spec:       runtimev1alpha1.ArtifactSpec{Image: testArtifactImageV1},
 		Status: runtimev1alpha1.ArtifactStatus{
-			ArtifactURL: "ghcr.io/x/y:v1",
+			ArtifactURL: testArtifactImageV1,
 			Precompiled: []runtimev1alpha1.PrecompiledVariant{{
-				Target:          "x86_64-unknown-linux-gnu",
-				WasmtimeVersion: "27.0.0",
+				Target:          testPrecompileTarget,
+				WasmtimeVersion: testWasmtimeVersion,
 				ArtifactURL:     "nats://store/comp/x86_64-unknown-linux-gnu-27.0.0.cwasm",
-				ImageRef:        "ghcr.io/x/y:v1",
+				ImageRef:        testArtifactImageV1,
 			}},
 		},
 	}
@@ -61,7 +61,7 @@ func newWorkloadReplicaTemplate() *runtimev1alpha1.WorkloadReplicaTemplate {
 
 func newWorkloadDeploymentArtifact() []runtimev1alpha1.WorkloadDeploymentArtifact {
 	return []runtimev1alpha1.WorkloadDeploymentArtifact{
-		{Name: "comp", ArtifactFrom: corev1.LocalObjectReference{Name: "comp"}},
+		{Name: testArtifactName, ArtifactFrom: corev1.LocalObjectReference{Name: testArtifactName}},
 	}
 }
 
@@ -71,10 +71,10 @@ var _ = Describe("resolveArtifacts", func() {
 		c := newTestClient(newArtifact())
 		tpl := newWorkloadReplicaTemplate()
 
-		Expect(resolveArtifacts(ctx, c, "default", tpl, newWorkloadDeploymentArtifact(), nil)).To(Succeed())
+		Expect(resolveArtifacts(ctx, c, metav1.NamespaceDefault, tpl, newWorkloadDeploymentArtifact(), nil)).To(Succeed())
 
 		got := tpl.Spec.Components[0]
-		Expect(got.Image).To(Equal("ghcr.io/x/y:v1"))
+		Expect(got.Image).To(Equal(testArtifactImageV1))
 		Expect(got.PrecompiledURL).To(BeEmpty())
 	})
 
@@ -83,15 +83,15 @@ var _ = Describe("resolveArtifacts", func() {
 		c := newTestClient(newArtifact())
 		tpl := newWorkloadReplicaTemplate()
 		pc := &precompileMatch{
-			Target:          "x86_64-unknown-linux-gnu",
-			WasmtimeVersion: "27.0.0",
+			Target:          testPrecompileTarget,
+			WasmtimeVersion: testWasmtimeVersion,
 		}
 
-		Expect(resolveArtifacts(ctx, c, "default", tpl, newWorkloadDeploymentArtifact(), pc)).To(Succeed())
+		Expect(resolveArtifacts(ctx, c, metav1.NamespaceDefault, tpl, newWorkloadDeploymentArtifact(), pc)).To(Succeed())
 
 		got := tpl.Spec.Components[0]
 		Expect(got.PrecompiledURL).To(Equal("nats://store/comp/x86_64-unknown-linux-gnu-27.0.0.cwasm"))
-		Expect(got.Image).To(Equal("ghcr.io/x/y:v1"))
+		Expect(got.Image).To(Equal(testArtifactImageV1))
 	})
 
 	It("returns status unknown to gate the deployment when no precompile variant matches", func() {
@@ -99,10 +99,10 @@ var _ = Describe("resolveArtifacts", func() {
 		c := newTestClient(newArtifact())
 		tpl := newWorkloadReplicaTemplate()
 		pc := &precompileMatch{
-			Target: "aarch64-apple-darwin", WasmtimeVersion: "27.0.0",
+			Target: "aarch64-apple-darwin", WasmtimeVersion: testWasmtimeVersion,
 		}
 
-		err := resolveArtifacts(ctx, c, "default", tpl, newWorkloadDeploymentArtifact(), pc)
+		err := resolveArtifacts(ctx, c, metav1.NamespaceDefault, tpl, newWorkloadDeploymentArtifact(), pc)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("status unknown"))
 		Expect(err.Error()).To(ContainSubstring("no precompiled variant matching"))
@@ -112,17 +112,17 @@ var _ = Describe("resolveArtifacts", func() {
 		ctx := context.Background()
 		art := newArtifact()
 
-		art.Spec.Image = "ghcr.io/x/y:v2"
-		art.Status.ArtifactURL = "ghcr.io/x/y:v2"
-		art.Status.Precompiled[0].ImageRef = "ghcr.io/x/y:v1"
+		art.Spec.Image = testArtifactImageV2
+		art.Status.ArtifactURL = testArtifactImageV2
+		art.Status.Precompiled[0].ImageRef = testArtifactImageV1
 		c := newTestClient(art)
 		tpl := newWorkloadReplicaTemplate()
 		pc := &precompileMatch{
-			Target:          "x86_64-unknown-linux-gnu",
-			WasmtimeVersion: "27.0.0",
+			Target:          testPrecompileTarget,
+			WasmtimeVersion: testWasmtimeVersion,
 		}
 
-		err := resolveArtifacts(ctx, c, "default", tpl, newWorkloadDeploymentArtifact(), pc)
+		err := resolveArtifacts(ctx, c, metav1.NamespaceDefault, tpl, newWorkloadDeploymentArtifact(), pc)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("status unknown"))
 		Expect(err.Error()).To(ContainSubstring("no precompiled variant matching"))
