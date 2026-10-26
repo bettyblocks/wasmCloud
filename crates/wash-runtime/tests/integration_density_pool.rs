@@ -46,7 +46,9 @@ async fn density_fixture_retains_warm_instances_and_releases_cold_ones() -> Resu
                         service: None,
                         components: vec![Component {
                             name: "handler".into(),
-                            source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(WASM)),
+                            source: wash_runtime::types::Source::Compile(
+                                bytes::Bytes::from_static(WASM),
+                            ),
                             pool_size,
                             ..Default::default()
                         }],

@@ -102,7 +102,9 @@ fn start_request(url: &str) -> WorkloadStartRequest {
             service: None,
             components: vec![Component {
                 name: "keyvalue-implements.wasm".to_string(),
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(KEYVALUE_IMPLEMENTS_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    KEYVALUE_IMPLEMENTS_WASM,
+                )),
                 local_resources: LocalResources::default(),
                 pool_size: 1,
                 max_invocations: 100,

@@ -48,7 +48,9 @@ fn workload_with_scratch(name: &str) -> WorkloadStartRequest {
             components: vec![Component {
                 name: "sleeper".to_string(),
                 digest: None,
-                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(HTTP_SLEEPER_WASM)),
+                source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                    HTTP_SLEEPER_WASM,
+                )),
                 local_resources: LocalResources {
                     volume_mounts: vec![VolumeMount {
                         name: "scratch".to_string(),

@@ -264,9 +264,9 @@ async fn exercise(registration: Registration) -> Result<()> {
                     ],
                     components: vec![Component {
                         name: "caller".into(),
-                        source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(include_bytes!(
-                            "wasm/structured_caller.wasm"
-                        ))),
+                        source: wash_runtime::types::Source::Compile(bytes::Bytes::from_static(
+                            include_bytes!("wasm/structured_caller.wasm"),
+                        )),
                         ..Default::default()
                     }],
                 },
