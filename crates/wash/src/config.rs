@@ -103,6 +103,32 @@ impl Default for Config {
 }
 
 impl Config {
+    /// This config as `wash config show` prints it: the same, with every
+    /// secret url replaced by `<redacted>`. `Serialize` keeps the url itself,
+    /// which a saved config file needs; only the printed copy leaves it out.
+    pub fn for_display(&self) -> Self {
+        let mut shown = self.clone();
+        if let Some(dev) = shown.dev.as_mut()
+            && dev.retrieval_database_url.is_some()
+        {
+            dev.retrieval_database_url = Some(SecretUrl::new("<redacted>"));
+        }
+        // The catalog and mirror may carry a token: keep where they point,
+        // drop the credentials and query string.
+        if let Some(dev) = shown.dev.as_mut() {
+            for address in [
+                &mut dev.retrieval_model_catalog,
+                &mut dev.retrieval_model_mirror,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *address = SecretUrl::new(redact_address(address.expose()));
+            }
+        }
+        shown
+    }
+
     /// Get the WIT directory from the configuration, defaulting to "./wit" if not set
     pub fn wit_dir(&self) -> PathBuf {
         if let Some(wit_config) = &self.wit
@@ -1327,6 +1353,120 @@ pub struct DevConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postgres_url: Option<url::Url>,
 
+    /// PostgreSQL connection URL for the betty-blocks:retrieval plugin's own
+    /// pool. Requires a model too: `dev.retrieval_model` (or
+    /// `WASH_RETRIEVAL_MODEL`), or `dev.retrieval_model_config`. Only takes
+    /// effect in a wash build with the `betty-retrieval` feature.
+    ///
+    /// Left unset, `WASH_RETRIEVAL_DATABASE_URL` supplies it, as it does for
+    /// `wash host`, for a project that names a model; a value here wins.
+    ///
+    /// A [`SecretUrl`]: a plain string in the config file, a placeholder
+    /// wherever this struct is printed with `Debug`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_database_url: Option<SecretUrl>,
+
+    /// Path to an embedding model's descriptor (MODEL.json) for the
+    /// betty-blocks:retrieval plugin. Relative paths resolve against the
+    /// project directory. Requires `dev.retrieval_database_url` to also be
+    /// set. Only takes effect in a wash build with the `betty-retrieval`
+    /// feature.
+    ///
+    /// Prefer `dev.retrieval_model`, which takes a model name as well as a
+    /// path, and which `WASH_RETRIEVAL_MODEL` can override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_model_config: Option<PathBuf>,
+
+    /// Which embedding model the betty-blocks:retrieval plugin runs: a model
+    /// NAME looked up in `dev.retrieval_model_catalog`, or a path to a
+    /// descriptor (relative paths resolve against the project directory).
+    ///
+    /// `WASH_RETRIEVAL_MODEL` overrides it, so changing models is an
+    /// environment change rather than an edit to a committed config file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_model: Option<String>,
+
+    /// Where model names are looked up: a directory, or an http(s) base URL,
+    /// holding one `<name>.json` descriptor per model. Overridden by
+    /// `WASH_RETRIEVAL_MODEL_CATALOG`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_model_catalog: Option<SecretUrl>,
+
+    /// Where fetched model artifacts are kept. Unset uses the user's cache
+    /// directory. Overridden by `WASH_RETRIEVAL_MODEL_CACHE`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_model_cache: Option<PathBuf>,
+
+    /// Download model artifacts from here instead of the address their
+    /// descriptor names. The pinned digests still decide whether the bytes are
+    /// accepted. Overridden by `WASH_RETRIEVAL_MODEL_MIRROR`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_model_mirror: Option<SecretUrl>,
+
+    /// Maximum size of the betty-blocks:retrieval plugin's connection pool.
+    /// Unset keeps the plugin's own default (8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_pool_size: Option<usize>,
+
+    /// How long the betty-blocks:retrieval plugin's pool waits for a new
+    /// connection before failing. Unset keeps the plugin's own default (10s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_connect_timeout_secs: Option<u64>,
+
+    /// `hnsw.ef_search` the betty-blocks:retrieval plugin sets on every
+    /// pooled connection. Unset keeps the plugin's own default (200).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_ef_search: Option<u32>,
+
+    /// `hnsw.max_scan_tuples` the betty-blocks:retrieval plugin sets on every
+    /// pooled connection. Unset keeps the plugin's own default (20000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_max_scan_tuples: Option<u32>,
+
+    /// Threads the betty-blocks:retrieval plugin's embedder uses. Unset
+    /// keeps the plugin's own default (4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_embed_threads: Option<usize>,
+
+    /// The betty-blocks:retrieval plugin's `statement_timeout`, in seconds; 0
+    /// turns it off. Unset keeps the plugin's own default (30s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_statement_timeout_secs: Option<u64>,
+
+    /// The betty-blocks:retrieval plugin's
+    /// `idle_in_transaction_session_timeout`, in seconds; 0 turns it off.
+    /// Unset keeps the plugin's own default (60s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_idle_in_transaction_timeout_secs: Option<u64>,
+
+    /// How many of the betty-blocks:retrieval plugin's connections one
+    /// workload may hold at a time. Unset is half the pool, and at least one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_connections_per_workload: Option<usize>,
+
+    /// How much, in bytes, one transaction query of the
+    /// betty-blocks:retrieval plugin may read, counting what the host holds
+    /// each row and value in. Unset keeps the plugin's own default (64 MiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_transaction_query_max_bytes: Option<usize>,
+
+    /// The most texts one statement may ask the betty-blocks:retrieval
+    /// plugin to embed. Unset keeps the plugin's own default (1000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_embed_max_texts: Option<usize>,
+
+    /// The longest text, in bytes, a statement may ask the
+    /// betty-blocks:retrieval plugin to embed. Unset keeps the plugin's own
+    /// default (64 KiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_embed_max_text_bytes: Option<usize>,
+
+    /// A PEM file of CA certificates the betty-blocks:retrieval plugin trusts
+    /// for its database's TLS, beside the public web roots. A relative path
+    /// is read from the project directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval_ca_file: Option<PathBuf>,
+
     /// Enable WASI OpenTelemetry support
     #[serde(default)]
     pub wasi_otel: bool,
@@ -1456,7 +1596,187 @@ impl DevConfig {
         .map(Some)
     }
 
+    /// The `dev.retrieval_*` keys this config sets, by name, in the order the
+    /// struct declares them. A wash build without the `betty-retrieval`
+    /// feature refuses a config that sets any of them, naming each.
+    pub fn retrieval_keys_set(&self) -> Vec<&'static str> {
+        [
+            (
+                "retrieval_database_url",
+                self.retrieval_database_url.is_some(),
+            ),
+            (
+                "retrieval_model_config",
+                self.retrieval_model_config.is_some(),
+            ),
+            ("retrieval_model", self.retrieval_model.is_some()),
+            (
+                "retrieval_model_catalog",
+                self.retrieval_model_catalog.is_some(),
+            ),
+            (
+                "retrieval_model_cache",
+                self.retrieval_model_cache.is_some(),
+            ),
+            (
+                "retrieval_model_mirror",
+                self.retrieval_model_mirror.is_some(),
+            ),
+            ("retrieval_pool_size", self.retrieval_pool_size.is_some()),
+            (
+                "retrieval_connect_timeout_secs",
+                self.retrieval_connect_timeout_secs.is_some(),
+            ),
+            ("retrieval_ef_search", self.retrieval_ef_search.is_some()),
+            (
+                "retrieval_max_scan_tuples",
+                self.retrieval_max_scan_tuples.is_some(),
+            ),
+            (
+                "retrieval_embed_threads",
+                self.retrieval_embed_threads.is_some(),
+            ),
+            (
+                "retrieval_statement_timeout_secs",
+                self.retrieval_statement_timeout_secs.is_some(),
+            ),
+            (
+                "retrieval_idle_in_transaction_timeout_secs",
+                self.retrieval_idle_in_transaction_timeout_secs.is_some(),
+            ),
+            (
+                "retrieval_connections_per_workload",
+                self.retrieval_connections_per_workload.is_some(),
+            ),
+            (
+                "retrieval_transaction_query_max_bytes",
+                self.retrieval_transaction_query_max_bytes.is_some(),
+            ),
+            (
+                "retrieval_embed_max_texts",
+                self.retrieval_embed_max_texts.is_some(),
+            ),
+            (
+                "retrieval_embed_max_text_bytes",
+                self.retrieval_embed_max_text_bytes.is_some(),
+            ),
+            ("retrieval_ca_file", self.retrieval_ca_file.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(key, set)| set.then_some(key))
+        .collect()
+    }
+
+    /// `retrieval_ca_file`, with a relative path joined onto `project_dir`, as
+    /// [`DevConfig::retrieval_model_config_path`] does.
+    pub fn retrieval_ca_file_path(&self, project_dir: &Path) -> Option<PathBuf> {
+        self.retrieval_ca_file
+            .as_ref()
+            .map(|path| project_dir.join(path))
+    }
+
+    /// `retrieval_model_config`, with a relative path joined onto
+    /// `project_dir` rather than left to resolve against the working directory.
+    pub fn retrieval_model_config_path(&self, project_dir: &Path) -> Option<PathBuf> {
+        self.retrieval_model_config
+            .as_ref()
+            .map(|path| project_dir.join(path))
+    }
+
+    /// Which model `wash dev` should run, letting the environment win over the
+    /// config file.
+    ///
+    /// `wash dev` reads nested `dev.*` keys from files, which wash's own
+    /// `WASH_`-prefixed environment merging cannot reach; these four are read
+    /// here by hand so that the same `WASH_RETRIEVAL_MODEL*` variables work in
+    /// `wash dev` and `wash host`. Without that, changing models under
+    /// `wash dev` would mean editing a committed file.
+    ///
+    /// A value that names an existing file is anchored to `project_dir` the
+    /// way the path key always was; a model name is left alone.
+    pub fn retrieval_model_settings(&self, project_dir: &Path) -> RetrievalModelSettings {
+        self.retrieval_model_settings_from(project_dir, |key| std::env::var(key).ok())
+    }
+
+    /// [`DevConfig::retrieval_model_settings`] with the environment handed in,
+    /// so the precedence rule is testable without mutating a real process's
+    /// variables from parallel tests.
+    pub(crate) fn retrieval_model_settings_from(
+        &self,
+        project_dir: &Path,
+        read_env: impl Fn(&str) -> Option<String>,
+    ) -> RetrievalModelSettings {
+        // The variables are for a project that uses the plugin: one whose file
+        // sets the database or names a model. Any other project ignores them,
+        // so exporting them for `wash host` does not turn the plugin on, or
+        // fail `wash dev`, for every project on the machine.
+        let uses_plugin = self.retrieval_database_url.is_some()
+            || self.retrieval_model.is_some()
+            || self.retrieval_model_config.is_some();
+        let env = |key: &str| {
+            uses_plugin
+                .then(|| read_env(key))
+                .flatten()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let model = env("WASH_RETRIEVAL_MODEL").or_else(|| self.retrieval_model.clone());
+        let model = model.map(|spec| anchor_model_spec(spec, project_dir));
+        RetrievalModelSettings {
+            model,
+            model_config: self.retrieval_model_config_path(project_dir),
+            catalog: env("WASH_RETRIEVAL_MODEL_CATALOG").or_else(|| {
+                self.retrieval_model_catalog
+                    .as_ref()
+                    .map(|url| url.expose().to_string())
+            }),
+            cache: env("WASH_RETRIEVAL_MODEL_CACHE")
+                .map(PathBuf::from)
+                .or_else(|| self.retrieval_model_cache.clone()),
+            mirror: env("WASH_RETRIEVAL_MODEL_MIRROR").or_else(|| {
+                self.retrieval_model_mirror
+                    .as_ref()
+                    .map(|url| url.expose().to_string())
+            }),
+        }
+    }
+
+    /// The plugin's database url: `dev.retrieval_database_url` if the file
+    /// sets it, otherwise `WASH_RETRIEVAL_DATABASE_URL`, as `wash host` takes
+    /// the same variable (there an explicit flag beats the variable, here an
+    /// explicit file value does).
+    ///
+    /// Like the other `WASH_RETRIEVAL_*` variables, it counts only for a
+    /// project that already uses the plugin by naming a model, so exporting it
+    /// for `wash host` does not turn the plugin on, or fail `wash dev`, for
+    /// every project on the machine. A blank value names nothing.
+    pub fn retrieval_database_url_with_env(
+        &self,
+        read_env: impl Fn(&str) -> Option<String>,
+    ) -> Option<SecretUrl> {
+        if self.retrieval_database_url.is_some() {
+            return self.retrieval_database_url.clone();
+        }
+        let names_a_model = self.retrieval_model.is_some() || self.retrieval_model_config.is_some();
+        names_a_model
+            .then(|| read_env("WASH_RETRIEVAL_DATABASE_URL"))
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(SecretUrl::new)
+    }
+
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_env(|key| std::env::var(key).ok())
+    }
+
+    /// [`DevConfig::validate`] with the environment handed in, so the one rule
+    /// that reads it is testable without mutating a real process's variables
+    /// from parallel tests.
+    pub(crate) fn validate_with_env(
+        &self,
+        read_env: impl Fn(&str) -> Option<String>,
+    ) -> Result<()> {
         let mut errors: Vec<String> = Vec::new();
 
         if let Some(addr) = &self.address
@@ -1503,6 +1823,48 @@ impl DevConfig {
                 &["postgres", "postgresql"],
                 &mut errors,
             );
+        }
+        let retrieval_database_url = self.retrieval_database_url_with_env(&read_env);
+        if let Some(url) = &retrieval_database_url {
+            // The value is left out of the message: a url can carry a password.
+            match url::Url::parse(url.expose()) {
+                Ok(url) => check_url_scheme_only(
+                    "dev.retrieval_database_url",
+                    &url,
+                    &["postgres", "postgresql"],
+                    &mut errors,
+                ),
+                Err(e) => errors.push(format!(
+                    "dev.retrieval_database_url is not a valid URL: {e}"
+                )),
+            }
+        }
+        // The database and a model go together, and a model is named either
+        // way `wash host` takes one: `dev.retrieval_model` (a name or a path)
+        // or the older, path-only `dev.retrieval_model_config`. A blank value
+        // names nothing, as in `model_selection`.
+        let names_a_model = |model: Option<String>| model.is_some_and(|m| !m.trim().is_empty());
+        let model_in_file =
+            names_a_model(self.retrieval_model.clone()) || self.retrieval_model_config.is_some();
+        // `wash dev` lets `WASH_RETRIEVAL_MODEL` name the model, so a file
+        // with only the database is complete when that is set. The reverse is
+        // judged on the file alone: this validates the file, and what a model
+        // named only in the environment means is `wash dev`'s to decide when
+        // it starts.
+        let model_in_env = names_a_model(read_env("WASH_RETRIEVAL_MODEL"));
+        match (retrieval_database_url.is_some(), model_in_file) {
+            (true, false) if !model_in_env => errors.push(
+                "dev.retrieval_database_url is set but no model is: set dev.retrieval_model \
+                 (or WASH_RETRIEVAL_MODEL) to a model name or a descriptor path, or \
+                 dev.retrieval_model_config to a descriptor path"
+                    .to_string(),
+            ),
+            (false, true) => errors.push(
+                "dev.retrieval_model or dev.retrieval_model_config is set but \
+                 dev.retrieval_database_url is missing"
+                    .to_string(),
+            ),
+            _ => {}
         }
 
         if cfg!(target_os = "windows") && self.wasi_webgpu {
@@ -1551,6 +1913,27 @@ impl DevConfig {
             bail!("{}", errors.join("\n"))
         }
     }
+}
+
+/// What `wash dev` settled on for the betty-blocks:retrieval plugin's model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetrievalModelSettings {
+    pub model: Option<String>,
+    pub model_config: Option<PathBuf>,
+    pub catalog: Option<String>,
+    pub cache: Option<PathBuf>,
+    pub mirror: Option<String>,
+}
+
+/// A model spec that is a relative PATH is joined onto the project directory,
+/// as `dev.retrieval_model_config` always has been. A name is left as written:
+/// it is looked up in a catalog, not on this filesystem.
+fn anchor_model_spec(spec: String, project_dir: &Path) -> String {
+    let path = Path::new(&spec);
+    if path.is_absolute() || !(spec.contains('/') || spec.ends_with(".json")) {
+        return spec;
+    }
+    project_dir.join(path).to_string_lossy().into_owned()
 }
 
 /// Load configuration with hierarchical merging
@@ -1833,6 +2216,76 @@ pub fn example_config() -> Config {
     }
 }
 
+/// A URL that carries a password, held as the text it was given.
+///
+/// It reads from a flag, an environment variable or a config file as a plain
+/// string and is written back as the same string, so nothing about how the
+/// value is parsed, saved or handed on differs from a `String`. Only `Debug`
+/// does: it prints a placeholder, so a struct holding one can be logged or
+/// put in an error without the password going with it. The whole value is
+/// withheld, not just its userinfo, because a postgres URL may also carry the
+/// password as a query parameter.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretUrl(String);
+
+impl SecretUrl {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self(url.into())
+    }
+
+    /// The URL itself, password included: for handing to whatever connects
+    /// with it, never for a log line or an error message.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// How clap reads one from a flag or an environment variable: any string, as
+/// a `String` field would take it.
+impl From<String> for SecretUrl {
+    fn from(url: String) -> Self {
+        Self(url)
+    }
+}
+
+/// Whether `s` begins `scheme://`, with a scheme as RFC 3986 spells one. A
+/// directory path has a `/` or `\\` before any `://`, so it never matches.
+fn has_scheme(s: &str) -> bool {
+    let Some((scheme, _)) = s.trim_start().split_once("://") else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// A catalog or mirror address as it may be printed: for a `scheme://` address,
+/// without its userinfo, query string or fragment; a directory as written.
+pub(crate) fn redact_address(address: &str) -> String {
+    // Any `scheme://`, not only http(s): `s3://k:secret@b` is no directory.
+    if !has_scheme(address) {
+        return address.to_string();
+    }
+    match url::Url::parse(address.trim()) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        // Not echoed: what failed to parse may still hold the secret.
+        Err(_) => "<unparseable address>".to_string(),
+    }
+}
+
 /// Returns `url` with its username and password masked, for logs and errors.
 pub(crate) fn redact_url(url: &url::Url) -> url::Url {
     let mut redacted = url.clone();
@@ -1854,6 +2307,25 @@ fn check_url_scheme(field: &str, value: &url::Url, expected: &[&str], errors: &m
     errors.push(format!(
         "{field} '{}' has scheme '{}', expected one of: {}",
         redact_url(value),
+        value.scheme(),
+        expected.join(", ")
+    ));
+}
+
+/// [`check_url_scheme`] for a url whose secret can sit anywhere in it, in the
+/// userinfo or in a query parameter: the message names the scheme alone.
+fn check_url_scheme_only(
+    field: &str,
+    value: &url::Url,
+    expected: &[&str],
+    errors: &mut Vec<String>,
+) {
+    if expected.contains(&value.scheme()) {
+        return;
+    }
+
+    errors.push(format!(
+        "{field} has scheme '{}', expected one of: {}",
         value.scheme(),
         expected.join(", ")
     ));
@@ -2311,6 +2783,577 @@ workload:
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn dev_retrieval_wrong_scheme_is_err() {
+        let cfg = DevConfig {
+            retrieval_database_url: Some(SecretUrl::new("mysql://localhost/db")),
+            retrieval_model_config: Some(PathBuf::from("models/granite.json")),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("retrieval_database_url"), "{err}");
+    }
+
+    #[test]
+    fn a_scheme_error_names_the_scheme_and_nothing_else_of_the_url() {
+        for url in [
+            "mysql://localhost/db?password=hunter2",
+            "mysql://u:hunter2@localhost/db",
+            "mysql://localhost/db?sslpassword=hunter2#hunter2",
+        ] {
+            let cfg = DevConfig {
+                retrieval_database_url: Some(SecretUrl::new(url)),
+                retrieval_model_config: Some(PathBuf::from("models/granite.json")),
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("scheme 'mysql'"), "{err}");
+            assert!(!err.contains("hunter2"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_catalog_and_mirror_print_without_their_credentials() {
+        let dev = DevConfig {
+            retrieval_model_catalog: Some(SecretUrl::new(
+                "https://u:hunter2@models.example/c?token=s3cr3t",
+            )),
+            retrieval_model_mirror: Some(SecretUrl::new("https://mirror.example/m?sig=s3cr3t")),
+            ..Default::default()
+        };
+        let config = Config {
+            dev: Some(dev.clone()),
+            ..Default::default()
+        };
+        // Debug withholds the value, and `wash config show` keeps the host.
+        for printed in [format!("{dev:?}"), format!("{config:#?}")] {
+            assert!(
+                !printed.contains("hunter2") && !printed.contains("s3cr3t"),
+                "{printed}"
+            );
+        }
+        let shown = config.for_display();
+        for printed in [
+            serde_yaml_ng::to_string(&shown).unwrap(),
+            serde_json::to_value(&shown).unwrap().to_string(),
+        ] {
+            assert!(
+                !printed.contains("hunter2") && !printed.contains("s3cr3t"),
+                "{printed}"
+            );
+            assert!(printed.contains("models.example/c"), "{printed}");
+            assert!(printed.contains("mirror.example/m"), "{printed}");
+        }
+        // The saved config keeps what was written.
+        assert!(
+            serde_yaml_ng::to_string(&config)
+                .unwrap()
+                .contains("s3cr3t")
+        );
+    }
+
+    #[test]
+    fn redact_address_strips_userinfo_query_and_fragment_but_leaves_a_directory() {
+        assert_eq!(
+            redact_address("HTTPS://u:p@models.example:8443/c?token=t#f"),
+            "https://models.example:8443/c"
+        );
+        assert_eq!(redact_address("/srv/catalog"), "/srv/catalog");
+        assert_eq!(
+            redact_address("s3://k:secret@bucket/m?sig=1"),
+            "s3://bucket/m"
+        );
+        assert_eq!(
+            redact_address("S3://k:secret@[bad"),
+            "<unparseable address>"
+        );
+        assert_eq!(redact_address("rel/a://b@c"), "rel/a://b@c");
+        assert_eq!(redact_address("https://[bad"), "<unparseable address>");
+    }
+
+    #[test]
+    fn dev_takes_the_database_url_from_the_environment_as_wash_host_does() {
+        let in_env = |key: &str| {
+            (key == "WASH_RETRIEVAL_DATABASE_URL")
+                .then(|| "postgres://u:hunter2@db.internal/retrieval".to_string())
+        };
+        // A project that names a model uses the plugin, so the variable counts.
+        let dev = DevConfig {
+            retrieval_model: Some("granite".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            dev.retrieval_database_url_with_env(in_env)
+                .as_ref()
+                .map(SecretUrl::expose),
+            Some("postgres://u:hunter2@db.internal/retrieval")
+        );
+        dev.validate_with_env(in_env)
+            .expect("model in the file, database in the environment");
+
+        // The file wins, as an explicit flag wins over the variable in `wash host`.
+        let both = DevConfig {
+            retrieval_database_url: Some(SecretUrl::new("postgres://file/db")),
+            ..dev.clone()
+        };
+        assert_eq!(
+            both.retrieval_database_url_with_env(in_env)
+                .as_ref()
+                .map(SecretUrl::expose),
+            Some("postgres://file/db")
+        );
+
+        // A project that does not use the plugin ignores it, and a blank
+        // variable names nothing.
+        assert!(
+            DevConfig::default()
+                .retrieval_database_url_with_env(in_env)
+                .is_none()
+        );
+        assert!(
+            dev.retrieval_database_url_with_env(|_| Some("  ".to_string()))
+                .is_none()
+        );
+
+        // The environment's value is checked like the file's, without echoing it.
+        let err = dev
+            .validate_with_env(|key| {
+                (key == "WASH_RETRIEVAL_DATABASE_URL").then(|| "mysql://u:hunter2@h/db".to_string())
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("scheme 'mysql'") && !err.contains("hunter2"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn dev_retrieval_url_errors_leave_out_the_password() {
+        for url in [
+            "postgres://genius:hunter2@127.0.0.1:5543x/genius_retrieval",
+            "mysql://genius:hunter2@127.0.0.1/genius_retrieval",
+        ] {
+            let cfg = DevConfig {
+                retrieval_database_url: Some(SecretUrl::new(url)),
+                retrieval_model_config: Some(PathBuf::from("models/granite.json")),
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("dev.retrieval_database_url"), "{err}");
+            assert!(!err.contains("hunter2"), "{err}");
+        }
+    }
+
+    /// A database url as an operator would write one, password in the
+    /// userinfo, and the same database with the password as a parameter.
+    const SECRET_URLS: [&str; 2] = [
+        "postgres://genius:hunter2@db.internal:5432/retrieval?sslmode=require",
+        "postgres://db.internal:5432/retrieval?user=genius&password=hunter2",
+    ];
+
+    #[test]
+    fn a_secret_url_prints_a_placeholder_and_hands_back_what_it_was_given() {
+        for url in SECRET_URLS {
+            let secret = SecretUrl::new(url);
+            for printed in [format!("{secret:?}"), format!("{secret:#?}")] {
+                assert_eq!(printed, "<redacted>");
+            }
+            assert_eq!(secret.expose(), url);
+            assert_eq!(SecretUrl::from(url.to_string()), secret);
+        }
+    }
+
+    #[test]
+    fn dev_config_debug_leaves_out_the_retrieval_database_url() {
+        for url in SECRET_URLS {
+            let dev = DevConfig {
+                retrieval_database_url: Some(SecretUrl::new(url)),
+                retrieval_model_config: Some(PathBuf::from("models/granite.json")),
+                retrieval_pool_size: Some(3),
+                ..Default::default()
+            };
+            // On its own, and inside the `Config` that holds it.
+            let config = Config {
+                dev: Some(dev.clone()),
+                ..Default::default()
+            };
+            for printed in [
+                format!("{dev:?}"),
+                format!("{dev:#?}"),
+                format!("{config:?}"),
+                format!("{config:#?}"),
+            ] {
+                assert!(!printed.contains("hunter2"), "{printed}");
+                assert!(!printed.contains("db.internal"), "{printed}");
+                assert!(
+                    printed.contains("retrieval_database_url: Some(")
+                        && printed.contains("<redacted>"),
+                    "{printed}"
+                );
+                // Everything else still prints.
+                assert!(printed.contains("models/granite.json"), "{printed}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_retrieval_database_url_is_a_plain_string_in_a_config_file() {
+        // The same text in, the same text out: redaction is `Debug`'s alone.
+        for url in SECRET_URLS {
+            let yaml = format!("retrieval_database_url: \"{url}\"\n");
+            let dev: DevConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(
+                dev.retrieval_database_url.as_ref().map(SecretUrl::expose),
+                Some(url)
+            );
+            let json = serde_json::to_value(&dev).unwrap();
+            assert_eq!(json["retrieval_database_url"], serde_json::json!(url));
+            let saved = serde_yaml_ng::to_string(&dev).unwrap();
+            let reloaded: DevConfig = serde_yaml_ng::from_str(&saved).unwrap();
+            assert_eq!(reloaded.retrieval_database_url, dev.retrieval_database_url);
+        }
+    }
+
+    /// `wash config show` prints the merged config, in YAML or JSON. A file
+    /// keeps the url as written (see the test above); a person reading the
+    /// config does not see it.
+    #[test]
+    fn a_config_shown_to_a_person_leaves_out_the_retrieval_database_url() {
+        for url in SECRET_URLS {
+            let config = Config {
+                dev: Some(DevConfig {
+                    retrieval_database_url: Some(SecretUrl::new(url)),
+                    retrieval_pool_size: Some(3),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let shown = config.for_display();
+            for printed in [
+                serde_yaml_ng::to_string(&shown).unwrap(),
+                serde_json::to_value(&shown).unwrap().to_string(),
+            ] {
+                assert!(!printed.contains("hunter2"), "{printed}");
+                assert!(!printed.contains("db.internal"), "{printed}");
+                assert!(printed.contains("<redacted>"), "{printed}");
+                // Everything else still prints.
+                assert!(printed.contains("retrieval_pool_size"), "{printed}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_config_without_a_retrieval_database_url_shows_none() {
+        let shown = Config::default().for_display();
+        assert!(
+            !serde_yaml_ng::to_string(&shown)
+                .unwrap()
+                .contains("retrieval_database_url"),
+            "redaction must not invent a key the config does not have"
+        );
+    }
+
+    #[test]
+    fn a_config_file_sets_the_retrieval_time_limits() {
+        let dev: DevConfig = serde_yaml_ng::from_str(
+            "retrieval_statement_timeout_secs: 5\n\
+             retrieval_idle_in_transaction_timeout_secs: 0\n",
+        )
+        .unwrap();
+        assert_eq!(dev.retrieval_statement_timeout_secs, Some(5));
+        assert_eq!(dev.retrieval_idle_in_transaction_timeout_secs, Some(0));
+    }
+
+    #[test]
+    fn a_config_file_sets_each_workloads_share_of_the_pool() {
+        let dev: DevConfig =
+            serde_yaml_ng::from_str("retrieval_connections_per_workload: 3\n").unwrap();
+        assert_eq!(dev.retrieval_connections_per_workload, Some(3));
+    }
+
+    #[test]
+    fn a_config_file_sets_the_transaction_query_cap() {
+        let dev: DevConfig =
+            serde_yaml_ng::from_str("retrieval_transaction_query_max_bytes: 4096\n").unwrap();
+        assert_eq!(dev.retrieval_transaction_query_max_bytes, Some(4096));
+    }
+
+    #[test]
+    fn a_config_file_sets_the_embedding_caps() {
+        let dev: DevConfig = serde_yaml_ng::from_str(
+            "retrieval_embed_max_texts: 10\n\
+             retrieval_embed_max_text_bytes: 512\n",
+        )
+        .unwrap();
+        assert_eq!(dev.retrieval_embed_max_texts, Some(10));
+        assert_eq!(dev.retrieval_embed_max_text_bytes, Some(512));
+    }
+
+    #[test]
+    fn a_relative_ca_file_is_anchored_to_the_project_like_the_model_path() {
+        let dev: DevConfig = serde_yaml_ng::from_str("retrieval_ca_file: certs/ca.pem\n").unwrap();
+        let project = PathBuf::from("/work/app");
+        assert_eq!(
+            dev.retrieval_ca_file_path(&project),
+            Some(project.join("certs/ca.pem"))
+        );
+        let absolute: DevConfig =
+            serde_yaml_ng::from_str("retrieval_ca_file: /etc/ca.pem\n").unwrap();
+        assert_eq!(
+            absolute.retrieval_ca_file_path(&project),
+            Some(PathBuf::from("/etc/ca.pem"))
+        );
+    }
+
+    /// A `DevConfig` with the retrieval database set and nothing else.
+    fn dev_with_retrieval_database() -> DevConfig {
+        DevConfig {
+            retrieval_database_url: Some(SecretUrl::new(
+                "postgres://genius:genius@127.0.0.1:55433/genius_retrieval",
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// An environment with nothing in it.
+    fn no_env(_key: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn dev_retrieval_url_without_model_config_is_err() {
+        let err = dev_with_retrieval_database()
+            .validate_with_env(no_env)
+            .unwrap_err()
+            .to_string();
+        // Both ways of naming one are offered.
+        assert!(err.contains("dev.retrieval_model "), "{err}");
+        assert!(err.contains("dev.retrieval_model_config"), "{err}");
+    }
+
+    #[test]
+    fn dev_retrieval_url_with_a_named_model_is_ok() {
+        // What `wash host` accepts as `--retrieval-model`, a name or a path,
+        // with no `dev.retrieval_model_config` beside it.
+        for model in ["granite-embedding-107m-multilingual", "models/granite.json"] {
+            let cfg = DevConfig {
+                retrieval_model: Some(model.to_string()),
+                ..dev_with_retrieval_database()
+            };
+            cfg.validate_with_env(no_env)
+                .unwrap_or_else(|e| panic!("{model}: {e}"));
+        }
+    }
+
+    #[test]
+    fn dev_retrieval_url_with_the_model_named_only_in_the_environment_is_ok() {
+        let cfg = dev_with_retrieval_database();
+        cfg.validate_with_env(|key| {
+            (key == "WASH_RETRIEVAL_MODEL").then(|| "granite-embedding-107m-multilingual".into())
+        })
+        .expect("WASH_RETRIEVAL_MODEL names the model wash dev will run");
+    }
+
+    #[test]
+    fn dev_retrieval_a_blank_model_names_nothing() {
+        // In the file, and in the environment, where an empty variable is a
+        // shell saying "unset" by accident.
+        let cfg = DevConfig {
+            retrieval_model: Some("  ".to_string()),
+            ..dev_with_retrieval_database()
+        };
+        let err = cfg
+            .validate_with_env(|key| (key == "WASH_RETRIEVAL_MODEL").then(String::new))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no model is"), "{err}");
+    }
+
+    #[test]
+    fn dev_retrieval_named_model_without_url_is_err() {
+        let cfg = DevConfig {
+            retrieval_model: Some("granite-embedding-107m-multilingual".to_string()),
+            ..Default::default()
+        };
+        let err = cfg.validate_with_env(no_env).unwrap_err().to_string();
+        assert!(err.contains("retrieval_database_url is missing"), "{err}");
+    }
+
+    #[test]
+    fn dev_without_retrieval_keys_ignores_a_model_named_in_the_environment() {
+        // Validation is about the file. What a model named only in the
+        // environment means is for `wash dev` to decide when it starts.
+        DevConfig::default()
+            .validate_with_env(|key| {
+                (key == "WASH_RETRIEVAL_MODEL")
+                    .then(|| "granite-embedding-107m-multilingual".into())
+            })
+            .expect("a config that does not use the plugin is valid");
+    }
+
+    #[test]
+    fn the_environment_names_the_model_over_the_config_file() {
+        // Why this exists: `wash dev` reads nested `dev.*` keys from files,
+        // which wash's WASH_-prefixed env merging cannot reach. Without this,
+        // switching models under `wash dev` would mean editing a committed
+        // file.
+        let dev = DevConfig {
+            retrieval_model: Some("from-the-file".to_string()),
+            retrieval_model_catalog: Some(SecretUrl::new("/catalog/from/file")),
+            ..Default::default()
+        };
+        let project = Path::new("/project");
+
+        let from_file = dev.retrieval_model_settings(project);
+        assert_eq!(from_file.model.as_deref(), Some("from-the-file"));
+
+        let settled = dev.retrieval_model_settings_from(project, |key| match key {
+            "WASH_RETRIEVAL_MODEL" => Some("from-the-environment".to_string()),
+            "WASH_RETRIEVAL_MODEL_CATALOG" => Some("/catalog/from/env".to_string()),
+            _ => None,
+        });
+        assert_eq!(settled.model.as_deref(), Some("from-the-environment"));
+        assert_eq!(settled.catalog.as_deref(), Some("/catalog/from/env"));
+
+        // An env var set to the empty string is a shell saying "unset" by
+        // accident; the file's value must survive it.
+        let blank = dev.retrieval_model_settings_from(project, |key| {
+            (key == "WASH_RETRIEVAL_MODEL").then(|| "  ".to_string())
+        });
+        assert_eq!(blank.model.as_deref(), Some("from-the-file"));
+    }
+
+    #[test]
+    fn every_retrieval_key_a_config_sets_is_named() {
+        assert!(DevConfig::default().retrieval_keys_set().is_empty());
+        let dev = DevConfig {
+            retrieval_model: Some("granite-107m".to_string()),
+            retrieval_model_catalog: Some(SecretUrl::new("https://models.example/catalog")),
+            retrieval_model_cache: Some(PathBuf::from("cache")),
+            retrieval_model_mirror: Some(SecretUrl::new("https://mirror.example")),
+            retrieval_ca_file: Some(PathBuf::from("ca.pem")),
+            ..Default::default()
+        };
+        assert_eq!(
+            dev.retrieval_keys_set(),
+            [
+                "retrieval_model",
+                "retrieval_model_catalog",
+                "retrieval_model_cache",
+                "retrieval_model_mirror",
+                "retrieval_ca_file",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_project_that_does_not_use_the_plugin_ignores_the_retrieval_environment() {
+        // Exported for `wash host`, these must not turn the plugin on, or fail
+        // `wash dev`, for every other project on the machine.
+        let env = |key: &str| match key {
+            "WASH_RETRIEVAL_MODEL" => Some("granite-107m".to_string()),
+            "WASH_RETRIEVAL_MODEL_CATALOG" => Some("https://models.example/catalog".to_string()),
+            "WASH_RETRIEVAL_MODEL_CACHE" => Some("/var/cache/models".to_string()),
+            "WASH_RETRIEVAL_MODEL_MIRROR" => Some("https://mirror.example".to_string()),
+            _ => None,
+        };
+        let project = Path::new("/project");
+        let unused = DevConfig::default().retrieval_model_settings_from(project, env);
+        assert_eq!(unused.model, None);
+        assert_eq!(unused.catalog, None);
+        assert_eq!(unused.cache, None);
+        assert_eq!(unused.mirror, None);
+
+        // A project that sets the database takes its model from the
+        // environment, which is what the variables are for.
+        let used = dev_with_retrieval_database().retrieval_model_settings_from(project, env);
+        assert_eq!(used.model.as_deref(), Some("granite-107m"));
+        assert_eq!(
+            used.catalog.as_deref(),
+            Some("https://models.example/catalog")
+        );
+    }
+
+    #[test]
+    fn a_model_path_is_anchored_to_the_project_but_a_model_name_is_not() {
+        let dev = dev_with_retrieval_database();
+        let project = Path::new("/project");
+        let named = |value: &'static str| {
+            dev.retrieval_model_settings_from(project, move |key| {
+                (key == "WASH_RETRIEVAL_MODEL").then(|| value.to_string())
+            })
+        };
+        // Joined, not spelled out: the separator between the project and the
+        // path is the platform's, a backslash on Windows.
+        let anchored = project.join("models/granite.json");
+        assert_eq!(
+            named("models/granite.json").model.as_deref(),
+            Some(&*anchored.to_string_lossy()),
+            "a relative descriptor path resolves against the project, as the path key always did"
+        );
+        assert_eq!(
+            named("granite-107m").model.as_deref(),
+            Some("granite-107m"),
+            "a name is looked up in a catalog, not on this filesystem"
+        );
+        assert_eq!(
+            named("/models/granite.json").model.as_deref(),
+            Some("/models/granite.json"),
+            "an absolute path is left alone"
+        );
+    }
+
+    #[test]
+    fn dev_retrieval_model_config_without_url_is_err() {
+        let cfg = DevConfig {
+            retrieval_model_config: Some(PathBuf::from("models/granite.json")),
+            ..Default::default()
+        };
+        let err = cfg.validate_with_env(no_env).unwrap_err().to_string();
+        assert!(err.contains("retrieval_database_url"), "{err}");
+    }
+
+    #[test]
+    fn dev_retrieval_both_set_with_postgres_url_is_ok() {
+        let cfg = DevConfig {
+            retrieval_database_url: Some(SecretUrl::new(
+                "postgres://genius:genius@127.0.0.1:55433/genius_retrieval",
+            )),
+            retrieval_model_config: Some(PathBuf::from("models/granite.json")),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn dev_retrieval_model_config_resolves_against_the_project_dir() {
+        // The context-provider POC's layout: the model sits beside the project.
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("context-provider-wasm");
+        let models = root.path().join("context-provider/models");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("granite.json"), "{}").unwrap();
+
+        let relative = DevConfig {
+            retrieval_model_config: Some(PathBuf::from("../context-provider/models/granite.json")),
+            ..Default::default()
+        };
+        let resolved = relative.retrieval_model_config_path(&project).unwrap();
+        // Found from the project, not from this test's own working directory.
+        assert!(resolved.exists(), "{}", resolved.display());
+
+        let absolute = DevConfig {
+            retrieval_model_config: Some(models.join("granite.json")),
+            ..Default::default()
+        };
+        assert_eq!(
+            absolute.retrieval_model_config_path(&project),
+            Some(models.join("granite.json"))
+        );
     }
 
     #[test]

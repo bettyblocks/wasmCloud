@@ -22,6 +22,10 @@ use wash_runtime::{
     wit::WitInterface,
 };
 
+#[cfg(feature = "betty-retrieval")]
+use crate::cli::retrieval::{
+    BettyRetrievalOverrides, ModelSettings, build_betty_retrieval_config, model_selection,
+};
 use crate::{
     cli::{
         CliCommand, CliContext, CommandOutput, component_build::build_dev_component,
@@ -388,6 +392,70 @@ impl CliCommand for DevCommand {
                 ))?;
                 debug!("wasmcloud:postgres multiplexed plugin registered (implements)");
             }
+        }
+
+        // Add the betty-blocks:retrieval plugin if configured
+        #[cfg(feature = "betty-retrieval")]
+        let retrieval_model = {
+            let settings = dev_config.retrieval_model_settings(project_dir);
+            model_selection(ModelSettings {
+                model: settings.model,
+                model_config: settings.model_config,
+                catalog: settings.catalog,
+                cache: settings.cache,
+                mirror: settings.mirror,
+            })
+        };
+        #[cfg(feature = "betty-retrieval")]
+        match (
+            &dev_config.retrieval_database_url_with_env(|key| std::env::var(key).ok()),
+            retrieval_model,
+        ) {
+            (Some(database_url), Some(model)) => {
+                let retrieval_config = build_betty_retrieval_config(
+                    database_url.expose().to_string(),
+                    model,
+                    BettyRetrievalOverrides {
+                        pool_size: dev_config.retrieval_pool_size,
+                        connect_timeout_secs: dev_config.retrieval_connect_timeout_secs,
+                        ef_search: dev_config.retrieval_ef_search,
+                        max_scan_tuples: dev_config.retrieval_max_scan_tuples,
+                        embed_threads: dev_config.retrieval_embed_threads,
+                        statement_timeout_secs: dev_config.retrieval_statement_timeout_secs,
+                        idle_in_transaction_timeout_secs: dev_config
+                            .retrieval_idle_in_transaction_timeout_secs,
+                        connections_per_workload: dev_config.retrieval_connections_per_workload,
+                        transaction_query_max_bytes: dev_config
+                            .retrieval_transaction_query_max_bytes,
+                        embed_max_texts: dev_config.retrieval_embed_max_texts,
+                        embed_max_text_bytes: dev_config.retrieval_embed_max_text_bytes,
+                        ca_file: dev_config.retrieval_ca_file_path(project_dir),
+                    },
+                )
+                .context("failed to configure the betty-blocks retrieval plugin")?;
+                host_builder = host_builder.with_plugin(Arc::new(
+                    plugin::betty_retrieval::BettyRetrieval::new(retrieval_config)
+                        .context("failed to configure the betty-blocks retrieval plugin")?,
+                ))?;
+                debug!("betty-blocks:retrieval plugin registered");
+            }
+            (Some(_), None) => bail!(
+                "dev.retrieval_database_url is set but no model is: set dev.retrieval_model \
+                 (or WASH_RETRIEVAL_MODEL) to a model name or a descriptor path"
+            ),
+            (None, Some(_)) => {
+                bail!("a retrieval model is set but dev.retrieval_database_url is missing")
+            }
+            (None, None) => {}
+        }
+        #[cfg(not(feature = "betty-retrieval"))]
+        {
+            let set = dev_config.retrieval_keys_set();
+            ensure!(
+                set.is_empty(),
+                "dev.{} require a wash build with the `betty-retrieval` feature",
+                set.join(", dev.")
+            );
         }
 
         // Add otel plugin

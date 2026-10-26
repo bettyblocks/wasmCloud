@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::str::FromStr;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use bigdecimal::num_traits::Float;
 use bit_vec::BitVec;
 use bytes::{BufMut, BytesMut};
@@ -27,7 +27,6 @@ use chrono::{
 };
 use cidr::IpCidr;
 use geo_types::{LineString, Point, Rect, coord};
-use pg_bigdecimal::PgNumeric;
 use postgres_types::{FromSql, IsNull, PgLsn, ToSql, Type as PgType};
 use tokio_postgres::Row;
 use uuid::Uuid;
@@ -60,28 +59,125 @@ fn rect_to_hashable_f64s(r: Rect<f64>) -> ((HashableF64, HashableF64), (Hashable
     )
 }
 
-/// Convert a [`LineString`] (expected to have exactly two points) into a tuple of `HashableF64` pairs
-fn linestring_to_hashable_f64s_tuple(
-    l: LineString<f64>,
-) -> anyhow::Result<((HashableF64, HashableF64), (HashableF64, HashableF64))> {
-    match linestring_to_hashable_f64s(l)[..] {
-        [start, end] => Ok((start, end)),
-        _ => bail!("unexpected number of points in line string"),
-    }
-}
-
-/// Convert a [`LineString`] into a vector of point pairs
-fn linestring_to_hashable_f64s(l: LineString<f64>) -> Vec<(HashableF64, HashableF64)> {
-    l.into_points()
-        .into_iter()
-        .map(point_to_hashable_f64s)
-        .collect::<Vec<_>>()
-}
-
 /// Convert a [`Point`] into two `HashableF64`s
 fn point_to_hashable_f64s(p: Point<f64>) -> (HashableF64, HashableF64) {
     let (x, y) = p.x_y();
     (x.integer_decode(), y.integer_decode())
+}
+
+/// The points of one `path` or `polygon`, as `pg-value` holds them.
+type PointList = Vec<(HashableF64, HashableF64)>;
+
+/// The points of a `path` or `polygon` value, from its binary form: a point
+/// count, then two big-endian `float8`s a point. A `path` carries one byte
+/// ahead of the count saying whether it is closed, which `pg-value` has no
+/// place for and which is dropped.
+///
+/// Neither type is an array, so neither may be handed to postgres-types'
+/// `Vec` decoder: that one panics on any type that is not.
+fn points_from_sql(ty: &PgType, raw: &[u8]) -> Result<PointList, Box<dyn Error + Sync + Send>> {
+    let counted = if *ty == PgType::PATH {
+        raw.split_first()
+            .map(|(_closed, counted)| counted)
+            .ok_or_else(|| format!("a {ty} value holds no bytes"))?
+    } else {
+        raw
+    };
+    let (count, coordinates) = counted
+        .split_first_chunk::<4>()
+        .ok_or_else(|| format!("a {ty} value is too short to hold its point count"))?;
+    let count = i32::from_be_bytes(*count);
+    let (floats, rest) = coordinates.as_chunks::<8>();
+    let whole = rest.is_empty()
+        && usize::try_from(count)
+            .ok()
+            .and_then(|count| count.checked_mul(2))
+            == Some(floats.len());
+    if !whole {
+        return Err(format!(
+            "a {ty} value says it holds {count} points but carries {} bytes of them",
+            coordinates.len()
+        )
+        .into());
+    }
+    Ok(floats
+        .chunks_exact(2)
+        .filter_map(|point| match point {
+            [x, y] => Some((
+                f64::from_be_bytes(*x).integer_decode(),
+                f64::from_be_bytes(*y).integer_decode(),
+            )),
+            _ => None,
+        })
+        .collect())
+}
+
+/// The two end points of one `lseg`, as `pg-value` holds them.
+type PointPair = ((HashableF64, HashableF64), (HashableF64, HashableF64));
+
+/// The end points of an `lseg` value, from its binary form: four big-endian
+/// `float8`s, the first point's `x` and `y` and then the second's.
+///
+/// Not postgres-types' `LineString` decoder, which reads a `path`: it takes
+/// the first of these bytes for a closed flag and the next four for a point
+/// count, and reserving room for that many points panics.
+fn lseg_from_sql(ty: &PgType, raw: &[u8]) -> Result<PointPair, Box<dyn Error + Sync + Send>> {
+    match raw.as_chunks::<8>() {
+        ([start_x, start_y, end_x, end_y], []) => Ok((
+            (
+                f64::from_be_bytes(*start_x).integer_decode(),
+                f64::from_be_bytes(*start_y).integer_decode(),
+            ),
+            (
+                f64::from_be_bytes(*end_x).integer_decode(),
+                f64::from_be_bytes(*end_y).integer_decode(),
+            ),
+        )),
+        _ => Err(format!(
+            "a {ty} value carries {} bytes, not the 32 of its two points",
+            raw.len()
+        )
+        .into()),
+    }
+}
+
+/// An `lseg` as a member of an array, so that `lseg[]` decodes as a `Vec` of
+/// these.
+struct PgLseg(PointPair);
+
+impl FromSql<'_> for PgLseg {
+    fn from_sql(ty: &PgType, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        lseg_from_sql(ty, raw).map(Self)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        *ty == PgType::LSEG
+    }
+}
+
+/// A `path` or `polygon` as a member of an array, so that `path[]` and
+/// `polygon[]` decode as a `Vec` of these.
+struct PgPoints(PointList);
+
+impl FromSql<'_> for PgPoints {
+    fn from_sql(ty: &PgType, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        points_from_sql(ty, raw).map(Self)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        matches!(*ty, PgType::PATH | PgType::POLYGON)
+    }
+}
+
+/// The members of a `path[]` or `polygon[]` value, each as its points.
+fn point_lists_from_sql(
+    ty: &PgType,
+    raw: &[u8],
+) -> Result<Vec<PointList>, Box<dyn Error + Sync + Send>> {
+    Ok(Vec::<PgPoints>::from_sql(ty, raw)?
+        .into_iter()
+        .map(|points| points.0)
+        .collect())
 }
 
 // ── MAC address helpers ─────────────────────────────────────────────────────
@@ -280,6 +376,308 @@ impl FromSql<'_> for MacAddressEui64 {
     }
 }
 
+// ── numeric and money, written from and read to their decimal text ─────────
+
+/// The most digits a `numeric` holds before its point, and after it:
+/// Postgres's own limits (a weight of `i16::MAX` base-10000 digits, and
+/// `NUMERIC_DSCALE_MAX`).
+const NUMERIC_MAX_INTEGER_DIGITS: i64 = 131_072;
+const NUMERIC_MAX_SCALE: i64 = 16_383;
+
+/// The sign word of Postgres's binary `numeric`.
+const NUMERIC_POSITIVE: u16 = 0x0000;
+const NUMERIC_NEGATIVE: u16 = 0x4000;
+const NUMERIC_NAN: u16 = 0xC000;
+const NUMERIC_INFINITY: u16 = 0xD000;
+const NUMERIC_NEGATIVE_INFINITY: u16 = 0xF000;
+
+/// The start of `text`, for an error message: a guest may send megabytes.
+fn numeric_shown(text: &str) -> String {
+    let mut end = text.len().min(64);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < text.len() {
+        format!("{}…", &text[..end])
+    } else {
+        text.to_string()
+    }
+}
+
+/// A numeric's exponent, `[+-]digits`, if it is one and within `i32`, which
+/// keeps the arithmetic on it from overflowing and is far past what any
+/// numeric can hold anyway.
+fn numeric_exponent(text: &str) -> Option<i64> {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    i32::from_str(text).ok().map(i64::from)
+}
+
+/// `text` as Postgres's binary `numeric`: a decimal number with an optional
+/// sign, point and exponent (`-12.50`, `1.5e3`), or `NaN`, `Infinity` or
+/// `-Infinity`. Each digit is read once and placed by where it falls.
+///
+/// Not through `pg_bigdecimal`: a value in exponent form (`1e5`) made that
+/// raise ten to a power of about four billion, which never finished and took
+/// memory until the host was killed, and its arithmetic grows with the
+/// square of the digits. A value past what Postgres holds (131072 digits
+/// before the point, 16383 after it) is refused before anything is expanded.
+fn numeric_to_sql(text: &str, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+    fn header(out: &mut BytesMut, digits: u16, weight: i16, sign: u16, scale: u16) {
+        out.put_u16(digits);
+        out.put_i16(weight);
+        out.put_u16(sign);
+        out.put_u16(scale);
+    }
+
+    if text.len() <= "+Infinity".len() {
+        let special = match text.to_ascii_lowercase().as_str() {
+            "nan" => Some(NUMERIC_NAN),
+            "infinity" | "+infinity" | "inf" | "+inf" => Some(NUMERIC_INFINITY),
+            "-infinity" | "-inf" => Some(NUMERIC_NEGATIVE_INFINITY),
+            _ => None,
+        };
+        if let Some(sign) = special {
+            header(out, 0, 0, sign, 0);
+            return Ok(IsNull::No);
+        }
+    }
+
+    let invalid = || format!("invalid numeric [{}]", numeric_shown(text));
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(unsigned) => (true, unsigned),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            numeric_exponent(exponent).ok_or_else(|| {
+                format!(
+                    "invalid numeric [{}]: its exponent is not an integer within ±2^31",
+                    numeric_shown(text)
+                )
+            })?,
+        ),
+        None => (unsigned, 0),
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all_digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if (integer.is_empty() && fraction.is_empty()) || !all_digits(integer) || !all_digits(fraction)
+    {
+        return Err(invalid().into());
+    }
+
+    let too_long = || format!("invalid numeric [{}]: it is too long", numeric_shown(text));
+    let integer_len = i64::try_from(integer.len()).map_err(|_| too_long())?;
+    let fraction_len = i64::try_from(fraction.len()).map_err(|_| too_long())?;
+    // The display scale: the digits after the point once the exponent has
+    // moved it, as Postgres counts them.
+    let scale = (fraction_len - exponent).max(0);
+    if scale > NUMERIC_MAX_SCALE {
+        return Err(format!(
+            "numeric [{}] has {scale} digits after the point; Postgres holds at most \
+             {NUMERIC_MAX_SCALE}",
+            numeric_shown(text)
+        )
+        .into());
+    }
+    let scale = u16::try_from(scale).map_err(|_| invalid())?;
+
+    let digits = || integer.bytes().chain(fraction.bytes()).map(|b| b - b'0');
+    let Some(first) = digits().position(|d| d != 0) else {
+        // Zero: no digits, and never negative.
+        header(out, 0, 0, NUMERIC_POSITIVE, scale);
+        return Ok(IsNull::No);
+    };
+    let count = integer.len() + fraction.len();
+    let last = count - 1 - digits().rev().position(|d| d != 0).unwrap_or(0);
+
+    // The power of ten of the digit at index `i` is `point - 1 - i`.
+    let point = integer_len + exponent;
+    let index = |i: usize| i64::try_from(i).map_err(|_| too_long());
+    let first_power = point - 1 - index(first)?;
+    let last_power = point - 1 - index(last)?;
+    if first_power + 1 > NUMERIC_MAX_INTEGER_DIGITS {
+        return Err(format!(
+            "numeric [{}] has {} digits before the point; Postgres holds at most \
+             {NUMERIC_MAX_INTEGER_DIGITS}",
+            numeric_shown(text),
+            first_power + 1
+        )
+        .into());
+    }
+
+    // Base-10000 digits, the first at `weight`: each holds the four decimal
+    // digits whose powers of ten floor-divide by four to its position.
+    const POWERS: [i16; 4] = [1, 10, 100, 1000];
+    let weight = first_power.div_euclid(4);
+    let groups = usize::try_from(weight - last_power.div_euclid(4) + 1).map_err(|_| invalid())?;
+    let mut base_10000 = vec![0_i16; groups];
+    for (i, digit) in digits().enumerate().take(last + 1).skip(first) {
+        let power = point - 1 - index(i)?;
+        let group = usize::try_from(weight - power.div_euclid(4)).map_err(|_| invalid())?;
+        let place = usize::try_from(power.rem_euclid(4)).map_err(|_| invalid())?;
+        if let (Some(slot), Some(unit)) = (base_10000.get_mut(group), POWERS.get(place)) {
+            *slot += i16::from(digit) * unit;
+        }
+    }
+
+    header(
+        out,
+        u16::try_from(groups).map_err(|_| invalid())?,
+        i16::try_from(weight).map_err(|_| invalid())?,
+        if negative {
+            NUMERIC_NEGATIVE
+        } else {
+            NUMERIC_POSITIVE
+        },
+        scale,
+    );
+    for group in base_10000 {
+        out.put_i16(group);
+    }
+    Ok(IsNull::No)
+}
+
+/// One member of a `numeric[]` or `money[]` value, written by
+/// [`numeric_to_sql`].
+#[derive(Debug)]
+struct NumericText<'a>(&'a str);
+
+impl ToSql for NumericText<'_> {
+    fn to_sql(
+        &self,
+        _ty: &PgType,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        numeric_to_sql(self.0, out)
+    }
+
+    fn accepts(_ty: &PgType) -> bool {
+        true
+    }
+
+    tokio_postgres::types::to_sql_checked!();
+}
+
+/// A binary `numeric` as Postgres prints it (`-12.50`, `NaN`, `Infinity`),
+/// worked out from its base-10000 digits. Each digit is read once.
+///
+/// Not through `pg_bigdecimal`: its decoder raises 10000 to the power of each
+/// digit's place, which grows faster than the square of the digits (18
+/// seconds for 40,000 digits in a debug build), and a guest chooses the
+/// values it selects.
+fn numeric_from_sql(raw: &[u8]) -> Result<String, Box<dyn Error + Sync + Send>> {
+    use std::fmt::Write as _;
+
+    let (header, body) = raw
+        .split_first_chunk::<8>()
+        .ok_or_else(|| format!("a numeric value carries {} bytes, too few for its header", raw.len()))?;
+    let [count_hi, count_lo, weight_hi, weight_lo, sign_hi, sign_lo, scale_hi, scale_lo] = *header;
+    let count = usize::from(u16::from_be_bytes([count_hi, count_lo]));
+    let weight = i64::from(i16::from_be_bytes([weight_hi, weight_lo]));
+    let scale = usize::from(u16::from_be_bytes([scale_hi, scale_lo]));
+    let negative = match u16::from_be_bytes([sign_hi, sign_lo]) {
+        NUMERIC_POSITIVE => false,
+        NUMERIC_NEGATIVE => true,
+        NUMERIC_NAN => return Ok("NaN".to_string()),
+        NUMERIC_INFINITY => return Ok("Infinity".to_string()),
+        NUMERIC_NEGATIVE_INFINITY => return Ok("-Infinity".to_string()),
+        other => return Err(format!("a numeric value has the unknown sign {other:#06x}").into()),
+    };
+    let (digits, rest) = body.as_chunks::<2>();
+    if digits.len() != count || !rest.is_empty() {
+        return Err(format!(
+            "a numeric value says it holds {count} digits but carries {} bytes of them",
+            body.len()
+        )
+        .into());
+    }
+    let digits: Vec<u16> = digits.iter().map(|digit| u16::from_be_bytes(*digit)).collect();
+    if digits.iter().any(|digit| *digit > 9999) {
+        return Err("a numeric value holds a base-10000 digit past 9999".into());
+    }
+    if i64::try_from(scale).map_or(true, |scale| scale > NUMERIC_MAX_SCALE) {
+        return Err(format!("a numeric value has the display scale {scale}").into());
+    }
+    // The base-10000 digit at `place`, counted from the first one.
+    let digit = |place: i64| {
+        usize::try_from(place)
+            .ok()
+            .and_then(|place| digits.get(place))
+            .copied()
+            .unwrap_or(0)
+    };
+
+    let mut text = String::new();
+    if negative {
+        text.push('-');
+    }
+    if weight < 0 {
+        text.push('0');
+    } else {
+        for place in 0..=weight {
+            // The first digit without leading zeros, as Postgres prints it.
+            let _ = if place == 0 {
+                write!(text, "{}", digit(place))
+            } else {
+                write!(text, "{:04}", digit(place))
+            };
+        }
+    }
+    if scale > 0 {
+        text.push('.');
+        let start = text.len();
+        let mut place = weight + 1;
+        while text.len() - start < scale {
+            let _ = write!(text, "{:04}", digit(place));
+            place += 1;
+        }
+        text.truncate(start + scale);
+    }
+    Ok(text)
+}
+
+/// A binary `money` as its amount with two places. Postgres sends money as
+/// an `int8` of the currency's smallest unit, which is a hundredth under the
+/// `C` locale and most others of `lc_monetary`.
+fn money_from_sql(raw: &[u8]) -> Result<String, Box<dyn Error + Sync + Send>> {
+    let cents = <[u8; 8]>::try_from(raw)
+        .map(i64::from_be_bytes)
+        .map_err(|_| format!("a money value carries {} bytes, not 8", raw.len()))?;
+    let sign = if cents < 0 { "-" } else { "" };
+    let cents = cents.unsigned_abs();
+    Ok(format!("{sign}{}.{:02}", cents / 100, cents % 100))
+}
+
+/// One member of a `numeric[]` value, decoded by [`numeric_from_sql`].
+struct NumericValue(String);
+
+impl FromSql<'_> for NumericValue {
+    fn from_sql(_ty: &PgType, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        numeric_from_sql(raw).map(Self)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        *ty == PgType::NUMERIC
+    }
+}
+
+/// One member of a `money[]` value, decoded by [`money_from_sql`].
+struct MoneyValue(String);
+
+impl FromSql<'_> for MoneyValue {
+    fn from_sql(_ty: &PgType, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        money_from_sql(raw).map(Self)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        *ty == PgType::MONEY
+    }
+}
+
 // ── ToSql for PgValue ───────────────────────────────────────────────────────
 
 impl ToSql for PgValue {
@@ -310,19 +708,11 @@ impl ToSql for PgValue {
                 .to_sql(ty, out),
             PgValue::Integer(n) | PgValue::Int(n) | PgValue::Int4(n) => n.to_sql(ty, out),
             PgValue::Int4Array(ns) => ns.to_sql(ty, out),
-            PgValue::Numeric(s) | PgValue::Decimal(s) | PgValue::Money(s) => {
-                let bigd = pg_bigdecimal::BigDecimal::parse_bytes(s.as_bytes(), 10)
-                    .ok_or_else(|| format!("failed to parse bigint [{s}]"))?;
-                PgNumeric::new(Some(bigd)).to_sql(ty, out)
-            }
+            PgValue::Numeric(s) | PgValue::Decimal(s) | PgValue::Money(s) => numeric_to_sql(s, out),
             PgValue::NumericArray(ss) | PgValue::MoneyArray(ss) => ss
                 .iter()
-                .map(|s| {
-                    pg_bigdecimal::BigDecimal::parse_bytes(s.as_bytes(), 10)
-                        .map(|v| PgNumeric::new(Some(v)))
-                        .ok_or_else(|| format!("failed to parse bigint [{s}]"))
-                })
-                .collect::<Result<Vec<PgNumeric>, _>>()?
+                .map(|s| NumericText(s))
+                .collect::<Vec<_>>()
                 .to_sql(ty, out),
             PgValue::SmallInt(n) | PgValue::Int2(n) => n.to_sql(ty, out),
             PgValue::Int2Array(ns) => ns.to_sql(ty, out),
@@ -731,16 +1121,21 @@ impl FromSql<'_> for PgValue {
                 Err("int8 ranges are not yet supported".into())
             }
 
-            &tokio_postgres::types::Type::MONEY => Ok(PgValue::Money(Numeric::from_sql(ty, raw)?)),
-            &tokio_postgres::types::Type::MONEY_ARRAY => {
-                Ok(PgValue::MoneyArray(Vec::<Numeric>::from_sql(ty, raw)?))
-            }
-            &tokio_postgres::types::Type::NUMERIC => {
-                Ok(PgValue::Numeric(Numeric::from_sql(ty, raw)?))
-            }
-            &tokio_postgres::types::Type::NUMERIC_ARRAY => {
-                Ok(PgValue::NumericArray(Vec::<Numeric>::from_sql(ty, raw)?))
-            }
+            // Both used to be read as text, which their binary forms are not.
+            &tokio_postgres::types::Type::MONEY => Ok(PgValue::Money(money_from_sql(raw)?)),
+            &tokio_postgres::types::Type::MONEY_ARRAY => Ok(PgValue::MoneyArray(
+                Vec::<MoneyValue>::from_sql(ty, raw)?
+                    .into_iter()
+                    .map(|money| money.0)
+                    .collect(),
+            )),
+            &tokio_postgres::types::Type::NUMERIC => Ok(PgValue::Numeric(numeric_from_sql(raw)?)),
+            &tokio_postgres::types::Type::NUMERIC_ARRAY => Ok(PgValue::NumericArray(
+                Vec::<NumericValue>::from_sql(ty, raw)?
+                    .into_iter()
+                    .map(|numeric| numeric.0)
+                    .collect(),
+            )),
             &tokio_postgres::types::Type::NUMMULTI_RANGE
             | &tokio_postgres::types::Type::NUMMULTI_RANGE_ARRAY
             | &tokio_postgres::types::Type::NUM_RANGE
@@ -800,36 +1195,24 @@ impl FromSql<'_> for PgValue {
             &tokio_postgres::types::Type::CIRCLE | &tokio_postgres::types::Type::CIRCLE_ARRAY => {
                 Err("circle & circle[] are not supported".into())
             }
-            &tokio_postgres::types::Type::LINE => Ok(PgValue::Line(
-                linestring_to_hashable_f64s_tuple(LineString::<f64>::from_sql(ty, raw)?)?,
-            )),
-            &tokio_postgres::types::Type::LINE_ARRAY => Ok(PgValue::LineArray(
-                Vec::<LineString<f64>>::from_sql(ty, raw)?
-                    .into_iter()
-                    .map(linestring_to_hashable_f64s_tuple)
-                    .collect::<Result<Vec<_>, _>>()?,
-            )),
-            &tokio_postgres::types::Type::LSEG => Ok(PgValue::Lseg(
-                linestring_to_hashable_f64s_tuple(LineString::<f64>::from_sql(ty, raw)?)?,
-            )),
+            // Postgres stores a line as the three coefficients of
+            // `Ax + By + C = 0`, which the two points `pg-value` has for one
+            // cannot say without choosing two points on it.
+            &tokio_postgres::types::Type::LINE | &tokio_postgres::types::Type::LINE_ARRAY => Err(
+                "line & line[] are not supported (consider using a cast like 'value'::text)"
+                    .into(),
+            ),
+            &tokio_postgres::types::Type::LSEG => Ok(PgValue::Lseg(lseg_from_sql(ty, raw)?)),
             &tokio_postgres::types::Type::LSEG_ARRAY => Ok(PgValue::LsegArray(
-                Vec::<LineString<f64>>::from_sql(ty, raw)?
+                Vec::<PgLseg>::from_sql(ty, raw)?
                     .into_iter()
-                    .map(linestring_to_hashable_f64s_tuple)
-                    .collect::<Result<Vec<_>, _>>()?,
+                    .map(|lseg| lseg.0)
+                    .collect(),
             )),
-            &tokio_postgres::types::Type::PATH => Ok(PgValue::Path(
-                Vec::<Point<f64>>::from_sql(ty, raw)?
-                    .into_iter()
-                    .map(point_to_hashable_f64s)
-                    .collect::<Vec<_>>(),
-            )),
-            &tokio_postgres::types::Type::PATH_ARRAY => Ok(PgValue::PathArray(
-                Vec::<Vec<Point<f64>>>::from_sql(ty, raw)?
-                    .into_iter()
-                    .map(|points| points.into_iter().map(point_to_hashable_f64s).collect())
-                    .collect::<Vec<_>>(),
-            )),
+            &tokio_postgres::types::Type::PATH => Ok(PgValue::Path(points_from_sql(ty, raw)?)),
+            &tokio_postgres::types::Type::PATH_ARRAY => {
+                Ok(PgValue::PathArray(point_lists_from_sql(ty, raw)?))
+            }
             &tokio_postgres::types::Type::POINT => {
                 let point = Point::<f64>::from_sql(ty, raw)?;
                 Ok(PgValue::Point(point_to_hashable_f64s(point)))
@@ -840,18 +1223,12 @@ impl FromSql<'_> for PgValue {
                     .map(point_to_hashable_f64s)
                     .collect::<Vec<_>>(),
             )),
-            &tokio_postgres::types::Type::POLYGON => Ok(PgValue::Polygon(
-                Vec::<Point<f64>>::from_sql(ty, raw)?
-                    .into_iter()
-                    .map(point_to_hashable_f64s)
-                    .collect::<Vec<_>>(),
-            )),
-            &tokio_postgres::types::Type::POLYGON_ARRAY => Ok(PgValue::PolygonArray(
-                Vec::<Vec<Point<f64>>>::from_sql(ty, raw)?
-                    .into_iter()
-                    .map(|v| v.into_iter().map(point_to_hashable_f64s).collect())
-                    .collect::<Vec<Vec<_>>>(),
-            )),
+            &tokio_postgres::types::Type::POLYGON => {
+                Ok(PgValue::Polygon(points_from_sql(ty, raw)?))
+            }
+            &tokio_postgres::types::Type::POLYGON_ARRAY => {
+                Ok(PgValue::PolygonArray(point_lists_from_sql(ty, raw)?))
+            }
 
             &tokio_postgres::types::Type::CIDR => {
                 let cidr = IpCidr::from_sql(ty, raw)?;
