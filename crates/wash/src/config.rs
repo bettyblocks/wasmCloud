@@ -103,6 +103,30 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The files and directories the `configs:`/`secrets:` catalogs read, with
+    /// relative paths resolved against `project_dir` — paths a host reserves
+    /// so no workload volume can expose them.
+    pub fn reserved_host_paths(&self, project_dir: &Path) -> Vec<PathBuf> {
+        let resolve = |path: &PathBuf| {
+            if path.is_relative() {
+                project_dir.join(path)
+            } else {
+                path.clone()
+            }
+        };
+        self.config_sources
+            .values()
+            .flat_map(|source| [&source.file, &source.dir])
+            .chain(
+                self.secret_sources
+                    .values()
+                    .flat_map(|source| [&source.file, &source.dir]),
+            )
+            .flatten()
+            .map(resolve)
+            .collect()
+    }
+
     /// Get the WIT directory from the configuration, defaulting to "./wit" if not set
     pub fn wit_dir(&self) -> PathBuf {
         if let Some(wit_config) = &self.wit
@@ -256,9 +280,11 @@ pub struct WorkloadConfig {
     /// strings such as `"*"`, `"*.example.com"`, `"example.com"`, or a
     /// literal IP address.
     ///
-    /// An omitted or empty list denies every lookup. Resolution is opt-in:
-    /// nothing substitutes an allow-all policy for a workload that
-    /// declared none.
+    /// A host named in `allowedHosts` may be resolved without being listed
+    /// here; this list is for names beyond those. Resolution is otherwise
+    /// opt-in: nothing substitutes an allow-all policy for a workload that
+    /// declared none, and the `*` an omitted `allowedHosts` becomes opens no
+    /// lookup.
     #[serde(default)]
     #[builder(default)]
     pub allowed_ip_name_lookups: Vec<AllowedIpName>,
@@ -423,9 +449,11 @@ pub struct DevComponent {
     /// How many warm instances a reclaim sweep never retires below.
     ///
     /// Unset (or `0`) lets a fully idle pool empty out, so the next call
-    /// after a quiet spell starts cold. Capped at `poolSize`. A floor on
-    /// reclaim, not a target to grow to: instances are still only built when
-    /// a call needs one. Only meaningful alongside `reclaimWindowSeconds`.
+    /// after a quiet spell starts cold. A value at or above `poolSize`
+    /// disables reclaim entirely, since a sweep could never find a surplus to
+    /// retire. A floor on reclaim, not a target to grow to: instances are
+    /// still only built when a call needs one. Only meaningful alongside
+    /// `reclaimWindowSeconds`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reclaim_min_instances: Option<i32>,
 }
@@ -581,9 +609,9 @@ pub enum WorkloadConfigPolicy {
     Allow,
     /// Host-owned keys come only from the operator.
     ///
-    /// The default on `wash host`. It refuses nothing where nothing is declared
-    /// — a plugin that names no keys of its own, under an entry that sets none,
-    /// owns none — so it is the stricter default without being a breaking one.
+    /// The default on `wash host`. It refuses only the keys a plugin claims or
+    /// an entry sets: a plugin that names no keys of its own, under an entry
+    /// that sets none, owns none.
     #[default]
     Deny,
     /// `allow` plus diagnostics: nothing is refused, but everything `deny`
@@ -993,7 +1021,10 @@ impl From<HttpClientTrustRoots> for wash_runtime::host::http_client::TrustRoots 
 /// # Errors
 ///
 /// Rejects a zero for any ceiling or for the wait, which would silently mean
-/// "no connections" or "never wait" rather than what the operator meant.
+/// "no connections" or "never wait" rather than what the operator meant, and
+/// any ceiling above [`tokio::sync::Semaphore::MAX_PERMITS`], which would panic
+/// inside the semaphore — for per-workload ceilings, only once the first
+/// workload claims a quota.
 ///
 /// [`QuotaRegistry`]: wash_runtime::host::quota::QuotaRegistry
 pub fn connection_quotas(
@@ -1003,13 +1034,14 @@ pub fn connection_quotas(
     max_inbound_per_workload: Option<usize>,
     http_connection_wait: Option<std::time::Duration>,
 ) -> anyhow::Result<std::sync::Arc<wash_runtime::host::quota::QuotaRegistry>> {
+    let checked = |value: Option<usize>, name: &str| -> anyhow::Result<Option<usize>> {
+        anyhow::ensure!(value != Some(0), "{name} must be at least 1");
+        within_max_permits(value, name)?;
+        Ok(value)
+    };
     let defaults = wash_runtime::host::quota::QuotaLimits::default();
     let resolve = |value: Option<usize>, default: usize, name: &str| -> anyhow::Result<usize> {
-        match value {
-            Some(0) => anyhow::bail!("{name} must be at least 1"),
-            Some(v) => Ok(v),
-            None => Ok(default),
-        }
+        Ok(checked(value, name)?.unwrap_or(default))
     };
     let limits = wash_runtime::host::quota::QuotaLimits {
         outbound_http: resolve(
@@ -1028,9 +1060,7 @@ pub fn connection_quotas(
             "max_inbound_socket_connections_per_workload",
         )?,
     };
-    if max_connections == Some(0) {
-        anyhow::bail!("max_connections must be at least 1");
-    }
+    let max_connections = checked(max_connections, "max_connections")?;
     if let Some(total) = max_connections
         && limits
             .outbound_http
@@ -1142,6 +1172,20 @@ pub fn wasmcloud_messaging_limits(
     );
 
     Ok(limits)
+}
+
+/// Rejects a ceiling above [`tokio::sync::Semaphore::MAX_PERMITS`], where
+/// `Semaphore::new` panics, so it fails at startup instead.
+pub fn within_max_permits(value: Option<usize>, name: &str) -> anyhow::Result<()> {
+    const MAX_PERMITS: usize = tokio::sync::Semaphore::MAX_PERMITS;
+    match value {
+        Some(v) if v > MAX_PERMITS => {
+            anyhow::bail!(
+                "{name} must be at most {MAX_PERMITS} (the most a semaphore can hold), got {v}"
+            )
+        }
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1935,6 +1979,20 @@ mod tests {
         assert!(connection_quotas(None, None, None, None, Some(Duration::ZERO)).is_err());
     }
 
+    /// A ceiling above `Semaphore::MAX_PERMITS` would panic inside
+    /// `Semaphore::new`, so it must fail at startup instead.
+    #[test]
+    fn connection_quotas_reject_above_max_permits() {
+        let max = tokio::sync::Semaphore::MAX_PERMITS;
+        let over = max + 1;
+        assert!(connection_quotas(Some(over), None, None, None, None).is_err());
+        assert!(connection_quotas(None, Some(over), None, None, None).is_err());
+        assert!(connection_quotas(None, None, Some(over), None, None).is_err());
+        assert!(connection_quotas(None, None, None, Some(over), None).is_err());
+        assert!(connection_quotas(Some(usize::MAX), None, None, None, None).is_err());
+        assert!(connection_quotas(Some(max), Some(max), Some(max), Some(max), None).is_ok());
+    }
+
     #[test]
     fn wasmcloud_messaging_limits_reject_zero() {
         // Zero would silently mean "process no messages" — a host that looks
@@ -1952,6 +2010,15 @@ mod tests {
         assert!(wasmcloud_messaging_limits(Some(too_big), None, None).is_err());
         assert!(wasmcloud_messaging_limits(None, Some(too_big), None).is_err());
         assert!(wasmcloud_messaging_limits(Some(usize::MAX), None, None).is_err());
+    }
+
+    #[test]
+    fn within_max_permits_rejects_only_what_a_semaphore_cannot_hold() {
+        let max = tokio::sync::Semaphore::MAX_PERMITS;
+        assert!(within_max_permits(None, "x").is_ok());
+        assert!(within_max_permits(Some(max), "x").is_ok());
+        assert!(within_max_permits(Some(max + 1), "x").is_err());
+        assert!(within_max_permits(Some(usize::MAX), "x").is_err());
     }
 
     #[test]
