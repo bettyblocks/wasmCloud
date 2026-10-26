@@ -73,12 +73,17 @@ pub enum Source {
     PrecompiledFile(PathBuf),
 }
 
+/// An empty module to compile: only here so [`Component`] can be `Default`
+/// (as upstream's is); a real component always names its own source.
+impl Default for Source {
+    fn default() -> Self {
+        Source::Compile(Bytes::new())
+    }
+}
+
 /// A WebAssembly component that can be executed as part of a workload.
 /// Components can be pooled for concurrent execution and have invocation limits.
-///
-/// Note : No `Default` because a component with no code source i pretty meaningless, so every construction
-/// must definitively state where its code comes from ([`Source`]).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Component {
     pub name: String,
     pub digest: Option<String>,
