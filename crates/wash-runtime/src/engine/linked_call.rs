@@ -343,6 +343,7 @@ async fn build_ctx_from_template(
     Ok(ctx)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn new_store_from_templates(
     engine: &wasmtime::Engine,
     stream_payloads: &Arc<super::stream_payload::StreamPayloads>,

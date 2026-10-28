@@ -91,4 +91,8 @@ pub(crate) const P3_FIXTURES: &[&str] = &[
     "events-caller",
     "events-service",
     "dispatch-target",
+    "cancellable-producer",
+    "cancellable-component",
+    "cancel-broker-worker",
+    "cancel-broker-commander",
 ];
