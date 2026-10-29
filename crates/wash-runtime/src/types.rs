@@ -73,12 +73,17 @@ pub enum Source {
     PrecompiledFile(PathBuf),
 }
 
+/// An empty module to compile: only here so [`Component`] can be `Default`
+/// (as upstream's is); a real component always names its own source.
+impl Default for Source {
+    fn default() -> Self {
+        Source::Compile(Bytes::new())
+    }
+}
+
 /// A WebAssembly component that can be executed as part of a workload.
 /// Components can be pooled for concurrent execution and have invocation limits.
-///
-/// Note : No `Default` because a component with no code source i pretty meaningless, so every construction
-/// must definitively state where its code comes from ([`Source`]).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Component {
     pub name: String,
     pub digest: Option<String>,
@@ -110,8 +115,9 @@ pub struct Component {
     pub reclaim_window_seconds: i32,
     /// How many warm instances a reclaim sweep never retires below. Unset
     /// lets an idle pool empty out, so the next call after a quiet spell
-    /// starts cold. Capped at `pool_size`, and only meaningful alongside
-    /// `reclaim_window_seconds`.
+    /// starts cold. A value at or above `pool_size` disables reclaim
+    /// entirely, since a sweep could never find a surplus to retire. Only
+    /// meaningful alongside `reclaim_window_seconds`.
     pub reclaim_min_instances: i32,
 }
 
@@ -144,8 +150,9 @@ pub struct LocalResources {
     /// request hot path matches against the typed enum directly.
     pub allowed_hosts: Arc<[AllowedHost]>,
     /// Which names the component may resolve through
-    /// `wasi:sockets/ip-name-lookup` (`resolve-addresses`).
-    /// **Empty = deny every lookup**, reported to the guest as
+    /// `wasi:sockets/ip-name-lookup` (`resolve-addresses`), beyond the hosts
+    /// `allowed_hosts` names — a host it may connect to it may also resolve.
+    /// **Both empty = deny every lookup**, reported to the guest as
     /// `permanent-resolver-failure`. See
     /// [`crate::host::allowed_ip_name`] for the accepted entry forms; pass
     /// an explicit `[AllowedIpName::Any]` to resolve any name. Strings from

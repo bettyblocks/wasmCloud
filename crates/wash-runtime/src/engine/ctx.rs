@@ -63,6 +63,8 @@ impl wasmtime_wasi_tls::TlsProvider for SharedTlsProvider {
 
 /// Shared context for linked components
 pub struct SharedCtx {
+    /// Typed adapters used when this store exchanges stream/future payloads.
+    pub stream_payloads: Arc<super::stream_payload::StreamPayloads>,
     /// Current active context
     pub active_ctx: Ctx,
     /// The resource table used to manage resources in the Wasmtime store.
@@ -154,6 +156,7 @@ impl SharedCtx {
     pub fn new(context: Ctx) -> Self {
         Self {
             active_ctx: context,
+            stream_payloads: Arc::default(),
             table: ResourceTable::new(),
             contexts: Default::default(),
             exporter_instances: Default::default(),
@@ -334,6 +337,8 @@ pub struct Ctx {
     pub workload_id: Arc<str>,
     /// The WASI context used to provide WASI functionality to the components using this context.
     pub ctx: WasiCtx,
+    /// Directory handles retained from workload validation.
+    pub(crate) volume_mounts: Vec<super::volumes::ResolvedVolumeMount>,
     /// The HTTP context used to provide HTTP functionality to the component.
     pub http: WasiHttpCtx,
     /// The sockets context used to provide socket functionality (with loopback support).
@@ -350,6 +355,10 @@ pub struct Ctx {
     /// Calling this handle will drop the store via epoch interruption trap
     #[cfg(feature = "epoch-interruption")]
     pub cancel_handle: Arc<AtomicBool>,
+    /// Whether this workload deploy has already logged the remediation hint
+    /// for a known guest toolchain trap. Shared by every component of one
+    /// deploy (see [`crate::engine::trap_remediation`]).
+    pub(crate) trap_hint_logged: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Ctx {
@@ -645,6 +654,7 @@ impl CtxBuilder {
             }),
             workload_id: self.workload_id,
             component_id: self.component_id,
+            volume_mounts: Vec::new(),
             http: WasiHttpCtx::new(),
             sockets: self.sockets.unwrap_or_default(),
             #[cfg(feature = "wasi-tls")]
@@ -662,6 +672,7 @@ impl CtxBuilder {
             http_hooks,
             #[cfg(feature = "epoch-interruption")]
             cancel_handle: self.cancel_handle,
+            trap_hint_logged: Arc::default(),
         }
     }
 }
