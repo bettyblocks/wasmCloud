@@ -2572,6 +2572,12 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         // would be forever: nothing will mark an accept loop stopped that never
         // ran.
         if was_accepting {
+            // The signal only queues the stop. Whoever watches [`Self::stopped`]
+            // from another runtime — the host's control loop runs on its own —
+            // must not see a clean shutdown before the loop has had its turn, or
+            // it cannot tell a requested stop from a lost ingress. Bounded
+            // because the loop is detached and this must not hang a caller on it.
+            let _ = tokio::time::timeout(ACCEPT_LOOP_STOP_WAIT, self.connections.stopped()).await;
             self.release_when_drained();
         }
         Ok(())
@@ -2837,6 +2843,10 @@ const SHED_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// How long a peer has to finish a TLS handshake before its connection slot is
 /// taken back.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long [`HostHandler::stop`] waits for the accept loop to act on the stop
+/// signal before returning anyway.
+const ACCEPT_LOOP_STOP_WAIT: Duration = Duration::from_secs(5);
 
 /// How long an accepted connection has to produce its first request.
 ///
