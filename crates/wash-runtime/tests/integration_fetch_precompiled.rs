@@ -103,12 +103,13 @@ async fn start_nats() -> Result<(ContainerAsync<GenericImage>, String)> {
     Ok((container, nats_url))
 }
 
+/// Precompiled with the wash-runtime engine's own config. A cwasm only loads
+/// into an engine whose settings (epoch interruption, collector, ...) match
+/// the ones it was compiled with.
 fn precompile_minimal_component() -> Result<Vec<u8>> {
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true);
-    let engine = wasmtime::Engine::new(&config)?;
+    let engine = Engine::builder().build()?;
     let wasm = wat::parse_str("(component)")?;
-    let cwasm = engine.precompile_component(&wasm)?;
+    let cwasm = engine.inner().precompile_component(&wasm)?;
     Ok(cwasm)
 }
 

@@ -58,9 +58,18 @@ use std::env;
 use std::str::FromStr;
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use wasmtime_wasi::WasiView;
+
+// Exact instance versions registered by the Wasmtime bindings below. Keep
+// these aligned when upgrading Wasmtime: partial overrides must reopen those
+// instances, since Linker::instance does not apply semver matching. The override
+// integration tests check both exact and compatible guest imports.
+pub(crate) const WASI_LINKER_VERSIONS: [semver::Version; 2] = [
+    semver::Version::new(0, 2, 12),
+    semver::Version::new(0, 3, 0),
+];
 
 /// Add all WASI interfaces to the linker, using upstream for non-socket interfaces
 /// and our custom socket implementation (with loopback support) for socket interfaces.
@@ -76,10 +85,7 @@ fn add_wasi_to_linker(linker: &mut Linker<SharedCtx>) -> anyhow::Result<()> {
         linker,
         <SharedCtx as wasmtime_wasi::filesystem::WasiFilesystemView>::filesystem,
     )?;
-    filesystem::preopens::add_to_linker::<SharedCtx, wasmtime_wasi::filesystem::WasiFilesystem>(
-        linker,
-        <SharedCtx as wasmtime_wasi::filesystem::WasiFilesystemView>::filesystem,
-    )?;
+    filesystem::preopens::add_to_linker::<SharedCtx, SharedCtx>(linker, ctx::extract_active_ctx)?;
 
     // Clocks
     clocks::wall_clock::add_to_linker::<SharedCtx, wasmtime_wasi::clocks::WasiClocks>(
@@ -180,7 +186,17 @@ fn add_wasi_to_linker(linker: &mut Linker<SharedCtx>) -> anyhow::Result<()> {
     // CLI, clocks, filesystem, random — upstream P3 add_to_linker
     wasmtime_wasi::p3::cli::add_to_linker(linker)?;
     wasmtime_wasi::p3::clocks::add_to_linker(linker)?;
-    wasmtime_wasi::p3::filesystem::add_to_linker(linker)?;
+    wasmtime_wasi::p3::bindings::filesystem::types::add_to_linker::<
+        SharedCtx,
+        wasmtime_wasi::filesystem::WasiFilesystem,
+    >(
+        linker,
+        <SharedCtx as wasmtime_wasi::filesystem::WasiFilesystemView>::filesystem,
+    )?;
+    wasmtime_wasi::p3::bindings::filesystem::preopens::add_to_linker::<SharedCtx, SharedCtx>(
+        linker,
+        ctx::extract_active_ctx,
+    )?;
     wasmtime_wasi::p3::random::add_to_linker(linker)?;
 
     // Sockets with our custom P3 implementation (with loopback)
@@ -221,15 +237,21 @@ pub fn targets_wasip3_http(component: &Component) -> bool {
 }
 
 pub mod abandon;
+pub mod command;
 pub mod ctx;
 pub mod dispatch;
 pub mod guest_memory;
 pub(crate) mod instance_driver;
 pub(crate) mod instance_pool;
+pub mod stream_payload;
 pub use instance_pool::{InstancePolicy, ReclaimPolicy};
 pub mod host_memory;
 pub(crate) mod linked_call;
+pub mod pool_usage;
+pub mod process_memory;
+mod scratch;
 pub(crate) mod store;
+pub(crate) mod trap_remediation;
 mod value;
 mod volumes;
 pub mod workload;
@@ -252,14 +274,14 @@ struct InstalledPool {
     core_instances: u32,
     memories: u32,
     max_memory_size: u64,
+    totals: pool_usage::PoolTotals,
 }
 
 impl InstalledPool {
     /// Address space the pool reserves. Keyed on the memory count, not the
-    /// instance count.
+    /// instance count, and never less than wasmtime's reservation per slot.
     fn reservation(&self) -> u64 {
-        self.max_memory_size
-            .saturating_mul(u64::from(self.memories))
+        host_memory::pool_slab_bytes(self.max_memory_size, self.memories)
     }
 }
 
@@ -295,6 +317,7 @@ fn spawn_epoch_ticker(engine: &wasmtime::Engine) -> anyhow::Result<()> {
 /// It wraps a wasmtime engine with additional functionality for workload management.
 #[derive(Clone)]
 pub struct Engine {
+    stream_payloads: Arc<stream_payload::StreamPayloads>,
     // wasmtime engine
     pub(crate) inner: wasmtime::Engine,
     pub(crate) cache: Cache<CacheKey, CacheValue>,
@@ -302,6 +325,9 @@ pub struct Engine {
     /// Optional directory for caching compiled components as `.cwasm` files, loaded
     /// file-backed (see `persist_and_reload` for why that matters).
     pub(crate) compiled_cache_dir: Option<PathBuf>,
+    /// Compiles running workloads hold, consulted before the cache so a live
+    /// compile can be reused after cache eviction. See [`LiveCompiles`].
+    live_compiles: Arc<LiveCompiles>,
     /// Compiles that actually ran on this engine.
     ///
     /// Test-only, and there is no way to do without it: what the digest-keyed
@@ -315,11 +341,20 @@ pub struct Engine {
     /// the host's port table, and the connection budget. The workload-level half
     /// (`allowedHosts`, `allowedHostLoopbackPorts`) is layered over it per component.
     pub(crate) socket_policy: Arc<crate::sockets::policy::SocketPolicy>,
+    /// Which host paths a workload's `hostPath` volume may name.
+    host_paths: volumes::HostPathPolicy,
+    /// Where `emptyDir` volumes live. An error when the root could not be
+    /// claimed, reported to the first workload that asks for one.
+    scratch: Result<Arc<scratch::ScratchRoot>, Arc<str>>,
     pub(crate) host_memory: host_memory::HostMemoryBudgets,
     /// The host-wide counter of guest linear-memory bytes that
     /// [`host_memory::HostMemoryBudgets::max_guest_memory`] is the cap on.
     /// Every store this engine builds carries a limiter drawing on it.
     pub(crate) guest_memory: Arc<guest_memory::GuestMemoryBudget>,
+    /// The whole process's footprint against `max_process_memory`, sampled on
+    /// its own thread. The guest budget refuses growth while it is over.
+    /// `None` when the guard was switched off.
+    process_memory: Option<Arc<process_memory::ProcessMemoryGuard>>,
     /// TLS provider override for `wasi:tls` client connections.
     #[cfg(feature = "wasi-tls")]
     pub(crate) tls_provider: Option<SharedTlsProvider>,
@@ -343,6 +378,27 @@ pub struct Engine {
     /// replaces it outright. Quoting the flag in a refusal that the installed
     /// ceiling caused produces advice that cannot work.
     installed_heap_memory: Option<u64>,
+    /// Every total the installed pool was built with, for
+    /// [`Engine::pool_usage`]. `None` when pooling is off.
+    pool_totals: Option<pool_usage::PoolTotals>,
+    /// The linkers every workload component starts from, built once and
+    /// shared (see [`BaseLinkers`]).
+    base_linkers: Arc<BaseLinkers>,
+}
+
+/// The WASI linker, with and without `wasi:http`, that every workload
+/// component starts from.
+///
+/// Building one is the largest part of what an idle workload costs the host:
+/// about 140 KiB for WASI and 180 KiB with `wasi:http`, most of a
+/// scale-to-zero workload. What goes into them depends on nothing about the
+/// workload, so each is built once per engine and shared; a component's
+/// [`workload::WorkloadMetadata::linker`] copies its own only when a plugin
+/// or a link writes to it.
+#[derive(Default)]
+struct BaseLinkers {
+    wasi: OnceLock<Arc<Linker<SharedCtx>>>,
+    wasi_http: OnceLock<Arc<Linker<SharedCtx>>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -366,6 +422,44 @@ impl std::fmt::Debug for CacheValue {
     }
 }
 
+/// Compiles that running workloads still hold, by digest.
+///
+/// The compile cache is bounded and forgets idle entries, but a workload
+/// keeps its `Component` for as long as it runs. Without this, a digest the
+/// cache let go of would be compiled again by the next workload to start
+/// from it, holding a second copy of the machine code beside the first.
+/// Consulting the live set first keeps one copy per digest while any
+/// workload holds it, however small the cache.
+type LiveCompiles =
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<LiveCompile>>>;
+
+/// One digest's compile, held by every workload loaded from it. The entry in
+/// [`LiveCompiles`] lives exactly as long as some workload holds this.
+pub(crate) struct LiveCompile {
+    digest: String,
+    component: Component,
+    live: std::sync::Weak<LiveCompiles>,
+}
+
+impl Drop for LiveCompile {
+    fn drop(&mut self) {
+        let Some(live) = self.live.upgrade() else {
+            return;
+        };
+        let mut live = live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A workload that started after this one's last holder let go has
+        // recorded a fresh compile under the same digest; leave that one.
+        if live
+            .get(&self.digest)
+            .is_some_and(|entry| entry.strong_count() == 0)
+        {
+            live.remove(&self.digest);
+        }
+    }
+}
+
 /// A cached compile failure, shared by every caller that raced for the same key.
 ///
 /// `moka` hands a failed `try_get_with` back as `Arc<anyhow::Error>`, and an
@@ -380,7 +474,7 @@ impl std::fmt::Debug for CacheValue {
 /// straight into the original error, since `anyhow::Error` derefs to
 /// `dyn StdError`.
 #[derive(Debug)]
-struct SharedError(Arc<anyhow::Error>);
+pub(crate) struct SharedError(pub(crate) Arc<anyhow::Error>);
 
 impl std::fmt::Display for SharedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -447,6 +541,11 @@ fn parse_pooling_minimum(text: &str) -> Option<u64> {
 }
 
 impl Engine {
+    /// Register application-defined stream/future payloads before resolving workloads.
+    pub fn stream_payloads(&self) -> &Arc<stream_payload::StreamPayloads> {
+        &self.stream_payloads
+    }
+
     /// host_memory has the memory budgets this engine was built with including max host
     /// memory available, default component heap limit, and number of core instances available.
     /// Read back rather than recomputed, so what a caller reports is what the engine actually
@@ -461,6 +560,25 @@ impl Engine {
         &self.guest_memory
     }
 
+    /// The process's memory footprint against `max_process_memory`, for an
+    /// embedder to report, or to stop taking on work while
+    /// [`process_memory::ProcessMemoryGuard::is_over`].
+    /// `None` when the engine was built
+    /// [`without_max_process_memory`](EngineBuilder::without_max_process_memory).
+    pub fn process_memory(&self) -> Option<&Arc<process_memory::ProcessMemoryGuard>> {
+        self.process_memory.as_ref()
+    }
+
+    /// Inject admission state without the process sampler overwriting it.
+    #[cfg(all(test, feature = "washlet"))]
+    pub(crate) fn with_unsampled_admission_guard(
+        mut self,
+        guard: Arc<process_memory::ProcessMemoryGuard>,
+    ) -> Self {
+        self.process_memory = Some(guard);
+        self
+    }
+
     /// Core instances the pooling allocator was configured to admit, captured
     /// from the [`PoolingAllocationConfig`] actually installed — so it reflects
     /// the `WASMTIME_POOLING_TOTAL_CORE_INSTANCES` override and a
@@ -472,6 +590,16 @@ impl Engine {
     /// [`new_pooling_config`]) and drift the moment either side changed.
     pub fn total_core_instances(&self) -> Option<u32> {
         self.total_core_instances
+    }
+
+    /// Every pooling allocator total against what is in use now, so an
+    /// embedder can report a host whose pool is full: its workloads still say
+    /// running while every instantiation is refused. `None` when pooling is
+    /// off. See [`pool_usage::pool_refusals`] for refusals between readings.
+    pub fn pool_usage(&self) -> Option<pool_usage::PoolUsage> {
+        let totals = self.pool_totals.as_ref()?;
+        let metrics = self.inner.pooling_allocator_metrics()?;
+        Some(pool_usage::PoolUsage::read(&metrics, totals))
     }
 
     /// Creates a new [`EngineBuilder`] for configuring an engine.
@@ -536,6 +664,9 @@ impl Engine {
 
         // Process and validate volumes - create a lookup map from volume name to validated host path
         let mut validated_volumes = std::collections::HashMap::new();
+        // Created on the first `emptyDir`, and removed when the workload is
+        // released or, for a start that fails before then, when this drops.
+        let mut workload_scratch: Option<Arc<scratch::ScratchDir>> = None;
 
         for v in volumes {
             let host_path = match v.volume_type {
@@ -546,14 +677,26 @@ impl Engine {
                             "HostPath volume '{local_path}' does not exist or is not a directory",
                         );
                     }
-                    path
+                    self.host_paths.open(&path)?
                 }
                 VolumeType::EmptyDir(EmptyDirVolume {}) => {
-                    // Create a temporary directory for the empty dir volume
-                    let temp_dir = tempfile::tempdir()
-                        .context("failed to create temp dir for empty dir volume")?;
-                    tracing::debug!(path = ?temp_dir.path(), "created temp dir for empty dir volume");
-                    temp_dir.keep()
+                    let workload_scratch = match &mut workload_scratch {
+                        Some(dir) => dir,
+                        None => {
+                            let root = self.scratch.as_ref().map_err(|e| {
+                                anyhow::anyhow!("emptyDir volumes are unavailable: {e}")
+                            })?;
+                            workload_scratch.insert(root.workload_dir()?)
+                        }
+                    };
+                    // Kept on disk: the workload's scratch directory owns it.
+                    let volume_dir = tempfile::Builder::new()
+                        .prefix("volume-")
+                        .tempdir_in(workload_scratch.path())
+                        .context("failed to create an emptyDir volume")?
+                        .keep();
+                    tracing::debug!(path = ?volume_dir, "created emptyDir volume");
+                    volumes::ReservedHostPaths::default().open(&volume_dir)?
                 }
             };
 
@@ -562,6 +705,8 @@ impl Engine {
         }
 
         let loopback = Arc::default();
+        // One per deploy, shared by every component in it.
+        let trap_hint_logged = Arc::default();
 
         // Iniitalize service
         let service = if let Some(svc) = service {
@@ -575,7 +720,11 @@ impl Engine {
             ) {
                 Ok(handle) => {
                     tracing::debug!("successfully initialized service component");
-                    Some(handle.with_annotations(Arc::clone(&annotations_arc)))
+                    Some(
+                        handle
+                            .with_annotations(Arc::clone(&annotations_arc))
+                            .with_trap_hint_flag(&trap_hint_logged),
+                    )
                 }
                 Err(e) => {
                     tracing::error!(err = ?e, "failed to initialize service component");
@@ -599,7 +748,11 @@ impl Engine {
             ) {
                 Ok(handle) => {
                     tracing::debug!("successfully initialized workload component");
-                    workload_components.push(handle.with_annotations(Arc::clone(&annotations_arc)));
+                    workload_components.push(
+                        handle
+                            .with_annotations(Arc::clone(&annotations_arc))
+                            .with_trap_hint_flag(&trap_hint_logged),
+                    );
                 }
                 Err(e) => {
                     tracing::error!(err = ?e, "failed to initialize component");
@@ -615,7 +768,9 @@ impl Engine {
             service,
             workload_components,
             host_interfaces,
-        );
+        )
+        .with_scratch(workload_scratch)
+        .with_stream_payloads(Arc::clone(&self.stream_payloads));
 
         #[cfg(feature = "wasi-tls")]
         let workload = workload.maybe_with_tls_provider(self.tls_provider.clone());
@@ -630,7 +785,7 @@ impl Engine {
         workload_name: impl AsRef<str>,
         workload_namespace: impl AsRef<str>,
         service: crate::types::Service,
-        validated_volumes: &std::collections::HashMap<String, PathBuf>,
+        validated_volumes: &std::collections::HashMap<String, volumes::OpenedVolume>,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
     ) -> anyhow::Result<WorkloadService> {
         // A service is always OCI-compiled, and the compile path writes its `.cwasm` to
@@ -638,8 +793,8 @@ impl Engine {
         // `artifact_key` (from the digest) to keep the sweep from reclaiming that file
         // out from under the running service.
         let artifact_key = self.oci_artifact_key(service.digest.as_deref());
-        let wasmtime_component = self
-            .load_component_bytes(&service.bytes, service.digest.as_ref())
+        let (wasmtime_component, compiled) = self
+            .load_live_component(service.bytes, service.digest)
             .context("failed to create component from bytes")?;
 
         // Create a linker for this component
@@ -659,9 +814,12 @@ impl Engine {
 
         // Build volume mounts for this component by looking up validated volumes
         let mut component_volume_mounts = Vec::new();
+        let mut resolved_volume_mounts = Vec::new();
         for vm in &service.local_resources.volume_mounts {
             if let Some(host_path) = validated_volumes.get(&vm.name) {
-                component_volume_mounts.push((host_path.clone(), vm.clone()));
+                component_volume_mounts.push((host_path.path.clone(), vm.clone()));
+                resolved_volume_mounts
+                    .push(volumes::ResolvedVolumeMount::from_opened(host_path, vm)?);
             } else {
                 tracing::warn!(
                     volume = %vm.name,
@@ -682,8 +840,10 @@ impl Engine {
             loopback,
             artifact_key,
         );
+        service.metadata.resolved_volume_mounts = resolved_volume_mounts;
         service.metadata.socket_policy = Arc::clone(&self.socket_policy);
         service.metadata.guest_memory = Arc::clone(&self.guest_memory);
+        service.metadata.compiled = compiled;
 
         let world = service.world();
 
@@ -709,6 +869,49 @@ impl Engine {
     fn effective_heap_memory(&self) -> u64 {
         self.installed_heap_memory
             .unwrap_or(self.host_memory.default_heap_memory)
+    }
+
+    /// [`Self::load_component_bytes`] for a workload, which holds the returned
+    /// [`LiveCompile`] while it runs: a digest some running workload was
+    /// loaded from is served from that workload's compile, whether or not the
+    /// cache still has it.
+    fn load_live_component(
+        &self,
+        bytes: impl AsRef<[u8]>,
+        digest: Option<impl AsRef<str>>,
+    ) -> anyhow::Result<(Component, Option<Arc<LiveCompile>>)> {
+        let Some(digest) = digest else {
+            return Ok((self.load_component_bytes(bytes, None::<&str>)?, None));
+        };
+        let digest = digest.as_ref();
+        if let Some(live) = self.live_compile(digest) {
+            return Ok((live.component.clone(), Some(live)));
+        }
+        let component = self.load_component_bytes(bytes, Some(digest))?;
+        let mut live = self
+            .live_compiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Another start may have recorded this digest since the check above;
+        // share its compile rather than keep a second.
+        if let Some(existing) = live.get(digest).and_then(std::sync::Weak::upgrade) {
+            return Ok((existing.component.clone(), Some(existing)));
+        }
+        let entry = Arc::new(LiveCompile {
+            digest: digest.to_string(),
+            component: component.clone(),
+            live: Arc::downgrade(&self.live_compiles),
+        });
+        live.insert(digest.to_string(), Arc::downgrade(&entry));
+        Ok((component, Some(entry)))
+    }
+
+    fn live_compile(&self, digest: &str) -> Option<Arc<LiveCompile>> {
+        self.live_compiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(digest)
+            .and_then(std::sync::Weak::upgrade)
     }
 
     /// Load a WebAssembly component from raw bytes or yields a previously compiled one.
@@ -908,7 +1111,7 @@ impl Engine {
         workload_name: impl AsRef<str>,
         workload_namespace: impl AsRef<str>,
         component: crate::types::Component,
-        validated_volumes: &std::collections::HashMap<String, PathBuf>,
+        validated_volumes: &std::collections::HashMap<String, volumes::OpenedVolume>,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
     ) -> anyhow::Result<WorkloadComponent> {
         // Read before the component's fields are moved out below.
@@ -917,39 +1120,34 @@ impl Engine {
         // Build the wasmtime component from its `Source` (deserialize a precompiled file,
         // or compile from wasm) and derive the `artifact_key` (the `.cwasm` file stem) so
         // the sweep keeps the on-disk file this running component maps from alive.
-        let (wasmtime_component, artifact_key) = match &component.source {
+        let (wasmtime_component, artifact_key, compiled) = match &component.source {
             Source::PrecompiledFile(path) => (
                 self.load_precompiled_file(path)?,
                 Self::artifact_key_from_path(path),
+                None,
             ),
             Source::Compile(bytes) => {
-                let compiled = self
-                    .load_component_bytes(bytes, component.digest.as_ref())
+                let (compiled, live) = self
+                    .load_live_component(bytes, component.digest.as_deref())
                     .context("failed to create component from bytes")?;
-                (compiled, self.oci_artifact_key(component.digest.as_deref()))
+                (
+                    compiled,
+                    self.oci_artifact_key(component.digest.as_deref()),
+                    live,
+                )
             }
         };
 
-        // Create a linker for this component
-        let mut linker: Linker<SharedCtx> = Linker::new(&self.inner);
-
-        // Add WASI interfaces to the linker (with custom socket implementation)
-        add_wasi_to_linker(&mut linker).context("failed to add WASI to linker")?;
-
-        // Add HTTP interfaces to the linker
-        if uses_wasi_http(&wasmtime_component) {
-            wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
-                .map_err(anyhow::Error::from)
-                .context("failed to add wasi:http/types to linker")?;
-            wasmtime_wasi_http::p3::add_to_linker(&mut linker)
-                .map_err(|e| anyhow::anyhow!(e).context("failed to add wasi:http p3 to linker"))?;
-        }
+        let linker = self.base_linker(uses_wasi_http(&wasmtime_component))?;
 
         // Build volume mounts for this component by looking up validated volumes
         let mut component_volume_mounts = Vec::new();
+        let mut resolved_volume_mounts = Vec::new();
         for vm in &component.local_resources.volume_mounts {
             if let Some(host_path) = validated_volumes.get(&vm.name) {
-                component_volume_mounts.push((host_path.clone(), vm.clone()));
+                component_volume_mounts.push((host_path.path.clone(), vm.clone()));
+                resolved_volume_mounts
+                    .push(volumes::ResolvedVolumeMount::from_opened(host_path, vm)?);
             } else {
                 tracing::warn!(
                     volume = %vm.name,
@@ -972,9 +1170,36 @@ impl Engine {
             artifact_key,
             instances,
         );
+        workload_component.metadata.resolved_volume_mounts = resolved_volume_mounts;
         workload_component.metadata.socket_policy = Arc::clone(&self.socket_policy);
         workload_component.metadata.guest_memory = Arc::clone(&self.guest_memory);
+        workload_component.metadata.compiled = compiled;
         Ok(workload_component)
+    }
+
+    /// The shared linker a workload component starts from: WASI (with our
+    /// socket implementation), plus `wasi:http` when the component uses it.
+    /// See [`BaseLinkers`].
+    fn base_linker(&self, with_http: bool) -> anyhow::Result<Arc<Linker<SharedCtx>>> {
+        let slot = if with_http {
+            &self.base_linkers.wasi_http
+        } else {
+            &self.base_linkers.wasi
+        };
+        if let Some(linker) = slot.get() {
+            return Ok(Arc::clone(linker));
+        }
+        let mut linker: Linker<SharedCtx> = Linker::new(&self.inner);
+        add_wasi_to_linker(&mut linker).context("failed to add WASI to linker")?;
+        if with_http {
+            wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
+                .map_err(anyhow::Error::from)
+                .context("failed to add wasi:http/types to linker")?;
+            wasmtime_wasi_http::p3::add_to_linker(&mut linker)
+                .map_err(|e| anyhow::anyhow!(e).context("failed to add wasi:http p3 to linker"))?;
+        }
+        // Concurrent first starts may each build one; all but one are dropped.
+        Ok(Arc::clone(slot.get_or_init(|| Arc::new(linker))))
     }
 
     /// Compile a host component plugin and build a linker with WASI (and
@@ -1161,7 +1386,12 @@ pub struct EngineBuilder {
     parallel_compilation: Option<bool>,
     native_unwind_info: Option<bool>,
     socket_policy: Option<Arc<crate::sockets::policy::SocketPolicy>>,
+    reserved_host_paths: Vec<PathBuf>,
+    allowed_host_paths: Vec<PathBuf>,
+    scratch_root: Option<PathBuf>,
     host_memory: Option<host_memory::HostMemoryBudgets>,
+    max_process_memory_bytes: Option<u64>,
+    max_process_memory_off: bool,
     guest_memory_mode: guest_memory::GuestMemoryMode,
     /// Optional TLS provider override for wasi:tls client connections.
     #[cfg(feature = "wasi-tls")]
@@ -1169,6 +1399,43 @@ pub struct EngineBuilder {
 }
 
 impl EngineBuilder {
+    /// Reserve paths that no workload volume may equal, contain, or lie
+    /// inside. The scratch root (see [`Self::with_scratch_root`]) is always
+    /// reserved.
+    #[must_use]
+    pub fn with_reserved_host_paths(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.reserved_host_paths.extend(paths);
+        self
+    }
+
+    /// Permit `hostPath` volumes within these directories. Adds to any
+    /// permitted before; with none, no `hostPath` volume is permitted.
+    ///
+    /// This is a host-wide guardrail for a trusted embedder, and for migrating
+    /// hosts whose workloads already mount host directories. It is not a
+    /// multi-tenant storage policy: any workload on the engine may mount any
+    /// directory permitted here. Where tenants author workloads, disable their
+    /// raw `hostPath` volumes in the control plane, and have it give each
+    /// workload a directory of its own instead.
+    #[must_use]
+    pub fn with_allowed_host_paths(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.allowed_host_paths.extend(paths);
+        self
+    }
+
+    /// Where `emptyDir` volumes live. Unset, `wasmcloud-scratch` under the
+    /// system temporary directory.
+    ///
+    /// The engine claims a directory of its own here, and removes what hosts
+    /// that are no longer running left behind. The root is reserved: no
+    /// `hostPath` volume may equal it, contain it, or lie inside it, whatever
+    /// [`Self::with_allowed_host_paths`] permits.
+    #[must_use]
+    pub fn with_scratch_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.scratch_root = Some(root.into());
+        self
+    }
+
     /// Install the host-level socket policy every workload on this engine
     /// inherits.
     ///
@@ -1181,8 +1448,38 @@ impl EngineBuilder {
         self
     }
 
+    /// Cap the whole process's memory footprint, guests and host together.
+    ///
+    /// Past it, guest memory growth and new instances are refused until the
+    /// footprint falls back (see [`process_memory`]). Unset, it is derived:
+    /// 90% of the cgroup limit, or of physical memory where there is none, so
+    /// a host never sets out to use more memory than the machine has.
+    ///
+    /// Overrides an earlier [`Self::without_max_process_memory`].
+    #[must_use]
+    pub fn with_max_process_memory_bytes(mut self, bytes: u64) -> Self {
+        self.max_process_memory_bytes = Some(bytes);
+        self.max_process_memory_off = false;
+        self
+    }
+
+    /// Hold the process to no footprint at all: no sampler runs, and only the
+    /// guest budget and the kernel limit memory. For an embedder that bounds
+    /// the process some other way, or a host whose footprint reading cannot
+    /// be trusted.
+    ///
+    /// Overrides an earlier [`Self::with_max_process_memory_bytes`].
+    #[must_use]
+    pub fn without_max_process_memory(mut self) -> Self {
+        self.max_process_memory_bytes = None;
+        self.max_process_memory_off = true;
+        self
+    }
+
     /// Set the host's memory budget, per-memory ceiling and instance count.
-    /// Unset, the engine uses wasmtime's default memory limits.
+    /// Unset, the pool knobs are wasmtime's defaults and the budget is derived
+    /// from this process's memory limit — and enforced, unless
+    /// [`Self::with_guest_memory_mode`] says otherwise.
     pub fn with_host_memory(mut self, host_memory: host_memory::HostMemoryBudgets) -> Self {
         self.host_memory = Some(host_memory);
         self
@@ -1190,11 +1487,10 @@ impl EngineBuilder {
 
     /// Whether `max_guest_memory` is enforced or only accounted.
     ///
-    /// Unset, it is [`guest_memory::GuestMemoryMode::Count`]: the budget is
-    /// charged and reported but never refuses a growth. That is deliberate —
-    /// `max_guest_memory` is derived when an operator sets nothing, so
-    /// enforcing by default would give every host a ceiling on upgrade that
-    /// nobody chose.
+    /// Unset, it is [`guest_memory::GuestMemoryMode::Enforce`]: growth past
+    /// the budget is refused. `max_guest_memory` is derived when an operator
+    /// sets nothing, so every engine has a ceiling unless it opts into
+    /// [`guest_memory::GuestMemoryMode::Count`].
     #[must_use]
     pub fn with_guest_memory_mode(mut self, mode: guest_memory::GuestMemoryMode) -> Self {
         self.guest_memory_mode = mode;
@@ -1381,20 +1677,42 @@ impl EngineBuilder {
             .or_else(|| getenv::<bool>("WASMTIME_POOLING"))
             .unwrap_or(!has_custom_config);
 
+        // Read once: each of the derivations and checks below needs it, and
+        // where there is no cgroup it means asking the OS for physical memory.
+        let memory_limit = host_memory::detected_memory_limit();
         // Resolved before the pooling config, which both of its knobs feed.
-        let host_memory = self.host_memory.unwrap_or_default();
+        let host_memory = self
+            .host_memory
+            .unwrap_or_else(|| host_memory::HostMemoryBudgets::derived_within(memory_limit));
         // Reads the resolved budgets, not the installed pool: it advises on the
-        // knobs as configured.
+        // knobs as configured. What the pool reserves is judged below, once
+        // the pool that is actually installed is known.
         if let Some(advisory) = host_memory.advisory() {
             tracing::warn!("{advisory}");
         }
         // Only when the budget is a real ceiling: an over-large budget the host
         // merely counts against costs nothing.
         if self.guest_memory_mode == guest_memory::GuestMemoryMode::Enforce
-            && let Some(advisory) = host_memory.enforcement_advisory()
+            && let Some(advisory) = host_memory.enforcement_advisory_within(memory_limit)
         {
             tracing::warn!("{advisory}");
         }
+        let max_process_memory_bytes = (!self.max_process_memory_off).then(|| {
+            self.max_process_memory_bytes.unwrap_or_else(|| {
+                host_memory::derive_max_process_memory_bytes_within(memory_limit)
+            })
+        });
+        // Only for a limit the operator named: a derived one is a share of the
+        // very limit this checks against.
+        if !self.max_process_memory_off
+            && let Some(bytes) = self.max_process_memory_bytes
+            && let Some(advisory) = host_memory::process_memory_advisory_within(bytes, memory_limit)
+        {
+            tracing::warn!("{advisory}");
+        }
+        // What the startup line says the process is held to.
+        let max_process_memory =
+            max_process_memory_bytes.map_or_else(|| "off".to_string(), host_memory::render_bytes);
 
         // The pooling allocator can be more efficient for workloads with many short-lived instances.
         // Read back from the installed pool: the environment and a
@@ -1412,6 +1730,7 @@ impl EngineBuilder {
                 core_instances: pooling.get_total_core_instances(),
                 memories: pooling.get_total_memories(),
                 max_memory_size: u64::try_from(pooling.get_max_memory_size()).unwrap_or(u64::MAX),
+                totals: pool_usage::PoolTotals::of(&pooling),
             });
             config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pooling));
         } else if use_pooling_allocator {
@@ -1419,21 +1738,34 @@ impl EngineBuilder {
         }
         let total_core_instances = installed_pool.map(|pool| pool.core_instances);
         let installed_heap_memory = installed_pool.map(|pool| pool.max_memory_size);
+        let pool_totals = installed_pool.map(|pool| pool.totals);
+        // Against the pool that was installed, not the knobs: the environment
+        // or a caller's own pooling config can move its memory count and slot
+        // size, and with no pool there is no reservation to warn about.
+        if let Some(pool) = installed_pool {
+            for advisory in host_memory::pool_advisories(&pool.totals, pool.max_memory_size) {
+                tracing::warn!("{advisory}");
+            }
+        }
 
         // Reported here so every embedder says what it built. The reservation
-        // is `total_memories x max_memory_size`, not the instance count.
+        // is `total_memories x slot_size`, not the instance count, and the slot
+        // does not shrink with the heap ceiling.
         match installed_pool {
             Some(pool) => tracing::info!(
+                %max_process_memory,
                 max_guest_memory = %host_memory::render_bytes(host_memory.max_guest_memory),
                 guest_memory_mode = self.guest_memory_mode.as_str(),
                 default_heap_memory = %host_memory::render_bytes(pool.max_memory_size),
                 core_instances = pool.core_instances,
                 memories = pool.memories,
+                slot_size = %host_memory::render_bytes(host_memory::pool_slot_bytes(pool.max_memory_size)),
                 pool_reservation = %host_memory::render_bytes(pool.reservation()),
                 "host memory resolved"
             ),
             // No pool, so no reservation and no installed ceiling to name.
             None => tracing::info!(
+                %max_process_memory,
                 max_guest_memory = %host_memory::render_bytes(host_memory.max_guest_memory),
                 guest_memory_mode = self.guest_memory_mode.as_str(),
                 pooling = false,
@@ -1520,8 +1852,43 @@ impl EngineBuilder {
             proposal.apply(&mut config);
         }
 
-        let inner = wasmtime::Engine::new(&config)?;
+        // The pool maps its whole slab here, so a pool too large for the
+        // address space fails now, with wasmtime naming only the mapping. Say
+        // which numbers produced it. A heap ceiling past the reservation is
+        // refused here too, whatever the slot count, so that is named instead.
+        let inner = wasmtime::Engine::new(&config).map_err(|e| match installed_pool {
+            Some(pool) if pool.max_memory_size > host_memory::WASMTIME_MEMORY_RESERVATION => e
+                .context(format!(
+                    "building the engine failed with a pooling allocator whose heap ceiling \
+                     (default-heap-memory) of {} is past wasmtime's {} memory reservation, \
+                     which the pooling allocator refuses; set default-heap-memory to {} or less",
+                    host_memory::render_bytes(pool.max_memory_size),
+                    host_memory::render_bytes(host_memory::WASMTIME_MEMORY_RESERVATION),
+                    host_memory::render_bytes(host_memory::WASMTIME_MEMORY_RESERVATION),
+                )),
+            Some(pool) => e.context(format!(
+                "building the engine failed with a pooling allocator reserving {} of address \
+                 space ({} memories of {} each) out of the {} this process can map; if the \
+                 pool is the cause, lower core-instances or WASMTIME_POOLING_TOTAL_MEMORIES",
+                host_memory::render_bytes(pool.reservation()),
+                pool.memories,
+                host_memory::render_bytes(host_memory::pool_slot_bytes(pool.max_memory_size)),
+                host_memory::render_bytes(host_memory::usable_address_space()),
+            )),
+            None => e,
+        })?;
         spawn_epoch_ticker(&inner)?;
+        let process_memory = match max_process_memory_bytes {
+            Some(limit) => {
+                let guard = Arc::new(process_memory::ProcessMemoryGuard::new(limit));
+                guard.spawn_sampler()?;
+                process_memory::ProcessMemoryGuard::register_metrics(
+                    &opentelemetry::global::meter("wash-runtime"),
+                );
+                Some(guard)
+            }
+            None => None,
+        };
         let cache = Cache::builder()
             .max_capacity(self.compilation_cache_size.unwrap_or(100))
             .time_to_idle(
@@ -1539,14 +1906,34 @@ impl EngineBuilder {
             })?;
         }
 
+        let socket_policy = self.socket_policy.unwrap_or_default();
+        let scratch_root = self
+            .scratch_root
+            .unwrap_or_else(|| std::env::temp_dir().join("wasmcloud-scratch"));
+        let scratch = scratch::ScratchRoot::open(&scratch_root).map_err(|e| {
+            tracing::warn!(root = %scratch_root.display(), err = %e, "cannot claim the scratch root; emptyDir volumes will be refused");
+            Arc::from(format!("{e:#}"))
+        });
         Ok(Engine {
+            stream_payloads: Arc::default(),
+            base_linkers: Arc::default(),
             inner,
             cache,
             // BettyBlocks: compiled_cache_dir (retained in upstream merge).
             compiled_cache_dir: self.compiled_cache_dir,
+            live_compiles: Arc::default(),
             #[cfg(test)]
             compiles: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            socket_policy: self.socket_policy.unwrap_or_default(),
+            host_paths: volumes::HostPathPolicy::new(
+                self.reserved_host_paths,
+                self.allowed_host_paths,
+                Some(scratch_root.clone()),
+                // The socket policy's counters, so an operator reads every
+                // policy figure in one place.
+                socket_policy.meters.clone(),
+            ),
+            socket_policy,
+            scratch,
             host_memory,
             guest_memory: {
                 let budget = guest_memory::GuestMemoryBudget::from_budgets(
@@ -1557,16 +1944,22 @@ impl EngineBuilder {
                 // asked for it: the budget must not charge for growth the pool
                 // is going to refuse. The same figure `explain_compile_failure`
                 // measures against, so they cannot drift apart.
-                match installed_heap_memory {
+                let budget = match installed_heap_memory {
                     Some(ceiling) => budget.with_heap_ceiling(ceiling),
+                    None => budget,
+                };
+                match &process_memory {
+                    Some(guard) => budget.with_process_guard(Arc::clone(guard)),
                     None => budget,
                 }
                 .into_metered()
             },
+            process_memory,
             #[cfg(feature = "wasi-tls")]
             tls_provider: self.tls_provider,
             total_core_instances,
             installed_heap_memory,
+            pool_totals,
         })
     }
 }
@@ -1865,6 +2258,176 @@ mod tests {
         );
     }
 
+    fn volume_only_workload(volumes: Vec<crate::types::Volume>) -> Workload {
+        Workload {
+            namespace: "ns".into(),
+            name: "volumes".into(),
+            annotations: Default::default(),
+            service: None,
+            components: vec![],
+            host_interfaces: vec![],
+            volumes,
+        }
+    }
+
+    fn host_path(path: &std::path::Path) -> crate::types::Volume {
+        crate::types::Volume {
+            name: "data".into(),
+            volume_type: VolumeType::HostPath(HostPathVolume {
+                local_path: path.to_string_lossy().into_owned(),
+            }),
+        }
+    }
+
+    #[test]
+    fn an_engine_refuses_a_host_path_outside_its_allowlist() {
+        let root = tempfile::tempdir().unwrap();
+        let allowed = root.path().join("allowed");
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let meters = Arc::new(crate::host::quota::PolicyMeters::default());
+        let engine = Engine::builder()
+            .with_socket_policy(Arc::new(crate::sockets::policy::SocketPolicy {
+                meters: Some(Arc::clone(&meters)),
+                ..Default::default()
+            }))
+            .with_allowed_host_paths([allowed.clone()])
+            .build()
+            .unwrap();
+
+        let Err(err) =
+            engine.initialize_workload("w", volume_only_workload(vec![host_path(&other)]))
+        else {
+            panic!("a host path outside the allowlist should be refused");
+        };
+        assert!(
+            format!("{err:#}").contains("--allowed-host-path"),
+            "{err:#}"
+        );
+        assert_eq!(meters.host_path_denied(), 1);
+        engine
+            .initialize_workload("w", volume_only_workload(vec![host_path(&allowed)]))
+            .unwrap();
+        // An empty directory is the host's own, never a path a workload named.
+        engine
+            .initialize_workload(
+                "w",
+                volume_only_workload(vec![crate::types::Volume {
+                    name: "scratch".into(),
+                    volume_type: VolumeType::EmptyDir(EmptyDirVolume {}),
+                }]),
+            )
+            .unwrap();
+    }
+
+    fn empty_dir(name: &str) -> crate::types::Volume {
+        crate::types::Volume {
+            name: name.into(),
+            volume_type: VolumeType::EmptyDir(EmptyDirVolume {}),
+        }
+    }
+
+    /// Scratch lives under the root the engine owns, and a workload that goes
+    /// away takes its scratch with it.
+    #[test]
+    fn empty_dir_scratch_lives_under_the_root_and_leaves_with_its_workload() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = Engine::builder()
+            .with_scratch_root(root.path())
+            .build()
+            .unwrap();
+        let scratch_files = || {
+            walkdir(root.path())
+                .into_iter()
+                .filter(|p| !p.ends_with(".lock"))
+                .count()
+        };
+        let before = scratch_files();
+        let Ok(workload) = engine.initialize_workload(
+            "w",
+            volume_only_workload(vec![empty_dir("a"), empty_dir("b")]),
+        ) else {
+            panic!("a workload with emptyDir volumes should initialize");
+        };
+        // One workload directory holding a directory per volume.
+        assert_eq!(scratch_files(), before + 3);
+        drop(workload);
+        assert_eq!(scratch_files(), before);
+    }
+
+    /// A volume around the scratch root, as `/tmp` is around the default one,
+    /// the root itself, or a workload's scratch inside it would expose other
+    /// workloads' scratch, so each is refused even when the allowlist names it.
+    #[test]
+    fn a_host_path_exposing_scratch_is_refused_even_when_allowed() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join("scratch");
+        let meters = Arc::new(crate::host::quota::PolicyMeters::default());
+        let engine = Engine::builder()
+            .with_socket_policy(Arc::new(crate::sockets::policy::SocketPolicy {
+                meters: Some(Arc::clone(&meters)),
+                ..Default::default()
+            }))
+            .with_scratch_root(&scratch)
+            .with_allowed_host_paths([root.path().to_path_buf(), scratch.clone()])
+            .build()
+            .unwrap();
+        let workload = engine
+            .initialize_workload("w", volume_only_workload(vec![empty_dir("a")]))
+            .unwrap();
+        let inside = walkdir(&scratch)
+            .into_iter()
+            .find(|p| p.is_dir())
+            .expect("the workload's scratch directory");
+        for (what, path) in [
+            ("around", root.path()),
+            ("equal to", scratch.as_path()),
+            ("inside", inside.as_path()),
+        ] {
+            assert!(
+                engine
+                    .initialize_workload("w2", volume_only_workload(vec![host_path(path)]))
+                    .is_err(),
+                "{what} the scratch root"
+            );
+        }
+        assert_eq!(meters.host_path_denied(), 3);
+        drop(workload);
+    }
+
+    fn walkdir(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(walkdir(&path));
+            }
+            found.push(path);
+        }
+        found
+    }
+
+    /// With no allowed host paths configured, no `hostPath` volume is permitted.
+    #[test]
+    fn a_default_engine_refuses_every_host_path() {
+        let root = tempfile::tempdir().unwrap();
+        let meters = Arc::new(crate::host::quota::PolicyMeters::default());
+        let engine = Engine::builder()
+            .with_socket_policy(Arc::new(crate::sockets::policy::SocketPolicy {
+                meters: Some(Arc::clone(&meters)),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+        assert!(
+            engine
+                .initialize_workload("w", volume_only_workload(vec![host_path(root.path())]))
+                .is_err()
+        );
+        assert_eq!(meters.host_path_denied(), 1);
+    }
+
     // Compiling is parallel unless a host says otherwise, and saying so
     // reaches the engine rather than being dropped on the builder.
     #[test]
@@ -1994,6 +2557,46 @@ mod tests {
                 .unwrap_or_else(|e| panic!("wasi:random@{version} should link: {e:#}"));
         }
         assert!(linker.instantiate_pre(&importing("0.4.0")).is_err());
+    }
+
+    /// A digest a running workload holds is never compiled again, even once
+    /// the cache has let it go; once nothing holds it, it is forgotten.
+    #[test]
+    fn a_digest_in_use_is_not_recompiled_after_cache_eviction() {
+        use std::sync::atomic::Ordering;
+        const DIGEST: &str = "sha256:held-image";
+
+        let bytes = wat::parse_str("(component)").expect("component should assemble");
+        let engine = Engine::builder().build().expect("engine should build");
+
+        let (_, first) = engine
+            .load_live_component(&bytes, Some(DIGEST))
+            .expect("first load");
+        engine.cache.invalidate_all();
+        engine.cache.run_pending_tasks();
+        let (_, second) = engine
+            .load_live_component(&bytes, Some(DIGEST))
+            .expect("second load");
+        assert_eq!(engine.compiles.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(
+            first.as_ref().expect("a digest is tracked"),
+            second.as_ref().expect("a digest is tracked"),
+        ));
+
+        drop((first, second));
+        assert!(engine.live_compiles.lock().unwrap().is_empty());
+        engine.cache.invalidate_all();
+        engine.cache.run_pending_tasks();
+        let (_, third) = engine
+            .load_live_component(&bytes, Some(DIGEST))
+            .expect("third load");
+        assert_eq!(engine.compiles.load(Ordering::SeqCst), 2);
+        assert!(third.is_some());
+
+        let (_, untracked) = engine
+            .load_live_component(&bytes, None::<&str>)
+            .expect("load without a digest");
+        assert!(untracked.is_none(), "nothing to share without a digest");
     }
 
     // A scheduler placing N replicas of one image sends N starts carrying one
