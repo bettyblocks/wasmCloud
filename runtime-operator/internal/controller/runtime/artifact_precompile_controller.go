@@ -68,13 +68,14 @@ func (r *PrecompileReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	if variantRecorded(a.Status.Precompiled, runtimev1alpha1.PrecompiledVariant{
+	current := runtimev1alpha1.PrecompiledVariant{
 		Target:          r.Target,
 		WasmtimeVersion: r.WasmtimeVersion,
 		ArtifactURL:     r.outputURLOf(&a),
 		ImageRef:        a.Spec.Image,
-	}) {
-		return ctrl.Result{}, nil
+	}
+	if variantRecorded(a.Status.Precompiled, current) {
+		return ctrl.Result{}, r.dropSupersededVariants(ctx, &a, current)
 	}
 
 	if err, done := r.handleImageChange(ctx, &a, desired); done {
@@ -119,13 +120,32 @@ func jobFailed(j *batchv1.Job) (bool, string) {
 	return false, ""
 }
 
+func sameVariant(a, b runtimev1alpha1.PrecompiledVariant) bool {
+	return a.Target == b.Target && a.WasmtimeVersion == b.WasmtimeVersion && a.ImageRef == b.ImageRef
+}
+
 func variantRecorded(existing []runtimev1alpha1.PrecompiledVariant, v runtimev1alpha1.PrecompiledVariant) bool {
 	for _, e := range existing {
-		if e.Target == v.Target && e.WasmtimeVersion == v.WasmtimeVersion && e.ImageRef == v.ImageRef {
+		if sameVariant(e, v) {
 			return true
 		}
 	}
 	return false
+}
+
+// dropSupersededVariants keeps only current: workloads resolve only the current
+// image's variant, and running WorkloadReplicaSets keep their own URL in use for GC.
+func (r *PrecompileReconciler) dropSupersededVariants(
+	ctx context.Context, a *runtimev1alpha1.Artifact, current runtimev1alpha1.PrecompiledVariant,
+) error {
+	if len(a.Status.Precompiled) <= 1 {
+		return nil
+	}
+	base := a.DeepCopy()
+	a.Status.Precompiled = slices.DeleteFunc(a.Status.Precompiled, func(e runtimev1alpha1.PrecompiledVariant) bool {
+		return !sameVariant(e, current)
+	})
+	return r.Status().Patch(ctx, a, client.MergeFrom(base))
 }
 
 func argsMatch(existing, desired *batchv1.Job) bool {
@@ -230,7 +250,8 @@ func (r *PrecompileReconciler) handleSuccessfulJob(
 		return ctrl.Result{}, nil
 	}
 	base := a.DeepCopy()
-	a.Status.Precompiled = append(a.Status.Precompiled, variant)
+	// Replace rather than append: see dropSupersededVariants.
+	a.Status.Precompiled = []runtimev1alpha1.PrecompiledVariant{variant}
 	a.Status.SetConditions(
 		condition.ReadyCondition(runtimev1alpha1.ArtifactConditionPrecompiled),
 		condition.Condition{

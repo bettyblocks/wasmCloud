@@ -321,4 +321,99 @@ var _ = Describe("precompile pipeline", func() {
 		}).Should(Succeed())
 	})
 
+	It("keeps only the current image's variant after a rebuild", func() {
+		ctx := context.Background()
+		a := newArtifact(ctx, "rebuild-replaces-variant")
+
+		completePrecompileJob(ctx, a.Name, testArtifactImage, true)
+
+		Eventually(func(g Gomega) {
+			var updated runtimev1alpha1.Artifact
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: "default", Name: a.Name,
+			}, &updated)).To(Succeed())
+			updated.Spec.Image = "ghcr.io/example/comp:v2"
+			g.Expect(k8sClient.Update(ctx, &updated)).To(Succeed())
+		}).Should(Succeed())
+
+		completePrecompileJob(ctx, a.Name, "ghcr.io/example/comp:v2", false)
+		expectPrecompiledImages(ctx, a.Name, "ghcr.io/example/comp:v2")
+	})
+
+	It("prunes superseded variants already recorded in status", func() {
+		ctx := context.Background()
+		a := newArtifact(ctx, "prunes-recorded-variants")
+
+		completePrecompileJob(ctx, a.Name, testArtifactImage, false)
+		expectPrecompiledImages(ctx, a.Name, testArtifactImage)
+
+		Eventually(func(g Gomega) {
+			var got runtimev1alpha1.Artifact
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: "default", Name: a.Name,
+			}, &got)).To(Succeed())
+			got.Status.Precompiled = append([]runtimev1alpha1.PrecompiledVariant{{
+				Target:          testTarget,
+				WasmtimeVersion: testWasmtimeVersion,
+				ArtifactURL:     "nats://precompiled-artifacts/old.cwasm",
+				ImageRef:        "ghcr.io/example/comp:v0",
+			}}, got.Status.Precompiled...)
+			g.Expect(k8sClient.Status().Update(ctx, &got)).To(Succeed())
+		}).Should(Succeed())
+
+		expectPrecompiledImages(ctx, a.Name, testArtifactImage)
+	})
+
 })
+
+// completePrecompileJob marks the Artifact's precompile Job for image as
+// succeeded. With deleteAfter it then deletes the Job, as happens to finished
+// Jobs in a real cluster, so the image-change path cannot rely on it.
+func completePrecompileJob(ctx context.Context, artifactName, image string, deleteAfter bool) {
+	GinkgoHelper()
+	var job batchv1.Job
+	Eventually(func(g Gomega) {
+		g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: "default", Name: "precompile-" + artifactName,
+		}, &job)).To(Succeed())
+		g.Expect(job.DeletionTimestamp).To(BeNil())
+		g.Expect(job.Spec.Template.Spec.Containers[0].Args).To(ContainElement(image))
+		job.Status.Succeeded = 1
+		job.Status.Conditions = []batchv1.JobCondition{{
+			Type:   batchv1.JobComplete,
+			Status: corev1.ConditionTrue,
+		}}
+		g.Expect(k8sClient.Status().Update(ctx, &job)).To(Succeed())
+	}).Should(Succeed())
+	if !deleteAfter {
+		return
+	}
+	expectPrecompiledImages(ctx, artifactName, image)
+	Expect(k8sClient.Delete(ctx, &job,
+		client.PropagationPolicy(metav1.DeletePropagationBackground),
+		client.GracePeriodSeconds(0),
+	)).To(Succeed())
+	Eventually(func(g Gomega) {
+		err := k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: "default", Name: "precompile-" + artifactName,
+		}, &batchv1.Job{})
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	}).Should(Succeed())
+}
+
+// expectPrecompiledImages waits until the Artifact records exactly one
+// precompiled variant per given image, in order.
+func expectPrecompiledImages(ctx context.Context, artifactName string, images ...string) {
+	GinkgoHelper()
+	Eventually(func(g Gomega) {
+		var got runtimev1alpha1.Artifact
+		g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: "default", Name: artifactName,
+		}, &got)).To(Succeed())
+		recorded := make([]string, 0, len(got.Status.Precompiled))
+		for _, v := range got.Status.Precompiled {
+			recorded = append(recorded, v.ImageRef)
+		}
+		g.Expect(recorded).To(Equal(images))
+	}).Should(Succeed())
+}
