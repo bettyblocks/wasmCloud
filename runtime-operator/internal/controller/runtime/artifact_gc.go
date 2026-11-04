@@ -2,7 +2,8 @@ package runtime
 
 import (
 	"context"
-	"errors"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -16,13 +17,7 @@ import (
 	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
 )
 
-// natsListTimeout bounds each JetStream API request the sweep makes (notably
-// building the object-store list consumer). nats.go defaults to 5s, which a
-// bucket with a large orphan backlog can exceed while the server computes
-// DeliverLastPerSubject across every object's metadata subject — exactly the
-// backlog this GC exists to clear. A sweep runs at most once per interval on
-// the leader, so a generous bound here is cheap.
-const natsListTimeout = 3 * time.Minute
+const natsRequestTimeout = 30 * time.Second
 
 // PrecompileGC garbage-collects precompiled .cwasm objects that are not
 // currently in use. The precompile pipeline writes AOT-compiled bytes to a
@@ -113,10 +108,7 @@ func (g *PrecompileGC) sweep(ctx context.Context, bucket string) error {
 		inUseKeysFromReplicaSets(g.BaseURL, replicaSets.Items),
 	)
 
-	// MaxWait raises the per-request timeout above nats.go's 5s default so
-	// listing a large bucket doesn't fail with "context deadline exceeded"
-	// while the list consumer is being built.
-	js, err := g.NatsConn.JetStream(nats.MaxWait(natsListTimeout))
+	js, err := g.NatsConn.JetStream(nats.MaxWait(natsRequestTimeout))
 	if err != nil {
 		return fmt.Errorf("acquiring JetStream context: %w", err)
 	}
@@ -124,23 +116,39 @@ func (g *PrecompileGC) sweep(ctx context.Context, bucket string) error {
 	if err != nil {
 		return fmt.Errorf("opening object store %q: %w", bucket, err)
 	}
+	stream := objectStreamName(bucket)
 
-	// Every entry NATS currently has in the object store for this bucket.
-	cwasmInfos, err := store.List()
+	metaSubjects, err := listMetaSubjects(js, bucket)
 	if err != nil {
-		if errors.Is(err, nats.ErrNoObjectsFound) {
-			return nil
-		}
-		return fmt.Errorf("listing cwasm objects in %q: %w", bucket, err)
+		return fmt.Errorf("listing object keys in %q: %w", bucket, err)
 	}
 
 	now := time.Now()
-	liveCwasm := make([]cwasmObject, 0, len(cwasmInfos))
-	for _, info := range cwasmInfos {
-		if info.Deleted {
+	var liveCwasm []cwasmObject
+	tombstones := 0
+	for subj := range metaSubjects {
+		key, ok := keyFromMetaSubject(bucket, subj)
+		if !ok {
+			log.Info("skipping object metadata subject with undecodable key", "bucket", bucket, "subject", subj)
 			continue
 		}
-		liveCwasm = append(liveCwasm, cwasmObject{Key: info.Name, ModTime: info.ModTime})
+		if _, used := inUseCwasm[key]; used {
+			continue
+		}
+		info, seq, err := readObjectInfo(js, stream, subj)
+		if err != nil {
+			log.Error(err, "failed to read object metadata", "bucket", bucket, "key", key)
+			continue
+		}
+		if !info.Deleted {
+			liveCwasm = append(liveCwasm, cwasmObject{Key: key, ModTime: info.ModTime})
+			continue
+		}
+		if err := purgeTombstone(js, bucket, subj, seq, info.NUID); err != nil {
+			log.Error(err, "failed to purge object tombstone", "bucket", bucket, "key", key)
+			continue
+		}
+		tombstones++
 	}
 
 	// Sweep: diff the store's cwasm against the in-use set — what's left is
@@ -161,13 +169,66 @@ func (g *PrecompileGC) sweep(ctx context.Context, bucket string) error {
 
 	log.V(1).Info("precompile GC sweep complete",
 		"bucket", bucket,
-		"scanned", len(liveCwasm),
+		"keys", len(metaSubjects),
 		"inUse", len(inUseCwasm),
 		"orphaned", len(removable),
 		"deleted", deleted,
 		"withinGrace", withinGrace,
+		"tombstonesPurged", tombstones,
 	)
 	return nil
+}
+
+func objectStreamName(bucket string) string { return "OBJ_" + bucket }
+
+func metaSubject(bucket, token string) string { return "$O." + bucket + ".M." + token }
+
+func chunkSubject(bucket, nuid string) string { return "$O." + bucket + ".C." + nuid }
+
+// listMetaSubjects returns one metadata subject per key, live or deleted.
+func listMetaSubjects(js nats.JetStreamContext, bucket string) (map[string]uint64, error) {
+	si, err := js.StreamInfo(objectStreamName(bucket),
+		&nats.StreamInfoRequest{SubjectsFilter: metaSubject(bucket, ">")})
+	if err != nil {
+		return nil, err
+	}
+	return si.State.Subjects, nil
+}
+
+func keyFromMetaSubject(bucket, subj string) (string, bool) {
+	enc, ok := strings.CutPrefix(subj, metaSubject(bucket, ""))
+	if !ok {
+		return "", false
+	}
+	key, err := base64.URLEncoding.DecodeString(enc)
+	if err != nil || len(key) == 0 {
+		return "", false
+	}
+	return string(key), true
+}
+
+func readObjectInfo(js nats.JetStreamContext, stream, subj string) (nats.ObjectInfo, uint64, error) {
+	var info nats.ObjectInfo
+	msg, err := js.GetLastMsg(stream, subj)
+	if err != nil {
+		return info, 0, err
+	}
+	if err := json.Unmarshal(msg.Data, &info); err != nil {
+		return info, 0, err
+	}
+	info.ModTime = msg.Time
+	return info, msg.Sequence, nil
+}
+
+// purgeTombstone stops at upToSeq so a re-upload of the same key since then survives.
+func purgeTombstone(js nats.JetStreamContext, bucket, subj string, upToSeq uint64, nuid string) error {
+	stream := objectStreamName(bucket)
+	if nuid != "" {
+		if err := js.PurgeStream(stream, &nats.StreamPurgeRequest{Subject: chunkSubject(bucket, nuid)}); err != nil {
+			return fmt.Errorf("purging chunks: %w", err)
+		}
+	}
+	return js.PurgeStream(stream, &nats.StreamPurgeRequest{Subject: subj, Sequence: upToSeq + 1})
 }
 
 // cwasmObject is the minimal object-store metadata the sweep reasons about

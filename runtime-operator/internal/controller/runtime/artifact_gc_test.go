@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/base64"
 	"testing"
 	"time"
 
@@ -266,6 +267,68 @@ func TestSweep_DeletesOrphansPastGrace(t *testing.T) {
 	if _, ok := keys[orphanKey]; ok {
 		t.Fatalf("orphan object should have been deleted; store has %v", keys)
 	}
+
+	// Delete leaves a tombstone on the orphan's metadata subject; the next
+	// sweep purges it so the key stops being listed at all.
+	if err := newGC(0).sweep(ctx, gcTestBucket); err != nil {
+		t.Fatalf("tombstone sweep: %v", err)
+	}
+	subjects := metaSubjects(t, js)
+	if _, ok := subjects[metaSubject(gcTestBucket, encodeKey(orphanKey))]; ok {
+		t.Fatalf("orphan tombstone should have been purged; subjects %v", subjects)
+	}
+	if len(subjects) != 2 {
+		t.Fatalf("live and running metadata must remain; subjects %v", subjects)
+	}
+}
+
+// A tombstone purge bounded to the sequence the GC read must not remove a Put
+// of the same key that landed afterwards.
+func TestPurgeTombstone_KeepsNewerPut(t *testing.T) {
+	nc := startEmbeddedNats(t)
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	store, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: gcTestBucket})
+	if err != nil {
+		t.Fatalf("create object store: %v", err)
+	}
+	const key = "a/img/x86_64-27.0.0.cwasm"
+	if _, err := store.PutBytes(key, []byte("old")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := store.Delete(key); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	subj := metaSubject(gcTestBucket, encodeKey(key))
+	tomb, err := js.GetLastMsg(objectStreamName(gcTestBucket), subj)
+	if err != nil {
+		t.Fatalf("read tombstone: %v", err)
+	}
+	if _, err := store.PutBytes(key, []byte("new")); err != nil {
+		t.Fatalf("re-put: %v", err)
+	}
+
+	if err := purgeTombstone(js, gcTestBucket, subj, tomb.Sequence, ""); err != nil {
+		t.Fatalf("purge tombstone: %v", err)
+	}
+	got, err := store.GetBytes(key)
+	if err != nil || string(got) != "new" {
+		t.Fatalf("re-put object must survive the purge; got %q, err %v", got, err)
+	}
+}
+
+func encodeKey(key string) string { return base64.URLEncoding.EncodeToString([]byte(key)) }
+
+func metaSubjects(t *testing.T, js nats.JetStreamContext) map[string]uint64 {
+	t.Helper()
+	si, err := js.StreamInfo(objectStreamName(gcTestBucket),
+		&nats.StreamInfoRequest{SubjectsFilter: metaSubject(gcTestBucket, ">")})
+	if err != nil {
+		t.Fatalf("stream info: %v", err)
+	}
+	return si.State.Subjects
 }
 
 // A missing bucket (no successful precompile has run yet) is a real error —
