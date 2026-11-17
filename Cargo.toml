@@ -47,6 +47,14 @@ uninit_vec = 'deny'
 uninlined_format_args = 'deny'
 unnecessary_box_returns = 'deny'
 
+# Full DWARF made debug binaries ~1GB. Keep line tables for backtraces only.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false
+
 [workspace.dependencies]
 anyhow = { version = "1.0.98", default-features = false }
 arc-swap = { version = "1.7", default-features = false }
