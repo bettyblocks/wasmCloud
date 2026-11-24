@@ -238,7 +238,7 @@ func (r *WorkloadDeploymentReconciler) reconcileScale(ctx context.Context, deplo
 		if rs.Name == curSetName || rs.Name == prevSetName {
 			continue
 		}
-		if err := r.Delete(ctx, &rs); err != nil {
+		if err := r.Delete(ctx, &rs); client.IgnoreNotFound(err) != nil {
 			return err
 		}
 	}

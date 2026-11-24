@@ -529,3 +529,43 @@ func TestConditionedReconcilerOptimisticLock(t *testing.T) {
 		}
 	}
 }
+
+// An object deleted between the reconcile's read and its status patch has
+// nothing left to reconcile: that is not an error, and post-hooks must not run.
+func TestConditionedReconcilerDeletedBeforeStatusPatch(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add corev1 to scheme: %v", err)
+	}
+	scheme.AddKnownTypes(corev1.SchemeGroupVersion, &conditionedResource{})
+
+	obj := &conditionedResource{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testName},
+	}
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(obj).
+		WithStatusSubresource(obj).
+		Build()
+
+	r := NewConditionedReconciler(kubeClient, scheme, obj, time.Second)
+	r.SetCondition(testCondition, func(ctx context.Context, o *conditionedResource) error {
+		return kubeClient.Delete(ctx, o.DeepCopy())
+	})
+	postHookRan := false
+	r.AddPostHook(func(context.Context, *conditionedResource) error {
+		postHookRan = true
+		return nil
+	})
+
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(obj)})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("a deleted object was requeued after %v", result.RequeueAfter)
+	}
+	if postHookRan {
+		t.Errorf("post-hooks ran for a deleted object")
+	}
+}

@@ -91,7 +91,7 @@ func HandleFinalizer[T ConditionedType](
 		}
 		patch := client.MergeFrom(obj.DeepCopyObject().(client.Object))
 		controllerutil.RemoveFinalizer(obj, finalizer)
-		if err := c.Patch(ctx, obj, patch); err != nil {
+		if err := c.Patch(ctx, obj, patch); client.IgnoreNotFound(err) != nil {
 			return false, err
 		}
 		return true, nil
@@ -297,6 +297,9 @@ func (r *ConditionedReconciler[T]) Reconcile(ctx context.Context, req reconcile.
 			if apierrors.IsConflict(err) {
 				log.FromContext(ctx).V(1).Info("status patch built from a stale read was rejected; requeueing")
 				return reconcile.Result{RequeueAfter: time.Second}, nil
+			}
+			if apierrors.IsNotFound(err) {
+				return reconcile.Result{}, nil
 			}
 			log.FromContext(ctx).Error(err, "failed to patch status",
 				"name", obj.GetName(),

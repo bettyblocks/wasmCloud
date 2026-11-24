@@ -116,7 +116,7 @@ func (r *WorkloadReplicaSetReconciler) reconcileScaleDown(ctx context.Context, r
 	}
 
 	for i := len(workloads.Items); i > expectedReplicas; i-- {
-		if err := r.Delete(ctx, &workloads.Items[i-1]); err != nil {
+		if err := r.Delete(ctx, &workloads.Items[i-1]); client.IgnoreNotFound(err) != nil {
 			return err
 		}
 	}
@@ -221,7 +221,7 @@ func (r *WorkloadReplicaSetReconciler) cleanupPreviousRevisionsWorkloads(ctx con
 
 		// At this point, the workload is not of the current generation
 		// and should be cleaned up
-		if err := r.Delete(ctx, &workload); err != nil {
+		if err := r.Delete(ctx, &workload); client.IgnoreNotFound(err) != nil {
 			return err
 		}
 	}
@@ -271,7 +271,7 @@ func (r *WorkloadReplicaSetReconciler) cleanupUnhealthyWorkloads(ctx context.Con
 		}
 		// At this point, the workload is not ready, has failed, and has not recovered within the grace period
 		// Delete the workload, which will be replaced by the scale-up logic
-		if err := r.Delete(ctx, &workload); err != nil {
+		if err := r.Delete(ctx, &workload); client.IgnoreNotFound(err) != nil {
 			return err
 		}
 	}
