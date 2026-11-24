@@ -133,7 +133,7 @@ func (h *fakeHost) Publish(*wasmbus.Message) error                              
 func newPinnedWorkload(ctx context.Context, name string) *runtimev1alpha1.Workload {
 	GinkgoHelper()
 	w := &runtimev1alpha1.Workload{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metav1.NamespaceDefault},
 		Spec: runtimev1alpha1.WorkloadSpec{
 			HostID: testHostID,
 			Components: []runtimev1alpha1.WorkloadComponent{{
@@ -182,7 +182,7 @@ var _ = Describe("Workload finalizer", func() {
 	It("stops a workload whose Workload was deleted while its start was in flight", func() {
 		ctx := context.Background()
 		const name = "deleted-mid-start"
-		key := types.NamespacedName{Namespace: "default", Name: name}
+		key := types.NamespacedName{Namespace: metav1.NamespaceDefault, Name: name}
 		gone := func() bool {
 			return apierrors.IsNotFound(k8sClient.Get(ctx, key, &runtimev1alpha1.Workload{}))
 		}
