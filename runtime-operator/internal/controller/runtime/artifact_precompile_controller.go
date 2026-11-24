@@ -88,7 +88,7 @@ func (r *PrecompileReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	var job batchv1.Job
 	if err := r.Get(ctx, types.NamespacedName{Namespace: a.Namespace, Name: desired.Name}, &job); err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	if failed, msg := jobFailed(&job); failed {
@@ -145,7 +145,7 @@ func (r *PrecompileReconciler) dropSupersededVariants(
 	a.Status.Precompiled = slices.DeleteFunc(a.Status.Precompiled, func(e runtimev1alpha1.PrecompiledVariant) bool {
 		return !sameVariant(e, current)
 	})
-	return r.Status().Patch(ctx, a, client.MergeFrom(base))
+	return r.patchStatus(ctx, a, base)
 }
 
 func argsMatch(existing, desired *batchv1.Job) bool {
@@ -261,7 +261,7 @@ func (r *PrecompileReconciler) handleSuccessfulJob(
 			LastTransitionTime: metav1.Now(),
 		},
 	)
-	return ctrl.Result{}, r.Status().Patch(ctx, a, client.MergeFrom(base))
+	return ctrl.Result{}, r.patchStatus(ctx, a, base)
 }
 
 func (r *PrecompileReconciler) handleInFlightJob(
@@ -280,7 +280,7 @@ func (r *PrecompileReconciler) handleInFlightJob(
 			LastTransitionTime: metav1.Now(),
 		},
 	)
-	return ctrl.Result{}, r.Status().Patch(ctx, a, client.MergeFrom(base))
+	return ctrl.Result{}, r.patchStatus(ctx, a, base)
 }
 
 func (r *PrecompileReconciler) handleFailedJob(
@@ -306,7 +306,7 @@ func (r *PrecompileReconciler) handleFailedJob(
 			LastTransitionTime: metav1.Now(),
 		},
 	)
-	return ctrl.Result{}, r.Status().Patch(ctx, a, client.MergeFrom(base))
+	return ctrl.Result{}, r.patchStatus(ctx, a, base)
 }
 
 func (r *PrecompileReconciler) handleImageChange(
@@ -330,7 +330,7 @@ func (r *PrecompileReconciler) handleImageChange(
 			}
 			base := a.DeepCopy()
 			a.Status.Precompiled = nil
-			return r.Status().Patch(ctx, a, client.MergeFrom(base)), true
+			return r.patchStatus(ctx, a, base), true
 		}
 		return nil, false
 	case !apierrors.IsNotFound(err):
@@ -338,4 +338,8 @@ func (r *PrecompileReconciler) handleImageChange(
 	default:
 		return nil, false
 	}
+}
+
+func (r *PrecompileReconciler) patchStatus(ctx context.Context, a, base *runtimev1alpha1.Artifact) error {
+	return client.IgnoreNotFound(r.Status().Patch(ctx, a, client.MergeFrom(base)))
 }

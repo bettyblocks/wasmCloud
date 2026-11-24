@@ -11,18 +11,18 @@ import (
 var _ = Describe("PrecompileReconciler.outputURLOf", func() {
 	r := &PrecompileReconciler{
 		ArtifactStore:   ArtifactStoreConfig{BaseURL: "nats://store"},
-		Target:          "x86_64-unknown-linux-gnu",
-		WasmtimeVersion: "27.0.0",
+		Target:          testTarget,
+		WasmtimeVersion: testWasmtimeVersion,
 	}
 
 	It("produces different URLs for the same artifact name when the image changes", func() {
 		v1 := &runtimev1alpha1.Artifact{
-			ObjectMeta: metav1.ObjectMeta{Name: "comp", Namespace: "default"},
-			Spec:       runtimev1alpha1.ArtifactSpec{Image: "ghcr.io/x/y:v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: testArtifactName, Namespace: metav1.NamespaceDefault},
+			Spec:       runtimev1alpha1.ArtifactSpec{Image: testImageV1},
 		}
 		v2 := &runtimev1alpha1.Artifact{
-			ObjectMeta: metav1.ObjectMeta{Name: "comp", Namespace: "default"},
-			Spec:       runtimev1alpha1.ArtifactSpec{Image: "ghcr.io/x/y:v2"},
+			ObjectMeta: metav1.ObjectMeta{Name: testArtifactName, Namespace: metav1.NamespaceDefault},
+			Spec:       runtimev1alpha1.ArtifactSpec{Image: testImageV2},
 		}
 
 		Expect(r.outputURLOf(v1)).NotTo(Equal(r.outputURLOf(v2)))
@@ -30,8 +30,8 @@ var _ = Describe("PrecompileReconciler.outputURLOf", func() {
 
 	It("is deterministic for the same image", func() {
 		a := &runtimev1alpha1.Artifact{
-			ObjectMeta: metav1.ObjectMeta{Name: "comp", Namespace: "default"},
-			Spec:       runtimev1alpha1.ArtifactSpec{Image: "ghcr.io/x/y:v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: testArtifactName, Namespace: metav1.NamespaceDefault},
+			Spec:       runtimev1alpha1.ArtifactSpec{Image: testImageV1},
 		}
 		Expect(r.outputURLOf(a)).To(Equal(r.outputURLOf(a)))
 	})
