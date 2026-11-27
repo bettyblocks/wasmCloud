@@ -8,7 +8,7 @@ wash-precompile --image <oci-ref> --output <scheme-url>
 
 Pulls a wasm component from an OCI registry, precompiles it via `wasmtime::Engine::precompile_component`, and writes the resulting `.cwasm` bytes to the URL given by `--output` (`nats://` for production, `file://` for tests and local dev).
 
-With exactly one `--image/--output` pair and no `--batch-file`, the behaviour (output, error text, exit code 1 on any error) is the same as before. The operator depends on this.
+With exactly one `--image/--output` pair and no `--batch-file` or `--batch`, the behaviour (output, error text, exit code 1 on any error) is the same as before. The operator depends on this.
 
 ## Batch mode
 
@@ -19,7 +19,7 @@ wash-precompile --image <ref-a> --output <url-a> --image <ref-b> --output <url-b
 wash-precompile --batch-file <path>          # one `<image> <output>` pair per line
 ```
 
-`--image/--output` pairs are matched by position; the items of `--batch-file` come after them. Blank lines and lines starting with `#` are ignored.
+`--batch` selects batch mode also for a single `--image/--output` pair (so a caller gets the same output and exit codes for one item). `--image/--output` pairs are matched by position; the items of `--batch-file` come after them. Blank lines and lines starting with `#` are ignored.
 
 - All items share one wasmtime engine, one registry client and one NATS connection.
 - At most `--concurrency` (env `PRECOMPILE_CONCURRENCY`, default: the CPUs available to the process) compiles run at the same time. Pulls and writes of up to twice that many items overlap with them.

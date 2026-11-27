@@ -38,6 +38,11 @@ struct Args {
     #[arg(long)]
     batch_file: Option<PathBuf>,
 
+    /// Use batch mode (per-item lines, JSON summary, exit codes 0/1/2) also
+    /// for a single `--image/--output` pair
+    #[arg(long)]
+    batch: bool,
+
     /// Batch mode: how many components to compile at the same time
     /// [default: the CPUs available to this process, cgroup-aware]
     #[arg(long, env = "PRECOMPILE_CONCURRENCY")]
@@ -54,9 +59,10 @@ struct Args {
 }
 
 impl Args {
-    /// Exactly one `--image/--output` pair and no batch file: the original CLI.
+    /// Exactly one `--image/--output` pair, no batch file and no `--batch`:
+    /// the original CLI.
     fn is_single(&self) -> bool {
-        self.batch_file.is_none() && self.image.len() == 1 && self.output.len() == 1
+        !self.batch && self.batch_file.is_none() && self.image.len() == 1 && self.output.len() == 1
     }
 
     fn items(&self) -> Result<Vec<Item>> {
@@ -262,6 +268,20 @@ mod tests {
         assert!(!args.is_single());
         let images: Vec<String> = args.items().unwrap().into_iter().map(|i| i.image).collect();
         assert_eq!(images, vec!["r/a:1", "r/b:1"]);
+    }
+
+    #[test]
+    fn batch_flag_forces_batch_mode_for_one_pair() {
+        let args = Args::parse_from([
+            "wash-precompile",
+            "--batch",
+            "--image",
+            "r/a:1",
+            "--output",
+            "file:///tmp/a",
+        ]);
+        assert!(!args.is_single());
+        assert_eq!(args.items().unwrap().len(), 1);
     }
 
     #[test]
