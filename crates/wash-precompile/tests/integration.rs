@@ -93,3 +93,63 @@ async fn end_to_end_nats_output() {
 
     assert!(!bytes.is_empty(), "object is empty");
 }
+
+// Batch mode. These items fail without network access, so they run by default.
+#[cfg(test)]
+mod batch_mode {
+    use std::process::Command;
+
+    /// Runs the binary in batch mode with items that fail without network access.
+    fn run_batch(lines: &str) -> (i32, serde_json::Value, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = dir.path().join("batch");
+        let term = dir.path().join("termination-log");
+        std::fs::write(&batch, lines).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_wash-precompile"))
+            .arg("--batch-file")
+            .arg(&batch)
+            .arg("--termination-log")
+            .arg(&term)
+            .output()
+            .expect("failed to spawn wash-precompile");
+        let summary = serde_json::from_slice(&std::fs::read(&term).unwrap()).unwrap();
+        (
+            out.status.code().unwrap(),
+            summary,
+            String::from_utf8_lossy(&out.stdout).to_string(),
+        )
+    }
+
+    #[test]
+    fn batch_reports_every_item_and_exits_retryable() {
+        // Item 0: a bad output scheme (permanent). Item 1: a refused connection (retryable).
+        let (code, summary, stdout) =
+            run_batch("127.0.0.1:1/a:1 s3://bucket/a\n127.0.0.1:1/b:1 file:///tmp/b.cwasm\n");
+
+        assert_eq!(code, 1, "{stdout}");
+        assert_eq!(summary["total"], 2);
+        assert_eq!(summary["ok"], serde_json::json!([]));
+        assert_eq!(summary["failed"][0]["index"], 0);
+        assert_eq!(summary["failed"][0]["permanent"], true);
+        assert_eq!(summary["failed"][1]["index"], 1);
+        assert_eq!(summary["failed"][1]["permanent"], false);
+        assert_eq!(
+            stdout.lines().filter(|l| l.starts_with("fail\t")).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn batch_with_only_permanent_failures_exits_2() {
+        let (code, summary, _) = run_batch("bad@@ref file:///tmp/a.cwasm\n");
+        assert_eq!(code, 2);
+        assert_eq!(summary["failed"][0]["permanent"], true);
+    }
+
+    #[test]
+    fn invalid_batch_file_exits_2_with_a_summary() {
+        let (code, summary, _) = run_batch("only-one-field\n");
+        assert_eq!(code, 2);
+        assert_eq!(summary["permanent"], true);
+    }
+}

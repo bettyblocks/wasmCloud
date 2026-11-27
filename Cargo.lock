@@ -6439,6 +6439,8 @@ dependencies = [
  "docker_credential",
  "oci-client",
  "oci-wasm",
+ "serde",
+ "serde_json",
  "tempfile",
  "testcontainers",
  "tokio",
