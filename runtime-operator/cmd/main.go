@@ -92,6 +92,10 @@ func main() {
 		precompileGCInterval         time.Duration
 		precompileGCGracePeriod      time.Duration
 		precompileArtifactReplicas   uint
+		precompileBatching           bool
+		precompileBatchWindow        time.Duration
+		precompileMaxParallelPods    int
+		precompileMaxItemsPerJob     int
 		workloadConcurrency          int
 		heartbeatTTL                 time.Duration
 	)
@@ -205,6 +209,35 @@ func main() {
 			"delete it (guards the window between a Job writing an object and the "+
 			"operator recording it in Artifact status).",
 	)
+	flag.BoolVar(
+		&precompileBatching,
+		"precompile-batching",
+		false,
+		"Precompile pending Artifacts in batches: one Indexed Job per batch, where each pod "+
+			"precompiles a slice of the Artifacts. Needs a worker image with batch mode "+
+			"(--batch-file). When false, one Job per Artifact is created.",
+	)
+	flag.DurationVar(
+		&precompileBatchWindow,
+		"precompile-batch-window",
+		300*time.Millisecond,
+		"With -precompile-batching: how long to wait for more pending Artifacts before a "+
+			"batch Job is created (at most 4x this after the first Artifact of a batch).",
+	)
+	flag.IntVar(
+		&precompileMaxParallelPods,
+		"precompile-max-parallel-pods",
+		10,
+		"With -precompile-batching: the maximum number of worker pods of one batch Job "+
+			"(its parallelism and completions).",
+	)
+	flag.IntVar(
+		&precompileMaxItemsPerJob,
+		"precompile-max-items-per-job",
+		200,
+		"With -precompile-batching: a batch Job is created at once when this many Artifacts "+
+			"are pending in one namespace (at most 500).",
+	)
 	flag.IntVar(
 		&workloadConcurrency,
 		"workload-concurrency",
@@ -291,6 +324,10 @@ func main() {
 		PrecompileGCInterval:         precompileGCInterval,
 		PrecompileGCGracePeriod:      precompileGCGracePeriod,
 		PrecompileArtifactReplicas:   precompileArtifactReplicas,
+		PrecompileBatching:           precompileBatching,
+		PrecompileBatchWindow:        precompileBatchWindow,
+		PrecompileMaxParallelPods:    precompileMaxParallelPods,
+		PrecompileMaxItemsPerJob:     precompileMaxItemsPerJob,
 		WorkloadConcurrency:          workloadConcurrency,
 	}
 
