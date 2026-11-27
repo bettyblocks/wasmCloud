@@ -6439,6 +6439,7 @@ dependencies = [
  "docker_credential",
  "oci-client",
  "oci-wasm",
+ "sha2 0.10.9",
  "tempfile",
  "testcontainers",
  "tokio",
