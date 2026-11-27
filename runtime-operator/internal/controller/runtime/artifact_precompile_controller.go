@@ -13,8 +13,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
 	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
@@ -42,25 +47,51 @@ type PrecompileReconciler struct {
 	// Worker may pull from over plain HTTP, passed through as the Worker's
 	// INSECURE_REGISTRIES env var.
 	InsecureRegistries string
+	// Batch, when set, precompiles pending Artifacts in batches with one
+	// Indexed Job per batch instead of one Job per Artifact. See
+	// artifact_precompile_batch.go.
+	Batch *PrecompileBatchConfig
+
+	batcher *artifactBatcher
+	requeue chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=artifacts,verbs=get;list;watch
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=artifacts/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;delete;patch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list
 
 func (r *PrecompileReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&runtimev1alpha1.Artifact{}).
-		Owns(&batchv1.Job{}).
-		Named("runtime-artifact-precompile").
-		Complete(r)
+		Owns(&batchv1.Job{})
+	if r.Batch != nil {
+		r.requeue = make(chan event.GenericEvent, 1024)
+		r.batcher = newArtifactBatcher(r.Batch.Window, r.Batch.MaxItemsPerJob, r.flushBatch)
+		b = b.
+			// A batch Job has every Artifact of the batch as a (non-controller)
+			// owner, so an event on it reconciles all of them.
+			Watches(&batchv1.Job{},
+				handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &runtimev1alpha1.Artifact{}),
+				builder.WithPredicates(predicate.NewPredicateFuncs(func(o client.Object) bool {
+					return o.GetLabels()[PrecompileBatchLabel] == "true"
+				})),
+			).
+			WatchesRawSource(source.Channel(r.requeue, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Named("runtime-artifact-precompile").Complete(r)
 }
 
 func (r *PrecompileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var a runtimev1alpha1.Artifact
 	if err := r.Get(ctx, req.NamespacedName, &a); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if r.batcher != nil {
+		return r.reconcileBatched(ctx, &a)
 	}
 
 	desired, err := r.buildDesiredJob(&a)

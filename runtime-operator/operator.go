@@ -5,6 +5,7 @@ package runtime_operator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -74,6 +75,15 @@ type EmbeddedOperatorConfig struct {
 	// bucket doesn't already exist — the precompile Worker attaches to
 	// (rather than reconfigures) an existing bucket's replica count.
 	PrecompileArtifactReplicas uint
+	// PrecompileBatching precompiles pending Artifacts in batches, with one
+	// Indexed Job per batch, instead of one Job per Artifact.
+	PrecompileBatching bool
+	// PrecompileBatchWindow is the debounce window that collects a batch.
+	PrecompileBatchWindow time.Duration
+	// PrecompileMaxParallelPods is the parallelism of one batch Job.
+	PrecompileMaxParallelPods int
+	// PrecompileMaxItemsPerJob flushes a batch early at this many Artifacts.
+	PrecompileMaxItemsPerJob int
 	// Namespace is the namespace the operator itself runs in. Every Host
 	// CRD is created here regardless of where the underlying host pod
 	// runs; tenant attribution is carried on the Host's Environment
@@ -120,6 +130,13 @@ func NewEmbeddedOperator(
 	if !cfg.DisablePrecompileController && cfg.PrecompileArtifactReplicas == 0 {
 		return nil, errors.New("EmbeddedOperatorConfig.PrecompileArtifactReplicas must be at least 1")
 	}
+	if !cfg.DisablePrecompileController && cfg.PrecompileBatching &&
+		(cfg.PrecompileMaxParallelPods < 1 || cfg.PrecompileBatchWindow < 0 ||
+			cfg.PrecompileMaxItemsPerJob < 1 || cfg.PrecompileMaxItemsPerJob > runtime_controllers.MaxPrecompileBatchItems) {
+		return nil, fmt.Errorf("EmbeddedOperatorConfig: with PrecompileBatching, PrecompileMaxParallelPods must be "+
+			"at least 1, PrecompileMaxItemsPerJob between 1 and %d, and PrecompileBatchWindow not negative",
+			runtime_controllers.MaxPrecompileBatchItems)
+	}
 
 	switch {
 	case cfg.HeartbeatTTL <= 0:
@@ -160,6 +177,16 @@ func NewEmbeddedOperator(
 		if precompileNatsURL == "" {
 			precompileNatsURL = cfg.NatsURL
 		}
+		var batch *runtime_controllers.PrecompileBatchConfig
+		if cfg.PrecompileBatching {
+			batch = &runtime_controllers.PrecompileBatchConfig{
+				Window:          cfg.PrecompileBatchWindow,
+				MaxParallelPods: cfg.PrecompileMaxParallelPods,
+				MaxItemsPerJob:  cfg.PrecompileMaxItemsPerJob,
+				// Worker pods are not in the cache; read them directly.
+				APIReader: mgr.GetAPIReader(),
+			}
+		}
 		if err = (&runtime_controllers.PrecompileReconciler{
 			Client:      mgr.GetClient(),
 			Scheme:      mgr.GetScheme(),
@@ -174,6 +201,7 @@ func NewEmbeddedOperator(
 			Target:             cfg.PrecompileTarget,
 			WasmtimeVersion:    cfg.PrecompileWasmtimeVersion,
 			InsecureRegistries: cfg.PrecompileInsecureRegistries,
+			Batch:              batch,
 		}).SetupWithManager(mgr); err != nil {
 			return nil, err
 		}
