@@ -5,7 +5,9 @@ package runtime_operator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -74,6 +76,16 @@ type EmbeddedOperatorConfig struct {
 	// bucket doesn't already exist — the precompile Worker attaches to
 	// (rather than reconfigures) an existing bucket's replica count.
 	PrecompileArtifactReplicas uint
+	// PrecompileContentAddressed keys each .cwasm by the sha256 of the
+	// component (the OCI layer digest) instead of by Artifact name and image
+	// tag, and skips the precompile Job when the object already exists. It
+	// needs a nats:// PrecompileArtifactBaseURL and
+	// PrecompileEngineProfile.
+	PrecompileContentAddressed bool
+	// PrecompileEngineProfile is `wash-precompile --print-engine-profile`
+	// of PrecompileWorkerImage. It is part of every content-addressed key,
+	// and the worker refuses a key with another profile.
+	PrecompileEngineProfile string
 	// Namespace is the namespace the operator itself runs in. Every Host
 	// CRD is created here regardless of where the underlying host pod
 	// runs; tenant attribution is carried on the Host's Environment
@@ -120,6 +132,11 @@ func NewEmbeddedOperator(
 	if !cfg.DisablePrecompileController && cfg.PrecompileArtifactReplicas == 0 {
 		return nil, errors.New("EmbeddedOperatorConfig.PrecompileArtifactReplicas must be at least 1")
 	}
+	if !cfg.DisablePrecompileController && cfg.PrecompileContentAddressed {
+		if err := validateContentAddressed(cfg); err != nil {
+			return nil, err
+		}
+	}
 
 	switch {
 	case cfg.HeartbeatTTL <= 0:
@@ -160,6 +177,29 @@ func NewEmbeddedOperator(
 		if precompileNatsURL == "" {
 			precompileNatsURL = cfg.NatsURL
 		}
+		// GC reads/deletes objects from the same precompiled-artifacts bucket
+		// the Worker Jobs write to, so it needs its own connection to
+		// precompileNatsURL whenever that differs from the operator's own
+		// (Scheduler) connection. Content-addressed precompile looks objects
+		// up through the same connection.
+		gcNatsConn := nc
+		if precompileNatsURL != cfg.NatsURL {
+			gcNatsConn, err = wasmbus.NatsConnect(precompileNatsURL, cfg.NatsOptions...)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		var contentAddressed *runtime_controllers.ContentAddressedConfig
+		if cfg.PrecompileContentAddressed {
+			contentAddressed = &runtime_controllers.ContentAddressedConfig{
+				Resolver:      runtime_controllers.NewHTTPDigestResolver(cfg.PrecompileInsecureRegistries),
+				Store:         &runtime_controllers.NatsObjectStore{Conn: gcNatsConn},
+				EngineProfile: cfg.PrecompileEngineProfile,
+				JobReader:     mgr.GetAPIReader(),
+			}
+		}
+
 		if err = (&runtime_controllers.PrecompileReconciler{
 			Client:      mgr.GetClient(),
 			Scheme:      mgr.GetScheme(),
@@ -174,20 +214,9 @@ func NewEmbeddedOperator(
 			Target:             cfg.PrecompileTarget,
 			WasmtimeVersion:    cfg.PrecompileWasmtimeVersion,
 			InsecureRegistries: cfg.PrecompileInsecureRegistries,
+			ContentAddressed:   contentAddressed,
 		}).SetupWithManager(mgr); err != nil {
 			return nil, err
-		}
-
-		// GC reads/deletes objects from the same precompiled-artifacts bucket
-		// the Worker Jobs write to, so it needs its own connection to
-		// precompileNatsURL whenever that differs from the operator's own
-		// (Scheduler) connection.
-		gcNatsConn := nc
-		if precompileNatsURL != cfg.NatsURL {
-			gcNatsConn, err = wasmbus.NatsConnect(precompileNatsURL, cfg.NatsOptions...)
-			if err != nil {
-				return nil, err
-			}
 		}
 
 		if err = mgr.Add(&runtime_controllers.PrecompileGC{
@@ -265,4 +294,17 @@ func NewEmbeddedOperator(
 		Bus:      bus,
 		NatsConn: nc,
 	}, nil
+}
+
+// validateContentAddressed checks the settings content-addressed precompile
+// needs. It runs before any side effect, like the other checks above.
+func validateContentAddressed(cfg EmbeddedOperatorConfig) error {
+	if err := runtime_controllers.ValidateEngineProfile(cfg.PrecompileEngineProfile); err != nil {
+		return fmt.Errorf("EmbeddedOperatorConfig.PrecompileEngineProfile: %w", err)
+	}
+	if !strings.HasPrefix(cfg.PrecompileArtifactBaseURL, "nats://") {
+		return fmt.Errorf("EmbeddedOperatorConfig.PrecompileContentAddressed needs a nats:// "+
+			"PrecompileArtifactBaseURL, got %q", cfg.PrecompileArtifactBaseURL)
+	}
+	return nil
 }

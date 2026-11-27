@@ -74,6 +74,10 @@ spec:
             {{- end }}
             - "-precompile-gc-interval={{ .Values.operator.precompile.gc.interval }}"
             - "-precompile-gc-grace-period={{ .Values.operator.precompile.gc.gracePeriod }}"
+            {{- if .Values.operator.precompile.contentAddressed.enabled }}
+            - "-precompile-content-addressed"
+            - "-precompile-engine-profile={{ required "operator.precompile.contentAddressed.engineProfile is required when contentAddressed.enabled is true (run `wash-precompile --print-engine-profile` in the worker image)" .Values.operator.precompile.contentAddressed.engineProfile }}"
+            {{- end }}
             {{- else }}
             - "-disable-precompile-controller"
             {{- end }}

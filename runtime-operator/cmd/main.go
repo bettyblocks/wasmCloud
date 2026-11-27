@@ -92,6 +92,8 @@ func main() {
 		precompileGCInterval         time.Duration
 		precompileGCGracePeriod      time.Duration
 		precompileArtifactReplicas   uint
+		precompileContentAddressed   bool
+		precompileEngineProfile      string
 		workloadConcurrency          int
 		heartbeatTTL                 time.Duration
 	)
@@ -190,6 +192,23 @@ func main() {
 		1,
 		"JetStream replica count for the precompiled-artifacts object store bucket. "+
 			"Only takes effect when the bucket doesn't already exist.",
+	)
+	flag.BoolVar(
+		&precompileContentAddressed,
+		"precompile-content-addressed",
+		false,
+		"Key precompiled .cwasm objects by the sha256 of the component (the OCI layer digest) "+
+			"instead of by Artifact name and image tag, and skip the precompile Job when the "+
+			"object already exists. Needs -precompile-engine-profile and a nats:// "+
+			"-precompile-artifact-base-url.",
+	)
+	flag.StringVar(
+		&precompileEngineProfile,
+		"precompile-engine-profile",
+		"",
+		"Engine profile of the precompile worker image: the output of "+
+			"`wash-precompile --print-engine-profile`. Part of every content-addressed key. "+
+			"Required with -precompile-content-addressed.",
 	)
 	flag.DurationVar(
 		&precompileGCInterval,
@@ -291,6 +310,8 @@ func main() {
 		PrecompileGCInterval:         precompileGCInterval,
 		PrecompileGCGracePeriod:      precompileGCGracePeriod,
 		PrecompileArtifactReplicas:   precompileArtifactReplicas,
+		PrecompileContentAddressed:   precompileContentAddressed,
+		PrecompileEngineProfile:      precompileEngineProfile,
 		WorkloadConcurrency:          workloadConcurrency,
 	}
 
