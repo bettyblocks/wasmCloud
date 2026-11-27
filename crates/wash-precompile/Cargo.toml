@@ -21,6 +21,7 @@ wasmtime = {workspace = true,  features = ["component-model", "cranelift", "comp
 docker_credential.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
 tempfile.workspace = true
 wat = {workspace = true, features = ["component-model"]}
 testcontainers.workspace = true

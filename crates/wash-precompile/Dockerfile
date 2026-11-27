@@ -27,7 +27,10 @@ COPY --exclude=rust-toolchain.toml . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --features epoch-interruption --target x86_64-unknown-linux-gnu -p wash-precompile --bin wash-precompile && \
-    cp target/x86_64-unknown-linux-gnu/release/wash-precompile /tmp/wash-precompile
+    cp target/x86_64-unknown-linux-gnu/release/wash-precompile /tmp/wash-precompile && \
+    # Every Job pod pulls this binary: drop the symbol table (~29 MB -> ~23 MB).
+    # Done here, not in [profile.release], so other crates are not affected.
+    strip /tmp/wash-precompile
 
 # Release image — minimal base. wash-precompile is a one-shot worker so we
 # need only the binary; no shell, no package manager.
