@@ -72,3 +72,26 @@ cargo test -p wash-precompile
 # Integration tests (requires Docker for testcontainers NATS)
 cargo test -p wash-precompile -- --ignored
 ```
+
+## Content-addressed output keys
+
+The operator can key the output by the sha256 of the `.wasm` (the OCI layer digest), so that every Artifact with the same bytes shares one object and the operator can skip the Job when it exists:
+
+```
+<base>/sha256/<hex>/<target>-<wasmtime version>-<engine profile>.cwasm
+```
+
+When the output key has a `sha256/<hex>/` segment, the worker checks two things before it writes:
+
+- the pulled bytes hash to `<hex>`, and
+- `<engine profile>` is the profile of this worker.
+
+If either check fails the worker exits non-zero and writes nothing. A key with a `sha256/` segment that does not have this shape is an error. Other (legacy) keys are not checked.
+
+The engine profile is a 16-character hex name for the engine settings this build compiles with (target, epoch interruption, native unwind info). Print it with:
+
+```bash
+wash-precompile --print-engine-profile
+```
+
+Set the operator's `-precompile-engine-profile` to this value for the worker image it runs.
