@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
 	runtimectrl "go.wasmcloud.dev/runtime-operator/v2/internal/controller/runtime"
@@ -79,6 +80,11 @@ var _ = Describe("precompile pipeline", func() {
 			g.Expect(job.Spec.Template.Spec.Volumes).To(BeEmpty())
 			g.Expect(c.VolumeMounts).To(BeEmpty())
 			g.Expect(c.Env).NotTo(ContainElement(HaveField("Name", "DOCKER_CONFIG")))
+			g.Expect(c.Env).NotTo(ContainElement(HaveField("Name", "DOCKER_CONFIG_JSON")))
+
+			podSpec := job.Spec.Template.Spec
+			g.Expect(podSpec.AutomountServiceAccountToken).To(HaveValue(BeFalse()))
+			g.Expect(podSpec.EnableServiceLinks).To(HaveValue(BeFalse()))
 
 			for _, want := range testArtifactStore.Env {
 				g.Expect(c.Env).To(ContainElement(want))
@@ -200,7 +206,7 @@ var _ = Describe("precompile pipeline", func() {
 		}).Should(Succeed())
 	})
 
-	It("mounts the imagePullSecret as a docker config when set", func() {
+	It("passes the imagePullSecret as an env var, not a volume, when set", func() {
 		ctx := context.Background()
 
 		a := &runtimev1alpha1.Artifact{
@@ -218,27 +224,100 @@ var _ = Describe("precompile pipeline", func() {
 				Namespace: metav1.NamespaceDefault, Name: "precompile-" + a.Name,
 			}, &job)).To(Succeed())
 
-			g.Expect(job.Spec.Template.Spec.Volumes).To(HaveLen(1))
-			vol := job.Spec.Template.Spec.Volumes[0]
-			g.Expect(vol.Name).To(Equal("docker-creds"))
-			g.Expect(vol.Secret).NotTo(BeNil())
-			g.Expect(vol.Secret.SecretName).To(Equal("ghcr-secret"))
-			g.Expect(vol.Secret.Items).To(ContainElement(corev1.KeyToPath{
-				Key:  ".dockerconfigjson",
-				Path: "config.json",
-			}))
+			// A Secret volume makes the kubelet fetch the Secret before it
+			// creates the pod sandbox (~0.3 s per Job); an env var does not.
+			g.Expect(job.Spec.Template.Spec.Volumes).To(BeEmpty())
 
 			c := job.Spec.Template.Spec.Containers[0]
-			g.Expect(c.VolumeMounts).To(ContainElement(corev1.VolumeMount{
-				Name:      "docker-creds",
-				MountPath: "/etc/docker-creds",
-				ReadOnly:  true,
-			}))
+			g.Expect(c.VolumeMounts).To(BeEmpty())
+			g.Expect(c.Env).NotTo(ContainElement(HaveField("Name", "DOCKER_CONFIG")))
 			g.Expect(c.Env).To(ContainElement(corev1.EnvVar{
-				Name:  "DOCKER_CONFIG",
-				Value: "/etc/docker-creds",
+				Name: "DOCKER_CONFIG_JSON",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ghcr-secret"},
+						Key:                  corev1.DockerConfigJsonKey,
+					},
+				},
 			}))
 		}).Should(Succeed())
+	})
+
+	// An operator upgrade must not restart Jobs that the previous version
+	// created with the Secret volume: only the args decide a re-run.
+	It("keeps an in-flight Job that still uses the old Secret volume spec", func() {
+		ctx := context.Background()
+		const name = "old-spec-job"
+
+		expectedURL := fmt.Sprintf("%s/%s/ghcr.io_example_comp_v1/%s-%s.cwasm",
+			testArtifactStore.BaseURL, name, testTarget, testWasmtimeVersion)
+		oldJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: "precompile-" + name, Namespace: metav1.NamespaceDefault},
+			Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						RestartPolicy: corev1.RestartPolicyNever,
+						Containers: []corev1.Container{{
+							Name:  "precompile",
+							Image: testWorkerImage,
+							Args:  []string{"--image", testArtifactImage, "--output", expectedURL},
+							Env:   []corev1.EnvVar{{Name: "DOCKER_CONFIG", Value: "/etc/docker-creds"}},
+							VolumeMounts: []corev1.VolumeMount{{
+								Name: "docker-creds", MountPath: "/etc/docker-creds", ReadOnly: true,
+							}},
+						}},
+						Volumes: []corev1.Volume{{
+							Name: "docker-creds",
+							VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+								SecretName: "ghcr-secret",
+								Items:      []corev1.KeyToPath{{Key: ".dockerconfigjson", Path: "config.json"}},
+							}},
+						}},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, oldJob)).To(Succeed())
+
+		a := &runtimev1alpha1.Artifact{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metav1.NamespaceDefault},
+			Spec: runtimev1alpha1.ArtifactSpec{
+				Image:           testArtifactImage,
+				ImagePullSecret: &corev1.LocalObjectReference{Name: "ghcr-secret"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, a)).To(Succeed())
+
+		// The old operator owned its Job; that is what routes Job status
+		// changes back to the Artifact.
+		Eventually(func(g Gomega) {
+			var job batchv1.Job
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(oldJob), &job)).To(Succeed())
+			g.Expect(controllerutil.SetControllerReference(a, &job, k8sClient.Scheme())).To(Succeed())
+			g.Expect(k8sClient.Update(ctx, &job)).To(Succeed())
+		}).Should(Succeed())
+
+		// The reconciler sees the Job and reports it as in flight.
+		Eventually(func(g Gomega) {
+			var got runtimev1alpha1.Artifact
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: metav1.NamespaceDefault, Name: name,
+			}, &got)).To(Succeed())
+			prog := got.Status.GetCondition(runtimev1alpha1.ArtifactConditionPrecompileProgressing)
+			g.Expect(prog.Status).To(Equal(corev1.ConditionTrue))
+		}).Should(Succeed())
+
+		Consistently(func(g Gomega) {
+			var job batchv1.Job
+			g.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Namespace: metav1.NamespaceDefault, Name: "precompile-" + name,
+			}, &job)).To(Succeed())
+			g.Expect(job.UID).To(Equal(oldJob.UID), "the old Job must not be recreated")
+			g.Expect(job.DeletionTimestamp).To(BeNil())
+		}, "1s").Should(Succeed())
+
+		completePrecompileJob(ctx, name, testArtifactImage, false)
+		expectPrecompiledImages(ctx, name, testArtifactImage)
 	})
 
 	It("does not re-create a Job when the variant is already recorded", func() {
