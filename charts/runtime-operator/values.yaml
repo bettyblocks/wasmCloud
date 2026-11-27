@@ -288,6 +288,19 @@ operator:
     # plain HTTP (e.g. a local dev registry). Mirrors the host's
     # INSECURE_REGISTRIES allowlist. Empty (default) means HTTPS-only.
     insecureRegistries: ""
+    # Content-addressed keys: the operator keys each .cwasm by the sha256 of
+    # the component (the OCI layer digest) instead of by Artifact name and
+    # image tag, and skips the precompile Job when the object already exists.
+    # Artifacts with the same bytes share one object, and a re-pushed tag can
+    # never serve an old .cwasm. Needs a nats:// artifactBaseURL and a worker
+    # image that verifies content-addressed keys.
+    contentAddressed:
+      # -- Off by default: the per-Artifact, tag-keyed URL stays the default.
+      enabled: false
+      # -- Output of `wash-precompile --print-engine-profile` for the worker
+      # image above. Part of every key; the worker refuses a key with another
+      # profile, so update it together with the worker image.
+      engineProfile: ""
     # Garbage collection of orphaned precompiled .cwasm objects — objects in the
     # artifact store that are neither claimed by a live Artifact's status nor
     # actively resolved onto a running WorkloadReplicaSet's components

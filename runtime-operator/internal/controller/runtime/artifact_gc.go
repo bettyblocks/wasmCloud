@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -34,6 +35,15 @@ const natsRequestTimeout = 30 * time.Second
 // GracePeriod (minimum object age) covers with a wide safety margin: the race
 // window is a single reconcile, GracePeriod defaults to much longer.
 //
+// With content-addressed keys an orphan can become in use again without a
+// new write: the operator finds the object and records it. Before it records
+// it, the operator re-publishes the object's metadata (NatsObjectStore.Claim),
+// which moves its ModTime. The delete here is conditional on the metadata
+// sequence the sweep read: if anything wrote the metadata since (a claim, a
+// new put of the same key), the delete does not land and the object is
+// kept. Both sides are conditional on the same per-subject sequence, so
+// exactly one of them wins.
+//
 // PrecompileGC runs automatically whenever the precompile controller is
 // enabled, as a manager.Runnable that only executes on the elected leader.
 type PrecompileGC struct {
@@ -57,6 +67,10 @@ type PrecompileGC struct {
 	// GracePeriod is the minimum age (by object ModTime) before a not-in-use
 	// object may be collected. Guards the write-then-record race.
 	GracePeriod time.Duration
+
+	// beforeDelete, if set, runs between the mark phase and the deletes.
+	// Tests use it to change the store in that window.
+	beforeDelete func()
 }
 
 // NeedLeaderElection makes the manager run the GC only on the elected leader,
@@ -112,8 +126,7 @@ func (g *PrecompileGC) sweep(ctx context.Context, bucket string) error {
 	if err != nil {
 		return fmt.Errorf("acquiring JetStream context: %w", err)
 	}
-	store, err := js.ObjectStore(bucket)
-	if err != nil {
+	if _, err := js.ObjectStore(bucket); err != nil {
 		return fmt.Errorf("opening object store %q: %w", bucket, err)
 	}
 	stream := objectStreamName(bucket)
@@ -141,7 +154,7 @@ func (g *PrecompileGC) sweep(ctx context.Context, bucket string) error {
 			continue
 		}
 		if !info.Deleted {
-			liveCwasm = append(liveCwasm, cwasmObject{Key: key, ModTime: info.ModTime})
+			liveCwasm = append(liveCwasm, cwasmObject{Key: key, ModTime: info.ModTime, Seq: seq})
 			continue
 		}
 		if err := purgeTombstone(js, bucket, subj, seq, info.NUID); err != nil {
@@ -155,16 +168,27 @@ func (g *PrecompileGC) sweep(ctx context.Context, bucket string) error {
 	// garbage, further filtered down to what's past the grace period.
 	removable, withinGrace := removableKeys(liveCwasm, inUseCwasm, now, g.GracePeriod)
 
-	deleted := 0
-	for _, key := range removable {
-		if err := store.Delete(key); err != nil {
-			log.Error(err, "failed to delete orphaned cwasm object", "bucket", bucket, "key", key)
+	if g.beforeDelete != nil {
+		g.beforeDelete()
+	}
+
+	deleted, touched := 0, 0
+	for _, obj := range removable {
+		ok, err := deleteIfUnchanged(js, bucket, obj)
+		if err != nil {
+			log.Error(err, "failed to delete orphaned cwasm object", "bucket", bucket, "key", obj.Key)
+			continue
+		}
+		if !ok {
+			// Claimed or re-written since the sweep read it: in use again.
+			touched++
+			log.V(1).Info("kept cwasm object that changed during the sweep", "bucket", bucket, "key", obj.Key)
 			continue
 		}
 		deleted++
 		// Deletions stay at Info: they are irreversible, so the audit trail of
 		// what GC removed must be visible at default verbosity.
-		log.Info("deleted orphaned cwasm object", "bucket", bucket, "key", key)
+		log.Info("deleted orphaned cwasm object", "bucket", bucket, "key", obj.Key)
 	}
 
 	log.V(1).Info("precompile GC sweep complete",
@@ -173,6 +197,7 @@ func (g *PrecompileGC) sweep(ctx context.Context, bucket string) error {
 		"inUse", len(inUseCwasm),
 		"orphaned", len(removable),
 		"deleted", deleted,
+		"changedDuringSweep", touched,
 		"withinGrace", withinGrace,
 		"tombstonesPurged", tombstones,
 	)
@@ -231,11 +256,72 @@ func purgeTombstone(js nats.JetStreamContext, bucket, subj string, upToSeq uint6
 	return js.PurgeStream(stream, &nats.StreamPurgeRequest{Subject: subj, Sequence: upToSeq + 1})
 }
 
+// deleteIfUnchanged deletes obj like ObjectStore.Delete does (a tombstone on
+// the metadata subject, then a purge of the chunks), but only if the
+// metadata is still the message the sweep read (obj.Seq). It returns false,
+// and deletes nothing, when the object was claimed or re-written since.
+func deleteIfUnchanged(js nats.JetStreamContext, bucket string, obj cwasmObject) (bool, error) {
+	stream := objectStreamName(bucket)
+	subj := metaSubject(bucket, base64.URLEncoding.EncodeToString([]byte(obj.Key)))
+	// Re-read right before the delete. The conditional publish below is what
+	// makes it safe; this read gives a clear answer without a failed publish
+	// in the common case, and the chunk subject of the current object.
+	info, seq, err := readObjectInfo(js, stream, subj)
+	switch {
+	case errors.Is(err, nats.ErrMsgNotFound):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("re-reading metadata: %w", err)
+	case seq != obj.Seq || info.Deleted:
+		return false, nil
+	}
+	if info.NUID == "" {
+		return false, nats.ErrBadObjectMeta
+	}
+	info.Deleted = true
+	info.Size, info.Chunks, info.Digest = 0, 0, ""
+	info.ModTime = time.Time{}
+	data, err := json.Marshal(info)
+	if err != nil {
+		return false, err
+	}
+	if err := publishMetaIfUnchanged(js, bucket, subj, data, seq); err != nil {
+		if isWrongLastSequence(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("publishing delete marker: %w", err)
+	}
+	if err := js.PurgeStream(stream, &nats.StreamPurgeRequest{Subject: chunkSubject(bucket, info.NUID)}); err != nil {
+		return true, fmt.Errorf("purging chunks: %w", err)
+	}
+	return true, nil
+}
+
+// publishMetaIfUnchanged replaces the metadata message on subj with data, if
+// the last message on subj still has sequence lastSeq.
+func publishMetaIfUnchanged(
+	js nats.JetStreamContext, bucket, subj string, data []byte, lastSeq uint64, opts ...nats.PubOpt,
+) error {
+	m := nats.NewMsg(subj)
+	m.Header.Set(nats.MsgRollup, nats.MsgRollupSubject)
+	m.Data = data
+	opts = append(opts, nats.ExpectStream(objectStreamName(bucket)), nats.ExpectLastSequencePerSubject(lastSeq))
+	_, err := js.PublishMsg(m, opts...)
+	return err
+}
+
+func isWrongLastSequence(err error) bool {
+	var apiErr *nats.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode == nats.JSErrCodeStreamWrongLastSequence
+}
+
 // cwasmObject is the minimal object-store metadata the sweep reasons about
 // for one precompiled .cwasm blob.
 type cwasmObject struct {
 	Key     string
 	ModTime time.Time
+	// Seq is the stream sequence of the metadata message the sweep read.
+	Seq uint64
 }
 
 // bucketFromBaseURL extracts the object-store bucket from a nats://<bucket>
@@ -305,7 +391,7 @@ func removableKeys(
 	inUse map[string]struct{},
 	now time.Time,
 	grace time.Duration,
-) (removable []string, withinGrace int) {
+) (removable []cwasmObject, withinGrace int) {
 	cutoff := now.Add(-grace)
 	for _, o := range cwasm {
 		if _, ok := inUse[o.Key]; ok {
@@ -315,7 +401,7 @@ func removableKeys(
 			withinGrace++
 			continue
 		}
-		removable = append(removable, o.Key)
+		removable = append(removable, o)
 	}
 	return removable, withinGrace
 }

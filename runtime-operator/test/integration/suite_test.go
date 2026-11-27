@@ -7,8 +7,10 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -21,6 +23,7 @@ import (
 
 var (
 	testEnv       *envtest.Environment
+	restConfig    *rest.Config
 	k8sClient     client.Client
 	cancelMgr     context.CancelFunc
 	testCache     client.Reader
@@ -40,6 +43,7 @@ var _ = BeforeSuite(func() {
 	}
 	cfg, err := testEnv.Start()
 	Expect(err).NotTo(HaveOccurred())
+	restConfig = cfg
 
 	scheme := runtime.NewScheme()
 	Expect(clientgoscheme.AddToScheme(scheme)).To(Succeed())
@@ -52,9 +56,14 @@ var _ = BeforeSuite(func() {
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:  scheme,
 		Metrics: metricsserver.Options{BindAddress: "0"},
-		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
-			&runtimev1alpha1.Workload{}: {Transform: testCacheHold.transform},
-		}},
+		Cache: cache.Options{
+			// The content-addressed precompile test runs its own manager in
+			// its own namespace; keep this one out of it.
+			DefaultNamespaces: map[string]cache.Config{metav1.NamespaceDefault: {}},
+			ByObject: map[client.Object]cache.ByObject{
+				&runtimev1alpha1.Workload{}: {Transform: testCacheHold.transform},
+			},
+		},
 	})
 	Expect(err).NotTo(HaveOccurred())
 

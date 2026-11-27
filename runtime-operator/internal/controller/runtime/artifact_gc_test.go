@@ -117,7 +117,7 @@ func TestRemovableKeys(t *testing.T) {
 
 	removable, withinGrace := removableKeys(cwasm, inUse, now, grace)
 
-	if len(removable) != 1 || removable[0] != "old-orphan.cwasm" {
+	if len(removable) != 1 || removable[0].Key != "old-orphan.cwasm" {
 		t.Fatalf("removable = %v, want [old-orphan.cwasm]", removable)
 	}
 	if withinGrace != 1 {
@@ -396,5 +396,87 @@ func TestInUseKeysFromReplicaSets(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// An orphan that is touched between the sweep's read and its delete (a
+// content-addressed re-use re-publishes its metadata) must survive. The hook
+// runs right after the mark phase, where such a touch would land.
+func TestSweep_KeepsOrphanClaimedDuringSweep(t *testing.T) {
+	nc := startEmbeddedNats(t)
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	store, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: gcTestBucket})
+	if err != nil {
+		t.Fatalf("create object store: %v", err)
+	}
+	const reusedKey = "sha256/aaaa/x86_64-27.0.0-0123456789abcdef.cwasm"
+	const orphanKey = "sha256/bbbb/x86_64-27.0.0-0123456789abcdef.cwasm"
+	for _, key := range []string{reusedKey, orphanKey} {
+		if _, err := store.PutBytes(key, []byte(key)); err != nil {
+			t.Fatalf("put %s: %v", key, err)
+		}
+	}
+
+	c := fake.NewClientBuilder().WithScheme(gcScheme(t)).Build()
+	gc := &PrecompileGC{
+		Reader:      c,
+		NatsConn:    nc,
+		BaseURL:     gcTestBaseURL,
+		GracePeriod: 0,
+		beforeDelete: func() {
+			// What a re-use does: re-publish the metadata, unchanged.
+			info, err := store.GetInfo(reusedKey)
+			if err != nil {
+				t.Errorf("get info during sweep: %v", err)
+				return
+			}
+			if err := store.UpdateMeta(reusedKey, &info.ObjectMeta); err != nil {
+				t.Errorf("touch during sweep: %v", err)
+			}
+		},
+	}
+	if err := gc.sweep(context.Background(), gcTestBucket); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	keys := objectStoreKeys(t, store)
+	if _, ok := keys[reusedKey]; !ok {
+		t.Fatalf("object touched during the sweep was deleted; store has %v", keys)
+	}
+	if _, ok := keys[orphanKey]; ok {
+		t.Fatalf("untouched orphan should have been deleted; store has %v", keys)
+	}
+	if b, err := store.GetBytes(reusedKey); err != nil || string(b) != reusedKey {
+		t.Fatalf("touched object unreadable: %q %v", b, err)
+	}
+}
+
+// A put of the same key between the sweep's read and its delete (a Job that
+// re-wrote the object) must survive too.
+func TestDeleteIfUnchanged_KeepsNewerPut(t *testing.T) {
+	nc := startEmbeddedNats(t)
+	js, _ := nc.JetStream()
+	store, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: gcTestBucket})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PutBytes(gcTestKey, []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	_, seq, err := readObjectInfo(js, objectStreamName(gcTestBucket), metaSubject(gcTestBucket, encodeKey(gcTestKey)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PutBytes(gcTestKey, []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := deleteIfUnchanged(js, gcTestBucket, cwasmObject{Key: gcTestKey, Seq: seq})
+	if err != nil || deleted {
+		t.Fatalf("stale delete landed: %v %v", deleted, err)
+	}
+	if b, err := store.GetBytes(gcTestKey); err != nil || string(b) != "v2" {
+		t.Fatalf("newer put lost: %q %v", b, err)
 	}
 }

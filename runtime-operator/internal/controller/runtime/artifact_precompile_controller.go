@@ -15,6 +15,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
 	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
@@ -27,6 +28,11 @@ type ArtifactStoreConfig struct {
 	BaseURL string
 	Env     []corev1.EnvVar
 }
+
+const (
+	reasonJobInFlight  condition.ConditionReason = "JobInFlight"
+	reasonJobSucceeded condition.ConditionReason = "JobSucceeded"
+)
 
 // PrecompileReconciler creates a precompile Job per Artifact and reports the
 // outcome via Artifact.Status.Precompiled plus Precompiled / PrecompileFailed /
@@ -42,19 +48,31 @@ type PrecompileReconciler struct {
 	// Worker may pull from over plain HTTP, passed through as the Worker's
 	// INSECURE_REGISTRIES env var.
 	InsecureRegistries string
+
+	// ContentAddressed, when set, keys each .cwasm by the digest of the
+	// component and skips the Job when the object already exists. See
+	// artifact_precompile_content.go. Nil keeps the per-Artifact,
+	// tag-keyed URL.
+	ContentAddressed *ContentAddressedConfig
 }
 
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=artifacts,verbs=get;list;watch
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=artifacts/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 func (r *PrecompileReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&runtimev1alpha1.Artifact{}).
 		Owns(&batchv1.Job{}).
-		Named("runtime-artifact-precompile").
-		Complete(r)
+		Named("runtime-artifact-precompile")
+	if r.ContentAddressed != nil {
+		// Artifacts that wait for another Artifact's Job (same bytes) are
+		// woken when that Job changes.
+		b = b.Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(r.artifactsWaitingForJob))
+	}
+	return b.Complete(r)
 }
 
 func (r *PrecompileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -62,8 +80,11 @@ func (r *PrecompileReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.Get(ctx, req.NamespacedName, &a); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	if r.ContentAddressed != nil {
+		return r.reconcileContentAddressed(ctx, &a)
+	}
 
-	desired, err := r.buildDesiredJob(&a)
+	desired, err := r.buildDesiredJob(&a, a.Spec.Image, r.outputURLOf(&a))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -173,13 +194,15 @@ func (r *PrecompileReconciler) outputURLOf(a *runtimev1alpha1.Artifact) string {
 	)
 }
 
-func (r *PrecompileReconciler) buildDesiredJob(a *runtimev1alpha1.Artifact) (*batchv1.Job, error) {
+func (r *PrecompileReconciler) buildDesiredJob(
+	a *runtimev1alpha1.Artifact, pullRef, outputURL string,
+) (*batchv1.Job, error) {
 	container := corev1.Container{
 		Name:  "precompile",
 		Image: r.WorkerImage,
 		Args: []string{
-			"--image", a.Spec.Image,
-			"--output", r.outputURLOf(a),
+			"--image", pullRef,
+			"--output", outputURL,
 		},
 		Env: r.ArtifactStore.Env,
 	}
@@ -240,13 +263,28 @@ func (r *PrecompileReconciler) buildDesiredJob(a *runtimev1alpha1.Artifact) (*ba
 func (r *PrecompileReconciler) handleSuccessfulJob(
 	ctx context.Context, a *runtimev1alpha1.Artifact,
 ) (ctrl.Result, error) {
-	variant := runtimev1alpha1.PrecompiledVariant{
+	return r.recordVariant(ctx, a, r.variantFor(a, r.outputURLOf(a)), reasonJobSucceeded, variantRecorded)
+}
+
+func (r *PrecompileReconciler) variantFor(a *runtimev1alpha1.Artifact, url string) runtimev1alpha1.PrecompiledVariant {
+	return runtimev1alpha1.PrecompiledVariant{
 		Target:          r.Target,
 		WasmtimeVersion: r.WasmtimeVersion,
-		ArtifactURL:     r.outputURLOf(a),
+		ArtifactURL:     url,
 		ImageRef:        a.Spec.Image,
 	}
-	if variantRecorded(a.Status.Precompiled, variant) {
+}
+
+// recordVariant makes variant the only recorded variant and marks the
+// Artifact precompiled. recorded decides whether it is already there.
+func (r *PrecompileReconciler) recordVariant(
+	ctx context.Context,
+	a *runtimev1alpha1.Artifact,
+	variant runtimev1alpha1.PrecompiledVariant,
+	reason condition.ConditionReason,
+	recorded func([]runtimev1alpha1.PrecompiledVariant, runtimev1alpha1.PrecompiledVariant) bool,
+) (ctrl.Result, error) {
+	if recorded(a.Status.Precompiled, variant) {
 		return ctrl.Result{}, nil
 	}
 	base := a.DeepCopy()
@@ -257,7 +295,7 @@ func (r *PrecompileReconciler) handleSuccessfulJob(
 		condition.Condition{
 			Type:               runtimev1alpha1.ArtifactConditionPrecompileProgressing,
 			Status:             condition.ConditionFalse,
-			Reason:             "JobSucceeded",
+			Reason:             reason,
 			LastTransitionTime: metav1.Now(),
 		},
 	)
@@ -267,8 +305,8 @@ func (r *PrecompileReconciler) handleSuccessfulJob(
 func (r *PrecompileReconciler) handleInFlightJob(
 	ctx context.Context, a *runtimev1alpha1.Artifact,
 ) (ctrl.Result, error) {
-	if a.Status.GetCondition(runtimev1alpha1.ArtifactConditionPrecompileProgressing).Status ==
-		condition.ConditionTrue {
+	if cond := a.Status.GetCondition(runtimev1alpha1.ArtifactConditionPrecompileProgressing); cond.Status ==
+		condition.ConditionTrue && cond.Reason == reasonJobInFlight {
 		return ctrl.Result{}, nil
 	}
 	base := a.DeepCopy()
@@ -276,7 +314,7 @@ func (r *PrecompileReconciler) handleInFlightJob(
 		condition.Condition{
 			Type:               runtimev1alpha1.ArtifactConditionPrecompileProgressing,
 			Status:             condition.ConditionTrue,
-			Reason:             "JobInFlight",
+			Reason:             reasonJobInFlight,
 			LastTransitionTime: metav1.Now(),
 		},
 	)
