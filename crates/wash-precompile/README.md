@@ -49,7 +49,7 @@ cargo run -p wash-precompile -- \
     --output file:///tmp/out.cwasm
 ```
 
-For `nats://`, set `NATS_URL`. For pulling from a private registry, set `DOCKER_CONFIG` pointing at a directory containing a `config.json` (the same format `kubectl create secret docker-registry` produces).
+For `nats://`, set `NATS_URL`. For pulling from a private registry, set `DOCKER_CONFIG_JSON` to the content of a docker `config.json` (the `.dockerconfigjson` key of a `kubectl create secret docker-registry` Secret); the runtime-operator does this from the Artifact's `imagePullSecret`. If `DOCKER_CONFIG_JSON` is not set, the worker reads `config.json` from the directory in `DOCKER_CONFIG` (default `~/.docker`).
 
 ## Insecure registries
 

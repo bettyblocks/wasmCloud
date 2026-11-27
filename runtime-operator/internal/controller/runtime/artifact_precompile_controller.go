@@ -173,6 +173,11 @@ func (r *PrecompileReconciler) outputURLOf(a *runtimev1alpha1.Artifact) string {
 	)
 }
 
+// dockerConfigJSONEnv carries the content of the Artifact's imagePullSecret
+// (a docker config.json) to the worker. The worker reads it before it falls
+// back to $DOCKER_CONFIG/config.json.
+const dockerConfigJSONEnv = "DOCKER_CONFIG_JSON"
+
 func (r *PrecompileReconciler) buildDesiredJob(a *runtimev1alpha1.Artifact) (*batchv1.Job, error) {
 	container := corev1.Container{
 		Name:  "precompile",
@@ -191,31 +196,22 @@ func (r *PrecompileReconciler) buildDesiredJob(a *runtimev1alpha1.Artifact) (*ba
 		})
 	}
 
-	var volumes []corev1.Volume
+	// Pass the pull credentials as an env var, not as a Secret volume: the
+	// kubelet resolves a Secret volume before it creates the pod sandbox, which
+	// costs ~0.3 s per Job. An env var from a secretKeyRef does not.
 	if a.Spec.ImagePullSecret != nil {
 		container.Env = append(container.Env, corev1.EnvVar{
-			Name:  "DOCKER_CONFIG",
-			Value: "/etc/docker-creds",
-		})
-		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
-			Name:      "docker-creds",
-			MountPath: "/etc/docker-creds",
-			ReadOnly:  true,
-		})
-		volumes = append(volumes, corev1.Volume{
-			Name: "docker-creds",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: a.Spec.ImagePullSecret.Name,
-					Items: []corev1.KeyToPath{{
-						Key:  ".dockerconfigjson",
-						Path: "config.json",
-					}},
+			Name: dockerConfigJSONEnv,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: *a.Spec.ImagePullSecret,
+					Key:                  corev1.DockerConfigJsonKey,
 				},
 			},
 		})
 	}
 
+	disabled := false
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "precompile-" + a.Name,
@@ -226,7 +222,11 @@ func (r *PrecompileReconciler) buildDesiredJob(a *runtimev1alpha1.Artifact) (*ba
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
 					Containers:    []corev1.Container{container},
-					Volumes:       volumes,
+					// The worker does not talk to the Kubernetes API or to
+					// in-cluster Services by name, so skip the token mount and
+					// the per-Service env vars.
+					AutomountServiceAccountToken: &disabled,
+					EnableServiceLinks:           &disabled,
 				},
 			},
 		},
