@@ -75,6 +75,27 @@ rules:
     - jobs/status
     verbs:
     - get
+{{- if and $.Values.operator.precompile.enabled $.Values.operator.precompile.batching.enabled }}
+  # Precompile batching: each batch Job reads its batch files from a ConfigMap
+  # the operator creates (owned by the Job, deleted with it), and the operator
+  # reads the per-item results from the termination message of the worker
+  # Pods.
+  - apiGroups:
+    - ""
+    resources:
+    - configmaps
+    verbs:
+    - create
+    - delete
+    - patch
+  - apiGroups:
+    - ""
+    resources:
+    - pods
+    verbs:
+    - get
+    - list
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

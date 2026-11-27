@@ -288,6 +288,24 @@ operator:
     # plain HTTP (e.g. a local dev registry). Mirrors the host's
     # INSECURE_REGISTRIES allowlist. Empty (default) means HTTPS-only.
     insecureRegistries: ""
+    # Batching: collect pending Artifacts for a short window and precompile
+    # them with one Indexed Job per batch (each pod runs `wash-precompile
+    # --batch-file` over a slice of the Artifacts) instead of one Job per
+    # Artifact. Needs a worker image with batch mode. Off by default.
+    batching:
+      # -- Turn batching on (--precompile-batching). Also grants the operator
+      # create/patch/delete on ConfigMaps and get/list on Pods in the Artifact
+      # namespaces (the batch files and the per-item results).
+      enabled: false
+      # -- Debounce window that collects a batch (Go duration string). A batch
+      # is created when no new pending Artifact arrived for this long, and at
+      # the latest 4x this after the first one.
+      window: "300ms"
+      # -- Maximum worker pods of one batch Job (its parallelism).
+      maxParallelPods: 10
+      # -- A batch Job is created at once when this many Artifacts are pending
+      # in one namespace.
+      maxItemsPerJob: 200
     # Garbage collection of orphaned precompiled .cwasm objects — objects in the
     # artifact store that are neither claimed by a live Artifact's status nor
     # actively resolved onto a running WorkloadReplicaSet's components
