@@ -19,22 +19,27 @@ import (
 	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
 )
 
-func TestOutputKeyOf(t *testing.T) {
-	cases := []struct {
-		base, url, want string
-		ok              bool
-	}{
-		{gcTestBaseURL, gcTestBaseURL + "/" + gcTestKey, gcTestKey, true},
-		{gcTestBaseURL + "/", gcTestBaseURL + "/" + gcTestKey, gcTestKey, true},
-		{gcTestBaseURL, "nats://other/" + gcTestKey, "", false},
-		{gcTestBaseURL, gcTestBaseURL + "/", "", false},
-		{"file:///tmp/out", "file:///tmp/out/" + gcTestKey, "", false},
+func TestPrecompiledArtifactKey(t *testing.T) {
+	r := &PrecompileReconciler{
+		ArtifactStore:   ArtifactStoreConfig{BaseURL: gcTestBaseURL},
+		Target:          testTarget,
+		WasmtimeVersion: testWasmtimeVersion,
 	}
-	for _, c := range cases {
-		got, ok := outputKeyOf(c.base, c.url)
-		if got != c.want || ok != c.ok {
-			t.Errorf("outputKeyOf(%q, %q) = %q, %v; want %q, %v", c.base, c.url, got, ok, c.want, c.ok)
-		}
+	a := &runtimev1alpha1.Artifact{
+		ObjectMeta: metav1.ObjectMeta{Name: testArtifactName},
+		Spec:       runtimev1alpha1.ArtifactSpec{Image: testImageV1},
+	}
+
+	key := r.precompiledArtifactKey(a)
+
+	if want := testArtifactName + "/ghcr.io_x_y_v1/" + testTarget + "-" + testWasmtimeVersion + ".cwasm"; key != want {
+		t.Fatalf("precompiledArtifactKey = %q, want %q", key, want)
+	}
+	if got := r.outputURLOf(a); got != gcTestBaseURL+"/"+key {
+		t.Fatalf("outputURLOf = %q, want the base URL plus the key", got)
+	}
+	if name, ok := artifactNameFromKey(key); !ok || name != testArtifactName {
+		t.Fatalf("artifactNameFromKey(%q) = %q, %v", key, name, ok)
 	}
 }
 
@@ -102,10 +107,7 @@ func newPrecompileFixture(t *testing.T, jobCreated time.Time) *precompileFixture
 			func(o client.Object) []string { return []string{o.GetName()} }).
 		Build()
 
-	key, ok := outputKeyOf(gcTestBaseURL, r.outputURLOf(a))
-	if !ok {
-		t.Fatalf("no output key for %q", r.outputURLOf(a))
-	}
+	key := r.precompiledArtifactKey(a)
 	return &precompileFixture{r: r, artifact: a, job: job, store: store, nc: nc, key: key}
 }
 
@@ -204,7 +206,7 @@ func TestReconcile_ClosedNatsConnWaitsForJobComplete(t *testing.T) {
 	}
 }
 
-func TestOutputWatcher_SendsEventForPut(t *testing.T) {
+func TestPrecompiledArtifactWatcher_SendsEventForPut(t *testing.T) {
 	f := newPrecompileFixture(t, time.Now())
 	other := &runtimev1alpha1.Artifact{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: metav1.NamespaceDefault}}
 	if err := f.r.Create(context.Background(), other); err != nil {
@@ -212,7 +214,7 @@ func TestOutputWatcher_SendsEventForPut(t *testing.T) {
 	}
 
 	events := make(chan event.GenericEvent, 8)
-	w := &precompileOutputWatcher{Reader: f.r.Client, NatsConn: f.nc, Bucket: gcTestBucket, Events: events}
+	w := &precompiledArtifactWatcher{Reader: f.r.Client, NatsConn: f.nc, Bucket: gcTestBucket, Events: events}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { _ = w.Start(ctx); close(done) }()
@@ -249,7 +251,7 @@ func TestOutputWatcher_SendsEventForPut(t *testing.T) {
 	}
 }
 
-func TestOutputWatcher_RetriesUntilBucketExists(t *testing.T) {
+func TestPrecompiledArtifactWatcher_RetriesUntilBucketExists(t *testing.T) {
 	nc := startEmbeddedNats(t)
 	a := &runtimev1alpha1.Artifact{ObjectMeta: metav1.ObjectMeta{Name: testArtifactName, Namespace: metav1.NamespaceDefault}}
 	c := fake.NewClientBuilder().WithScheme(gcScheme(t)).WithObjects(a).
@@ -257,7 +259,7 @@ func TestOutputWatcher_RetriesUntilBucketExists(t *testing.T) {
 			func(o client.Object) []string { return []string{o.GetName()} }).
 		Build()
 	events := make(chan event.GenericEvent, 8)
-	w := &precompileOutputWatcher{Reader: c, NatsConn: nc, Bucket: gcTestBucket, Events: events}
+	w := &precompiledArtifactWatcher{Reader: c, NatsConn: nc, Bucket: gcTestBucket, Events: events}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { _ = w.Start(ctx); close(done) }()

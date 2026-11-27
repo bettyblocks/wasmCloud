@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"fmt"
 	"slices"
 	"strings"
 
@@ -58,7 +57,7 @@ func (r *PrecompileReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&batchv1.Job{}).
 		Named("runtime-artifact-precompile")
 
-	outputs, err := r.startOutputWatcher(mgr)
+	outputs, err := r.startPrecompiledArtifactWatcher(mgr)
 	if err != nil {
 		return err
 	}
@@ -176,13 +175,7 @@ func sanitizeImageRef(image string) string {
 }
 
 func (r *PrecompileReconciler) outputURLOf(a *runtimev1alpha1.Artifact) string {
-	return fmt.Sprintf("%s/%s/%s/%s-%s.cwasm",
-		r.ArtifactStore.BaseURL,
-		a.Name,
-		sanitizeImageRef(a.Spec.Image),
-		r.Target,
-		r.WasmtimeVersion,
-	)
+	return r.ArtifactStore.BaseURL + "/" + r.precompiledArtifactKey(a)
 }
 
 func (r *PrecompileReconciler) buildDesiredJob(a *runtimev1alpha1.Artifact) (*batchv1.Job, error) {

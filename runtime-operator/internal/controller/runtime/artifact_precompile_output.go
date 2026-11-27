@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -20,12 +21,9 @@ import (
 
 const artifactNameIndex = "precompile.artifactName"
 
-const (
-	outputEventBuffer = 64
-	reopenWatchDelay  = 5 * time.Second
-)
+const reopenWatchDelay = 5 * time.Second
 
-func (r *PrecompileReconciler) startOutputWatcher(mgr ctrl.Manager) (source.Source, error) {
+func (r *PrecompileReconciler) startPrecompiledArtifactWatcher(mgr ctrl.Manager) (source.Source, error) {
 	bucket, ok := bucketFromBaseURL(r.ArtifactStore.BaseURL)
 	if !ok || r.NatsConn == nil {
 		return nil, nil
@@ -33,16 +31,16 @@ func (r *PrecompileReconciler) startOutputWatcher(mgr ctrl.Manager) (source.Sour
 	if err := indexArtifactsByName(mgr); err != nil {
 		return nil, err
 	}
-	outputEvents := make(chan event.GenericEvent, outputEventBuffer)
-	if err := mgr.Add(&precompileOutputWatcher{
+	events := make(chan event.GenericEvent)
+	if err := mgr.Add(&precompiledArtifactWatcher{
 		Reader:   mgr.GetClient(),
 		NatsConn: r.NatsConn,
 		Bucket:   bucket,
-		Events:   outputEvents,
+		Events:   events,
 	}); err != nil {
 		return nil, err
 	}
-	return source.Channel(outputEvents, &handler.EnqueueRequestForObject{}), nil
+	return source.Channel(events, &handler.EnqueueRequestForObject{}), nil
 }
 
 func indexArtifactsByName(mgr ctrl.Manager) error {
@@ -50,15 +48,8 @@ func indexArtifactsByName(mgr ctrl.Manager) error {
 		func(o client.Object) []string { return []string{o.GetName()} })
 }
 
-func outputKeyOf(baseURL, outputURL string) (string, bool) {
-	if _, ok := bucketFromBaseURL(baseURL); !ok {
-		return "", false
-	}
-	key, ok := strings.CutPrefix(outputURL, strings.TrimSuffix(baseURL, "/")+"/")
-	if !ok || key == "" {
-		return "", false
-	}
-	return key, true
+func (r *PrecompileReconciler) precompiledArtifactKey(a *runtimev1alpha1.Artifact) string {
+	return fmt.Sprintf("%s/%s/%s-%s.cwasm", a.Name, sanitizeImageRef(a.Spec.Image), r.Target, r.WasmtimeVersion)
 }
 
 func artifactNameFromKey(key string) (string, bool) {
@@ -67,18 +58,14 @@ func artifactNameFromKey(key string) (string, bool) {
 }
 
 func (r *PrecompileReconciler) jobSucceeded(ctx context.Context, a *runtimev1alpha1.Artifact, job *batchv1.Job) bool {
-	return jobComplete(job) || r.outputStoredSince(ctx, a, job.CreationTimestamp.Time)
+	return jobComplete(job) || r.precompiledArtifactStoredSince(ctx, a, job.CreationTimestamp.Time)
 }
 
-func (r *PrecompileReconciler) outputStoredSince(ctx context.Context, a *runtimev1alpha1.Artifact, since time.Time) bool {
+func (r *PrecompileReconciler) precompiledArtifactStoredSince(ctx context.Context, a *runtimev1alpha1.Artifact, since time.Time) bool {
 	if r.NatsConn == nil {
 		return false
 	}
 	bucket, ok := bucketFromBaseURL(r.ArtifactStore.BaseURL)
-	if !ok {
-		return false
-	}
-	key, ok := outputKeyOf(r.ArtifactStore.BaseURL, r.outputURLOf(a))
 	if !ok {
 		return false
 	}
@@ -90,38 +77,40 @@ func (r *PrecompileReconciler) outputStoredSince(ctx context.Context, a *runtime
 	if err != nil {
 		return false
 	}
+	key := r.precompiledArtifactKey(a)
 	info, err := store.GetInfo(key, nats.Context(ctx))
 	if err != nil {
 		if !errors.Is(err, nats.ErrObjectNotFound) {
-			ctrl.LoggerFrom(ctx).V(1).Info("cannot read precompile output", "key", key, "error", err.Error())
+			ctrl.LoggerFrom(ctx).V(1).Info("cannot read precompiled artifact", "key", key, "error", err.Error())
 		}
 		return false
 	}
-	return !info.ModTime.Before(since)
+	storedAt := info.ModTime
+	return storedAt.After(since) || storedAt.Equal(since)
 }
 
-type precompileOutputWatcher struct {
+type precompiledArtifactWatcher struct {
 	Reader   client.Reader
 	NatsConn *nats.Conn
 	Bucket   string
 	Events   chan<- event.GenericEvent
 }
 
-func (w *precompileOutputWatcher) NeedLeaderElection() bool { return true }
+func (w *precompiledArtifactWatcher) NeedLeaderElection() bool { return true }
 
-func (w *precompileOutputWatcher) Start(ctx context.Context) error {
+func (w *precompiledArtifactWatcher) Start(ctx context.Context) error {
 	wait.UntilWithContext(ctx, w.runWatch, reopenWatchDelay)
 	return nil
 }
 
-func (w *precompileOutputWatcher) runWatch(ctx context.Context) {
-	if err := w.streamOutputs(ctx); err != nil && ctx.Err() == nil {
-		ctrl.LoggerFrom(ctx).V(1).Info("precompile output watch ended; reopening",
+func (w *precompiledArtifactWatcher) runWatch(ctx context.Context) {
+	if err := w.streamPrecompiledArtifacts(ctx); err != nil && ctx.Err() == nil {
+		ctrl.LoggerFrom(ctx).V(1).Info("precompiled artifact watch ended; reopening",
 			"bucket", w.Bucket, "in", reopenWatchDelay, "error", err.Error())
 	}
 }
 
-func (w *precompileOutputWatcher) streamOutputs(ctx context.Context) error {
+func (w *precompiledArtifactWatcher) streamPrecompiledArtifacts(ctx context.Context) error {
 	js, err := w.NatsConn.JetStream(nats.MaxWait(natsRequestTimeout))
 	if err != nil {
 		return err
@@ -145,20 +134,22 @@ func (w *precompileOutputWatcher) streamOutputs(ctx context.Context) error {
 			if !ok {
 				return errors.New("watch closed")
 			}
-			if info == nil {
-				continue
-			}
-			if name, ok := artifactNameFromKey(info.Name); ok {
-				w.enqueueArtifactsNamed(ctx, name)
-			}
+			w.enqueueArtifactsFor(ctx, info)
 		}
 	}
 }
 
-func (w *precompileOutputWatcher) enqueueArtifactsNamed(ctx context.Context, name string) {
+func (w *precompiledArtifactWatcher) enqueueArtifactsFor(ctx context.Context, info *nats.ObjectInfo) {
+	if info == nil {
+		return
+	}
+	name, ok := artifactNameFromKey(info.Name)
+	if !ok {
+		return
+	}
 	var artifacts runtimev1alpha1.ArtifactList
 	if err := w.Reader.List(ctx, &artifacts, client.MatchingFields{artifactNameIndex: name}); err != nil {
-		ctrl.LoggerFrom(ctx).V(1).Info("cannot list artifacts for precompile output", "name", name, "error", err.Error())
+		ctrl.LoggerFrom(ctx).V(1).Info("cannot list artifacts for precompiled artifact", "key", info.Name, "error", err.Error())
 		return
 	}
 	for i := range artifacts.Items {
