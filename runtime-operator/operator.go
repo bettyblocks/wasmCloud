@@ -160,6 +160,15 @@ func NewEmbeddedOperator(
 		if precompileNatsURL == "" {
 			precompileNatsURL = cfg.NatsURL
 		}
+		// The precompile store can be on a different NATS than the scheduler.
+		storeNatsConn := nc
+		if precompileNatsURL != cfg.NatsURL {
+			storeNatsConn, err = wasmbus.NatsConnect(precompileNatsURL, cfg.NatsOptions...)
+			if err != nil {
+				return nil, err
+			}
+		}
+
 		if err = (&runtime_controllers.PrecompileReconciler{
 			Client:      mgr.GetClient(),
 			Scheme:      mgr.GetScheme(),
@@ -174,25 +183,14 @@ func NewEmbeddedOperator(
 			Target:             cfg.PrecompileTarget,
 			WasmtimeVersion:    cfg.PrecompileWasmtimeVersion,
 			InsecureRegistries: cfg.PrecompileInsecureRegistries,
+			NatsConn:           storeNatsConn,
 		}).SetupWithManager(mgr); err != nil {
 			return nil, err
 		}
 
-		// GC reads/deletes objects from the same precompiled-artifacts bucket
-		// the Worker Jobs write to, so it needs its own connection to
-		// precompileNatsURL whenever that differs from the operator's own
-		// (Scheduler) connection.
-		gcNatsConn := nc
-		if precompileNatsURL != cfg.NatsURL {
-			gcNatsConn, err = wasmbus.NatsConnect(precompileNatsURL, cfg.NatsOptions...)
-			if err != nil {
-				return nil, err
-			}
-		}
-
 		if err = mgr.Add(&runtime_controllers.PrecompileGC{
 			Reader:      mgr.GetClient(),
-			NatsConn:    gcNatsConn,
+			NatsConn:    storeNatsConn,
 			BaseURL:     cfg.PrecompileArtifactBaseURL,
 			Interval:    cfg.PrecompileGCInterval,
 			GracePeriod: cfg.PrecompileGCGracePeriod,

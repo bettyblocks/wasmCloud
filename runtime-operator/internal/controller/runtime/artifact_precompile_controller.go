@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/nats-io/nats.go"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -42,6 +43,8 @@ type PrecompileReconciler struct {
 	// Worker may pull from over plain HTTP, passed through as the Worker's
 	// INSECURE_REGISTRIES env var.
 	InsecureRegistries string
+	// NatsConn reads the nats:// artifact store. Nil: wait for Job Complete only.
+	NatsConn *nats.Conn
 }
 
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=artifacts,verbs=get;list;watch
@@ -50,11 +53,20 @@ type PrecompileReconciler struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
 
 func (r *PrecompileReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&runtimev1alpha1.Artifact{}).
 		Owns(&batchv1.Job{}).
-		Named("runtime-artifact-precompile").
-		Complete(r)
+		Named("runtime-artifact-precompile")
+
+	outputs, err := r.startOutputWatcher(mgr)
+	if err != nil {
+		return err
+	}
+	if outputs != nil {
+		b = b.WatchesRawSource(outputs)
+	}
+
+	return b.Complete(r)
 }
 
 func (r *PrecompileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -95,7 +107,7 @@ func (r *PrecompileReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return r.handleFailedJob(ctx, &a, msg)
 	}
 
-	if !jobComplete(&job) {
+	if !r.jobSucceeded(ctx, &a, &job) {
 		return r.handleInFlightJob(ctx, &a)
 	}
 
